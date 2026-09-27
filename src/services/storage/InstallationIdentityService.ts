@@ -1,18 +1,27 @@
 const installIdKey = 'installId'
+const installIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 function createInstallId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID()
   }
 
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (character) => {
+    const randomValue = Math.random() * 16 | 0
+    const value = character === 'x' ? randomValue : randomValue & 0x3 | 0x8
+    return value.toString(16)
+  })
+}
+
+function isValidInstallId(installId: string): boolean {
+  return installIdPattern.test(installId)
 }
 
 class InstallationIdentityService {
   getInstallId(): string {
     const existingInstallId = localStorage.getItem(installIdKey)
 
-    if (existingInstallId) {
+    if (existingInstallId && isValidInstallId(existingInstallId)) {
       return existingInstallId
     }
 

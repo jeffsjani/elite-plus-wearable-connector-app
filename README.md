@@ -72,3 +72,24 @@ They are submitted directly without a durable queue.
 The mobile Connector does not have permission to assign user ownership to
 observations. Ownership is determined server-side from the authenticated
 Base44 session, never from a client-supplied `user_id`.
+
+## Build 2A: Live Base44 Certification
+
+The Build 2A live certification passed against the existing Elite+ backend:
+
+- SDK authentication: PASS
+- Direct raw function transport: PASS
+- Registration: PASS
+- Re-registration: PASS
+- Status: PASS
+- Single observation: PASS
+- Duplicate observation: PASS
+- 500-observation batch: PASS
+- Repeat 500 deduplication: PASS
+- Logout and same-user re-login: PASS
+- Cross-account client test: NOT RUN; server-side test already passed
+- Session-expiration manual test: NOT RUN
+
+The browser harness used `VITE_CONNECTOR_TEST_PLATFORM=ios` for development
+validation only. Production uses the real Capacitor platform and does not
+override the native platform.

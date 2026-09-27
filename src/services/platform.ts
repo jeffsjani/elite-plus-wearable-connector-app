@@ -10,3 +10,13 @@ export function getPlatform(): ConnectorPlatform {
 
   return 'web'
 }
+
+export function getRegistrationPlatform(): ConnectorPlatform {
+  const testPlatform = import.meta.env.VITE_CONNECTOR_TEST_PLATFORM
+
+  if (import.meta.env.DEV && (testPlatform === 'ios' || testPlatform === 'android')) {
+    return testPlatform
+  }
+
+  return getPlatform()
+}

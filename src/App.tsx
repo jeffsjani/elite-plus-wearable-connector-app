@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import './App.css'
-import { getPlatform } from './services/platform'
+import { getPlatform, getRegistrationPlatform } from './services/platform'
 import { installationIdentityService } from './services/storage/InstallationIdentityService'
 import { authenticationService } from './services/base44/AuthenticationService'
 import { connectorIdentityService } from './services/base44/ConnectorIdentityService'
@@ -89,7 +89,7 @@ function App() {
         setUser(currentUser)
         setConnectionState('AUTHENTICATED')
         setErrorMessage('')
-        const result = await connectorRegistrationService.registerConnector({ installId, platform: getPlatform(), appVersion })
+        const result = await connectorRegistrationService.registerConnector({ installId: installationIdentityService.getInstallId(), platform: getRegistrationPlatform(), appVersion })
         if (!active) return
         setRegistration(result)
         setConnectionState('REGISTERED')
@@ -107,7 +107,7 @@ function App() {
     setConnectionState('REGISTERING')
     setErrorMessage('')
     try {
-      const result = await connectorRegistrationService.registerConnector({ installId, platform: getPlatform(), appVersion })
+      const result = await connectorRegistrationService.registerConnector({ installId: installationIdentityService.getInstallId(), platform: getRegistrationPlatform(), appVersion })
       setRegistration(result)
       setStatus(null)
       setConnectionState('REGISTERED')
@@ -209,7 +209,7 @@ function App() {
     return (
       <main className="shell">
         <section className="status-panel auth-panel" aria-labelledby="app-title">
-          <div className="eyebrow">Elite+ / Base44 connection</div>
+          <div className="eyebrow">Elite+ / Connector connection</div>
           <h1 id="app-title">Elite+ Connector</h1>
           <p className="lede">Connect your Elite+ account to securely synchronize wearable and phone health data.</p>
           <form className="auth-form" onSubmit={(event) => void handleSignIn(event)}>
@@ -228,7 +228,7 @@ function App() {
   return (
     <main className="shell">
       <section className="status-panel" aria-labelledby="app-title">
-        <div className="eyebrow">Elite+ / Base44 connection</div>
+        <div className="eyebrow">Elite+ / Connector connection</div>
         <h1 id="app-title">Elite+ Connector</h1>
         <p className="signed-in">Signed in as: <strong>{user.email}</strong></p>
         <div className="readiness" role="status">
@@ -251,7 +251,7 @@ function App() {
           <button type="button" onClick={() => void refreshStatus()} disabled={isBusy}>Refresh Status</button>
           <button type="button" className="secondary" onClick={() => void handleLogout()} disabled={isBusy}>Sign Out</button>
         </div>
-        {testResult && <div className="result-panel"><h2>Base44 Connection Test</h2><p>Accepted: {testResult.accepted}</p><p>Duplicate: {testResult.duplicate}</p><p>Rejected: {testResult.rejected}</p><p>Server: Connected</p><p>Timestamp: {testResult.serverTimestamp}</p></div>}
+        {testResult && <div className="result-panel"><h2>Connector Connection Test</h2><p>Accepted: {testResult.accepted}</p><p>Duplicate: {testResult.duplicate}</p><p>Rejected: {testResult.rejected}</p><p>Server: Connected</p><p>Timestamp: {testResult.serverTimestamp}</p></div>}
         {import.meta.env.DEV && <aside className="diagnostics"><h2>Development diagnostics</h2><button type="button" onClick={() => void runDuplicateTest()} disabled={isBusy || !lastTestObservation}>Resubmit Last Observation</button><button type="button" onClick={() => void runBatchTest()} disabled={isBusy || !registration}>Run 500 Observation Test</button>{batchResult && <p>500 test: first accepted {batchResult.accepted}; repeat duplicates {batchResult.duplicate}; rejected {batchResult.rejected}</p>}</aside>}
       </section>
     </main>

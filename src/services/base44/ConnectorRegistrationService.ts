@@ -16,7 +16,7 @@ class ConnectorRegistrationService {
     )
 
     if (!response.success || !response.connectorDeviceId) {
-      throw new ConnectorServiceError('INVALID_RESPONSE', 'Base44 returned an invalid connector registration.')
+      throw new ConnectorServiceError('INVALID_RESPONSE', 'The connector service returned an invalid registration.')
     }
 
     connectorIdentityService.setConnectorDeviceId(response.connectorDeviceId)

@@ -15,7 +15,7 @@ class ConnectorObservationService {
     )
 
     if (!response.success) {
-      throw new ConnectorServiceError('BATCH_REJECTED', 'Base44 rejected the observation batch.')
+      throw new ConnectorServiceError('BATCH_REJECTED', 'The connector service rejected the observation batch.')
     }
 
     return response

@@ -6,14 +6,16 @@ import {
 } from './base44Types'
 
 const appId = import.meta.env.VITE_BASE44_APP_ID ?? ''
+const configuredServerUrl = import.meta.env.VITE_BASE44_SERVER_URL ?? ''
+const configuredAppBaseUrl = import.meta.env.VITE_BASE44_APP_BASE_URL ?? ''
 const functionBaseUrl = import.meta.env.VITE_BASE44_FUNCTION_BASE_URL ?? ''
 const normalizedFunctionBaseUrl = functionBaseUrl.replace(/\/+$/, '')
-const serverUrl = normalizedFunctionBaseUrl.replace(/\/functions$/, '')
+const serverUrl = configuredServerUrl || normalizedFunctionBaseUrl.replace(/\/functions$/, '')
 
 export const base44: Base44Client = createClient({
   appId,
   serverUrl: serverUrl || undefined,
-  appBaseUrl: serverUrl || undefined,
+  appBaseUrl: configuredAppBaseUrl || serverUrl || undefined,
   analytics: { enabled: false },
 })
 
@@ -21,7 +23,7 @@ function getConfiguredFunctionUrl(functionName: string): string {
   if (!appId || !normalizedFunctionBaseUrl) {
     throw new ConnectorServiceError(
       'SERVER_ERROR',
-      'Base44 client configuration is missing.',
+      'Connector service configuration is missing.',
     )
   }
 
@@ -46,10 +48,10 @@ export function mapBase44Error(error: unknown): ConnectorServiceError {
   }
 
   if (error instanceof TypeError) {
-    return new ConnectorServiceError('NETWORK_ERROR', 'Unable to reach Base44.')
+    return new ConnectorServiceError('NETWORK_ERROR', 'Unable to reach the connector service.')
   }
 
-  return new ConnectorServiceError('SERVER_ERROR', 'Base44 request failed.')
+  return new ConnectorServiceError('SERVER_ERROR', 'Connector service request failed.')
 }
 
 export async function invokeConnectorFunction<T>(
@@ -72,12 +74,13 @@ export async function invokeConnectorFunction<T>(
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
+        'X-App-Id': appId,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(payload),
     })
   } catch {
-    throw new ConnectorServiceError('NETWORK_ERROR', 'Unable to reach Base44.')
+    throw new ConnectorServiceError('NETWORK_ERROR', 'Unable to reach the connector service.')
   }
 
   let responseBody: unknown
@@ -87,16 +90,22 @@ export async function invokeConnectorFunction<T>(
   } catch {
     throw new ConnectorServiceError(
       response.ok ? 'INVALID_RESPONSE' : getErrorCode(response.status),
-      'Base44 returned an invalid response.',
+      'Connector service returned an invalid response.',
       response.status,
     )
   }
 
   if (!response.ok) {
     const message =
-      typeof responseBody === 'object' && responseBody !== null && 'message' in responseBody
-        ? String(responseBody.message)
-        : 'Base44 rejected the request.'
+      typeof responseBody === 'object' && responseBody !== null
+        ? 'message' in responseBody
+          ? String(responseBody.message)
+          : 'error' in responseBody
+            ? String(responseBody.error)
+            : 'detail' in responseBody
+              ? String(responseBody.detail)
+              : 'Connector service rejected the request.'
+        : 'Connector service rejected the request.'
     throw new ConnectorServiceError(getErrorCode(response.status), message, response.status)
   }
 
@@ -105,7 +114,7 @@ export async function invokeConnectorFunction<T>(
 
 export function logConnectorError(functionName: string, error: unknown, batchId?: string): void {
   const mappedError = mapBase44Error(error)
-  console.error('Base44 connector request failed', {
+  console.error('Connector service request failed', {
     functionName,
     batchId,
     status: mappedError.status,
