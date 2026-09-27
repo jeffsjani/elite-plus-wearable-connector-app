@@ -154,14 +154,16 @@ button.secondary {
 }
 
 .result-panel,
-.diagnostics {
+.diagnostics,
+.queue-panel {
   margin-top: 32px;
   padding-top: 22px;
   border-top: 1px solid #d6ddd8;
 }
 
 .result-panel h2,
-.diagnostics h2 {
+.diagnostics h2,
+.queue-panel h2 {
   margin: 0 0 14px;
   color: #142522;
   font-family: Georgia, 'Times New Roman', serif;
@@ -170,14 +172,31 @@ button.secondary {
 }
 
 .result-panel p,
-.diagnostics p {
+.diagnostics p,
+.queue-panel p {
   margin: 6px 0;
   color: #5f6b66;
+}
+
+.warning-message {
+  color: #996b22 !important;
 }
 
 .diagnostics {
   display: grid;
   gap: 10px;
+}
+
+.queue-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-bottom: 14px;
+  color: #5f6b66;
+}
+
+.queue-stats strong {
+  color: #142522;
 }
 
 .diagnostics button {

@@ -93,3 +93,49 @@ The Build 2A live certification passed against the existing Elite+ backend:
 The browser harness used `VITE_CONNECTOR_TEST_PLATFORM=ios` for development
 validation only. Production uses the real Capacitor platform and does not
 override the native platform.
+
+## Build 3: Durable Observation Queue
+
+Build 3 adds a durable, owner-scoped local observation queue between future
+source adapters and `ConnectorObservationService`.
+
+- Native iOS/Android storage: `@capacitor-community/sqlite@8.1.1`
+- Browser development storage: IndexedDB through `WebQueueStore`
+- Native storage: `NativeSQLiteQueueStore`
+- Schema: versioned `schema_version` and `observation_queue` tables
+- Queue states: `PENDING`, `IN_FLIGHT`, `RETRY_WAIT`, `ACKNOWLEDGED`, `FAILED_PERMANENT`
+- Initial batch size: 100 observations
+- Retry policy: exponential backoff with jitter, capped at five minutes
+- Accepted and duplicate server results both acknowledge local records
+- Explicit rejected observation IDs become permanent failures
+- Stale `IN_FLIGHT` records recover to retryable state after 15 minutes
+- Queue rows are scoped by authenticated `ownerUserId`
+- Queue safety warnings appear at 100,000 records or 30 days of pending age;
+    records are not silently purged for age or capacity
+- `Sync Now`, enqueue, app startup, network restoration, and foreground resume
+    can request processing; only one processor runs at a time
+
+The queue stores observation payloads and synchronization metadata only. It does
+not store passwords, Base44 session tokens, service credentials, or source
+secrets. Future health observations are sensitive local data. The selected
+SQLite plugin is configured without encryption in this build; no encryption
+claim is made. No wearable SDK or native background scheduler is integrated.
+
+### Build 3 Certification
+
+- Normal queued delivery: PASS
+- Offline queue preservation and recovery: PASS (automated)
+- Restart persistence: PASS (automated browser store)
+- Duplicate enqueue: PASS (automated)
+- Uncertain delivery/duplicate retry: PASS (automated and live)
+- Partial rejection isolation: PASS (automated)
+- Authentication interruption: PASS (automated)
+- Account isolation: PASS (automated)
+- Stale `IN_FLIGHT` recovery: PASS (automated)
+- Retry classification and backoff: PASS (automated)
+- Processing lock: PASS (automated)
+- Live 100-observation queue delivery: PASS
+- Live duplicate retry: PASS
+
+The live queue tests used only synthetic connector observations. No real health
+data was sent.

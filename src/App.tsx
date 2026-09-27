@@ -17,6 +17,9 @@ import {
 } from './services/base44/base44Types'
 import { createSyntheticObservation, createSyntheticObservations } from './services/testing/SyntheticObservationFactory'
 import type { ConnectorConnectionState } from './models/connection'
+import { observationBatchManager } from './services/sync/ObservationBatchManager'
+import { observationQueue } from './services/sync/ObservationQueue'
+import type { QueueStats } from './services/storage/ObservationQueueStore'
 
 const appVersion = '0.0.0'
 
@@ -54,8 +57,12 @@ function App() {
   const [status, setStatus] = useState<ConnectorStatusResponse | null>(null)
   const [testResult, setTestResult] = useState<ConnectorObservationsResponse | null>(null)
   const [batchResult, setBatchResult] = useState<ConnectorObservationsResponse | null>(null)
+  const [queueTestResult, setQueueTestResult] = useState<ConnectorObservationsResponse | null>(null)
+  const [lastQueueObservations, setLastQueueObservations] = useState<NativeObservationInput[]>([])
+  const [queueDuplicateResult, setQueueDuplicateResult] = useState<ConnectorObservationsResponse | null>(null)
   const [lastTestObservation, setLastTestObservation] = useState<NativeObservationInput | null>(null)
   const [lastTestBatchId, setLastTestBatchId] = useState('')
+  const [queueStats, setQueueStats] = useState<QueueStats | null>(null)
   const installId = installationIdentityService.getInstallId()
   const connectorDeviceId = connectorIdentityService.getConnectorDeviceId()
   const isBusy = ['REGISTERING', 'TESTING'].includes(connectionState)
@@ -77,6 +84,19 @@ function App() {
     setErrorMessage(describeError(error, isLogin))
   }
 
+  async function refreshQueueStats(): Promise<void> {
+    if (!observationQueue.getOwnerUserId()) return
+    setQueueStats(await observationQueue.getQueueStats())
+  }
+
+  async function prepareQueue(currentUser: LocalUser): Promise<void> {
+    await observationQueue.initialize()
+    observationQueue.setOwnerUserId(currentUser.id)
+    observationBatchManager.resume()
+    observationBatchManager.start()
+    await refreshQueueStats()
+  }
+
   useEffect(() => {
     let active = true
 
@@ -89,6 +109,7 @@ function App() {
         setUser(currentUser)
         setConnectionState('AUTHENTICATED')
         setErrorMessage('')
+        await prepareQueue(currentUser)
         const result = await connectorRegistrationService.registerConnector({ installId: installationIdentityService.getInstallId(), platform: getRegistrationPlatform(), appVersion })
         if (!active) return
         setRegistration(result)
@@ -125,6 +146,7 @@ function App() {
       setPassword('')
       setUser(currentUser)
       connectorIdentityService.clearConnectorDeviceId()
+      await prepareQueue(currentUser)
       await registerConnector()
     } catch (error) {
       handleServiceError(error, true)
@@ -159,8 +181,10 @@ function App() {
     setLastTestObservation(observation)
     setLastTestBatchId(batchId)
     try {
-      const result = await connectorObservationService.submitObservations({ installId, connectorDeviceId, batchId, observations: [observation] })
-      setTestResult(result)
+      await observationQueue.enqueue(observation)
+      const result = await observationBatchManager.process()
+      await refreshQueueStats()
+      if (result) setTestResult(result)
       setConnectionState('CONNECTED')
     } catch (error) {
       handleServiceError(error)
@@ -196,13 +220,62 @@ function App() {
     }
   }
 
+  async function runQueueBatchTest(): Promise<void> {
+    if (!user || !connectorDeviceId) return
+    setConnectionState('TESTING')
+    setErrorMessage('')
+    try {
+      const observations = createSyntheticObservations(100, 'connector_batch_test')
+      setLastQueueObservations(observations)
+      await observationQueue.enqueueMany(observations)
+      const result = await observationBatchManager.process()
+      if (result) setQueueTestResult(result)
+      await refreshQueueStats()
+      setConnectionState('CONNECTED')
+    } catch (error) {
+      handleServiceError(error)
+    }
+  }
+
+  async function runQueueDuplicateRetryTest(): Promise<void> {
+    if (!user || !connectorDeviceId || !lastQueueObservations.length) return
+    setConnectionState('TESTING')
+    setErrorMessage('')
+    try {
+      await observationQueue.enqueueMany(lastQueueObservations)
+      const result = await observationBatchManager.process()
+      if (result) setQueueDuplicateResult(result)
+      await refreshQueueStats()
+      setConnectionState('CONNECTED')
+    } catch (error) {
+      handleServiceError(error)
+    }
+  }
+
   async function handleLogout(): Promise<void> {
+    observationBatchManager.pause()
+    observationBatchManager.stop()
+    observationQueue.setOwnerUserId(null)
     connectorIdentityService.clearConnectorDeviceId()
     await authenticationService.logout()
     setUser(null)
     setRegistration(null)
     setStatus(null)
+    setQueueStats(null)
     setConnectionState('UNAUTHENTICATED')
+  }
+
+  async function syncNow(): Promise<void> {
+    setErrorMessage('')
+    setConnectionState('TESTING')
+    try {
+      const result = await observationBatchManager.process()
+      if (result) setTestResult(result)
+      await refreshQueueStats()
+      setConnectionState('CONNECTED')
+    } catch (error) {
+      handleServiceError(error)
+    }
   }
 
   if (!user) {
@@ -251,8 +324,9 @@ function App() {
           <button type="button" onClick={() => void refreshStatus()} disabled={isBusy}>Refresh Status</button>
           <button type="button" className="secondary" onClick={() => void handleLogout()} disabled={isBusy}>Sign Out</button>
         </div>
+        {queueStats && <div className="queue-panel"><h2>Sync Queue</h2><div className="queue-stats"><span>Pending: <strong>{queueStats.pending}</strong></span><span>Retrying: <strong>{queueStats.retrying}</strong></span><span>Failed: <strong>{queueStats.failed}</strong></span></div><p>Oldest pending: {queueStats.oldestPendingAgeMs === null ? 'None' : `${Math.round(queueStats.oldestPendingAgeMs / 60000)} minutes`}</p><p>Last successful sync: {queueStats.lastSuccessfulUploadAt ?? 'Not available'}</p>{queueStats.warnings.length > 0 && <p className="warning-message">Queue diagnostics: {queueStats.warnings.join(', ')}</p>}<button type="button" onClick={() => void syncNow()} disabled={isBusy}>Sync Now</button></div>}
         {testResult && <div className="result-panel"><h2>Connector Connection Test</h2><p>Accepted: {testResult.accepted}</p><p>Duplicate: {testResult.duplicate}</p><p>Rejected: {testResult.rejected}</p><p>Server: Connected</p><p>Timestamp: {testResult.serverTimestamp}</p></div>}
-        {import.meta.env.DEV && <aside className="diagnostics"><h2>Development diagnostics</h2><button type="button" onClick={() => void runDuplicateTest()} disabled={isBusy || !lastTestObservation}>Resubmit Last Observation</button><button type="button" onClick={() => void runBatchTest()} disabled={isBusy || !registration}>Run 500 Observation Test</button>{batchResult && <p>500 test: first accepted {batchResult.accepted}; repeat duplicates {batchResult.duplicate}; rejected {batchResult.rejected}</p>}</aside>}
+        {import.meta.env.DEV && <aside className="diagnostics"><h2>Development diagnostics</h2><button type="button" onClick={() => void runDuplicateTest()} disabled={isBusy || !lastTestObservation}>Resubmit Last Observation</button><button type="button" onClick={() => void runQueueBatchTest()} disabled={isBusy || !registration}>Run 100 Queue Test</button><button type="button" onClick={() => void runQueueDuplicateRetryTest()} disabled={isBusy || !lastQueueObservations.length}>Retry Last 100 Queue Test</button><button type="button" onClick={() => void runBatchTest()} disabled={isBusy || !registration}>Run 500 Observation Test</button>{queueTestResult && <p>100 queue test: accepted {queueTestResult.accepted}; duplicate {queueTestResult.duplicate}; rejected {queueTestResult.rejected}</p>}{queueDuplicateResult && <p>100 queue retry: accepted {queueDuplicateResult.accepted}; duplicate {queueDuplicateResult.duplicate}; rejected {queueDuplicateResult.rejected}</p>}{batchResult && <p>500 test: first accepted {batchResult.accepted}; repeat duplicates {batchResult.duplicate}; rejected {batchResult.rejected}</p>}</aside>}
       </section>
     </main>
   )

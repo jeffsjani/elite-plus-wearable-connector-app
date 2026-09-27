@@ -1,0 +1,58 @@
+import type { NativeObservationInput } from '../base44/base44Types'
+
+export type QueueState = 'PENDING' | 'IN_FLIGHT' | 'RETRY_WAIT' | 'ACKNOWLEDGED' | 'FAILED_PERMANENT'
+
+export interface QueueRecord {
+  queueId: string
+  ownerUserId: string
+  observationId: string
+  payload: NativeObservationInput
+  state: QueueState
+  createdAt: string
+  updatedAt: string
+  attemptCount: number
+  nextAttemptAt: string | null
+  lastAttemptAt: string | null
+  lastErrorCode: string | null
+  lastErrorMessage: string | null
+  batchId: string | null
+  acknowledgedAt: string | null
+}
+
+export interface QueueErrorMetadata {
+  code: string
+  message: string
+}
+
+export interface QueueStats {
+  pending: number
+  retrying: number
+  failed: number
+  inFlight: number
+  acknowledged: number
+  oldestPendingAgeMs: number | null
+  lastAttemptAt: string | null
+  lastSuccessfulUploadAt: string | null
+  warnings: string[]
+}
+
+export interface EnqueueResult {
+  inserted: boolean
+  alreadyQueued: boolean
+  record: QueueRecord
+}
+
+export interface ObservationQueueStore {
+  initialize(): Promise<void>
+  enqueue(ownerUserId: string, observation: NativeObservationInput): Promise<EnqueueResult>
+  enqueueMany(ownerUserId: string, observations: NativeObservationInput[]): Promise<EnqueueResult[]>
+  getPending(ownerUserId: string, limit: number, now?: Date): Promise<QueueRecord[]>
+  markInFlight(queueIds: string[], batchId: string): Promise<void>
+  markAcknowledged(observationIds: string[], ownerUserId: string): Promise<void>
+  markRetry(queueIds: string[], error: QueueErrorMetadata, nextAttemptAt: string): Promise<void>
+  markPermanentFailure(queueIds: string[], error: QueueErrorMetadata): Promise<void>
+  releaseStaleInFlight(ownerUserId: string, staleBefore: string): Promise<void>
+  getQueueStats(ownerUserId: string, now?: Date): Promise<QueueStats>
+  getOldestPendingAge(ownerUserId: string, now?: Date): Promise<number | null>
+  purgeAcknowledged(ownerUserId: string): Promise<number>
+}
