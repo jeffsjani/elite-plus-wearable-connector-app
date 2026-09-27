@@ -48,3 +48,27 @@ npx cap doctor
 
 Native projects live in `ios/` and `android/`. Capacitor serves the production
 web output from `dist/`.
+
+## Build 2: Base44 Connection
+
+Build 2 connects the standalone Connector to the existing Elite+ Base44
+backend using the official `@base44/sdk` authentication client. The client
+uses `auth.loginViaEmailPassword()`, `auth.me()`, `auth.isAuthenticated()`, and
+`auth.logout()` for the Base44 session. Connector functions are:
+
+- `nativeConnectorRegister`
+- `nativeConnectorStatus`
+- `nativeConnectorObservations`
+
+The Connector sends the persisted `installId` when registering. Base44 returns
+the account-scoped `connectorDeviceId`, which is replaced on every login and
+cleared on logout to protect against cross-account reuse on the same device.
+The install ID itself is not deleted during logout.
+
+Synthetic observations use the `connector_test` source and are intended only
+for the Build 2 connection, duplicate, and 500-observation development tests.
+They are submitted directly without a durable queue.
+
+The mobile Connector does not have permission to assign user ownership to
+observations. Ownership is determined server-side from the authenticated
+Base44 session, never from a client-supplied `user_id`.

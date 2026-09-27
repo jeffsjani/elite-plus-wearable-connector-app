@@ -67,6 +67,123 @@ h1 {
   font-size: 1.05rem;
 }
 
+.readiness small {
+  display: block;
+  margin-top: 6px;
+  color: #7a8580;
+}
+
+.readiness-dot.is-error {
+  background: #b54a3a;
+}
+
+.signed-in {
+  margin: 0;
+  color: #5f6b66;
+}
+
+.auth-form {
+  display: grid;
+  gap: 10px;
+  margin-top: 42px;
+}
+
+.auth-form label {
+  color: #53635d;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+input {
+  width: 100%;
+  padding: 13px 14px;
+  border: 1px solid #c5d0c9;
+  border-radius: 2px;
+  color: #142522;
+  background: #fffefb;
+  font: inherit;
+}
+
+input:focus-visible,
+button:focus-visible {
+  outline: 2px solid #37756a;
+  outline-offset: 2px;
+}
+
+button {
+  padding: 13px 16px;
+  border: 1px solid #176e60;
+  border-radius: 2px;
+  color: #fbfaf6;
+  background: #176e60;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: #12594e;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.52;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 28px;
+}
+
+.actions button {
+  flex: 1 1 180px;
+}
+
+button.secondary {
+  color: #176e60;
+  background: transparent;
+}
+
+.error-message {
+  margin: 18px 0 0;
+  color: #a33e32;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.result-panel,
+.diagnostics {
+  margin-top: 32px;
+  padding-top: 22px;
+  border-top: 1px solid #d6ddd8;
+}
+
+.result-panel h2,
+.diagnostics h2 {
+  margin: 0 0 14px;
+  color: #142522;
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: 1.5rem;
+  font-weight: 400;
+}
+
+.result-panel p,
+.diagnostics p {
+  margin: 6px 0;
+  color: #5f6b66;
+}
+
+.diagnostics {
+  display: grid;
+  gap: 10px;
+}
+
+.diagnostics button {
+  justify-self: start;
+}
+
 .details {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -103,5 +220,9 @@ dd {
 
   .details {
     grid-template-columns: 1fr;
+  }
+
+  .actions button {
+    flex-basis: 100%;
   }
 }
