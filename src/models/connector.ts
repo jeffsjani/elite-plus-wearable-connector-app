@@ -1,6 +1,6 @@
 export type ConnectorPlatform = 'web' | 'ios' | 'android'
 
-export type SourceStatus = 'unavailable' | 'disconnected' | 'ready' | 'syncing' | 'error'
+export type SourceStatus = 'unavailable' | 'disconnected' | 'ready' | 'syncing' | 'error' | 'connected' | 'permission_required' | 'unsupported'
 
 export interface PermissionResult {
   granted: boolean
@@ -18,16 +18,13 @@ export interface SyncResult {
   startedAt: string
   completedAt: string
   nextCursor?: string
+  samplesRetrieved?: number
+  newlyQueued?: number
+  alreadyQueued?: number
+  failedNormalization?: number
 }
 
-export interface NativeObservation {
-  source: string
-  type: string
-  observedAt: string
-  value: number | string | boolean
-  unit?: string
-  metadata?: Record<string, string | number | boolean>
-}
+export type NativeObservation = import('../services/base44/base44Types').NativeObservationInput
 
 export interface ConnectorDiagnostics {
   source: string

@@ -47,9 +47,12 @@ export interface NativeObservationInput {
   valueNumber: number
   unit: string
   startTime: string
+  endTime?: string
   timezone: string
   capturedAt: string
   provider: string
+  sourceRecordId?: string
+  sourceId?: string
 }
 
 export interface ConnectorObservationsRequest {

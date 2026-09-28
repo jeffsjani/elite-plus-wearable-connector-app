@@ -171,3 +171,50 @@ Build 4B automated connection tests are mocked and do not certify a live
 provider login. Garmin authorization URL, live provider login, webhook arrival,
 and safe server-side data verification remain pending an authenticated test
 session and approved Garmin account.
+
+## Build 5: Direct Apple Health
+
+Apple Health is read directly on iOS 15+ through the app-local Capacitor 8 Swift
+HealthKit plugin (`EliteHealthKitPlugin`), not through ROOK. The maintained
+`@capgo/capacitor-health@8.11.4` was evaluated but **not retained**: its Android
+component requires API 26 while this project's Android minimum is 24 and its
+manifest would introduce Health Connect permissions. No Android Health Connect
+capability or plugin is added. ROOK live-provider testing remains deferred and
+does not block this implementation.
+
+The user explicitly selects read types before requesting HealthKit access:
+heart rate, resting heart rate, HRV, sleep analysis, steps, active energy,
+workouts, respiratory rate, oxygen saturation, body mass, and height. No write
+authorization is requested. iOS does not disclose whether individual read
+types were denied; a settled permission prompt or an empty read is **not**
+treated as evidence of connection. A successfully normalized sample confirms
+access for that read, but cannot prove all selected types are authorized.
+Actual HealthKit entitlement signing and device permission behavior must be
+verified in Xcode on a real iPhone.
+
+Initial synchronization queries the last seven days (configurable in the
+adapter). Subsequent runs use owner- and data-type-scoped timestamp checkpoints
+with a one-day overlap, preserving the entire gap if the app has been idle for
+more than seven days. The native query is capped per day and a saturated result
+does not advance its checkpoint. This bridge does **not** implement HealthKit
+anchored/deletion queries; late backfills outside the overlap and deleted samples
+are not captured. Failed normalization does not advance the affected window's
+checkpoint. The user initiates sync; no HealthKit background observer is enabled.
+
+HealthKit sample UUIDs are hashed with owner ID and `apple_health` source to
+produce stable observation IDs. Records retain HealthKit source name/bundle ID,
+sample UUID, start/end times and supplied value/unit; unknown origin is labeled
+as unknown rather than Apple Watch. Each observation goes through
+`ObservationQueue.enqueueMany()` and `ObservationBatchManager` to authenticated
+Base44 ingestion; the adapter never calls Base44 directly. The queue's existing
+owner isolation and local-storage security limitations remain unchanged. Logout
+stops HealthKit ingestion, leaves the previous user's queued data intact, and
+does not revoke iOS Health permissions (the user manages those in Settings).
+Diagnostics display counts, timestamps and queue delivery only, never raw values.
+
+Build 5 TypeScript behavior and queue integration are covered by mocked tests.
+Device certification is **PENDING**: Mac/Xcode, signing with the HealthKit
+entitlement, a physical iPhone, explicit permissions, actual samples and safe
+server-side validation are required. The optional provenance fields in the
+observation payload also require validation against production Base44 ingestion
+before claiming end-to-end device delivery.
