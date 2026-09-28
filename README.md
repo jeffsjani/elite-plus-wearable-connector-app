@@ -276,3 +276,88 @@ Code tests are mocked and Android debug compilation is verified in Codespaces;
 Apple Health device certification and ROOK live-provider certification remain
 deferred. Do not interpret code tests as real Android permissions or provider
 delivery. Optional provenance fields still need live Base44 ingestion validation.
+
+## Build 7A: JCVital V8 Maximum-Data Integration (architecture only — see blockers)
+
+Build 7A targets the JCVital V8 as a high-resolution sensor acquisition source.
+**No native Android JCVital SDK artifact (AAR/JAR/Kotlin/Java source, sample
+project, or BLE transport library) was present in this workspace or attached
+to this task.** Per the explicit "do not invent native API method names"
+requirement, the native Capacitor Kotlin bridge and its Android build/manifest
+steps were **not implemented** in this build. Full details, evidence, and the
+exact unblock steps are in
+[`src/adapters/jcvital/README.md`](src/adapters/jcvital/README.md).
+
+What secondary evidence was available and inspected: the vendor's published
+cross-platform wrapper `@moshenguo/ms-data-sdk@0.1.13` (npm), which explicitly
+lists `V8` as a `DeviceType` and contains the real BLE command/protocol byte
+encoding (`BleConst`, `DeviceKey`, `BleSDK`). The referenced Flutter package
+`ms_ble_data_analysis` (V8 branch) was not resolvable on pub.dev and could not
+be inspected. This secondary evidence is documentation-grade only — it is a
+protocol parser, not an Android transport/connection library — so it cannot
+substitute for the native Android SDK required to build the real Bluetooth
+bridge, and no CONFIRMED_V8 status was ever assigned purely from it.
+
+**Workout-HR cadence evidence found:** the JStyle/JCVital "dynamic HR" history
+records (`GetDynamicHR` / `ArrayDynamicHR`) are 24-byte blocks: one BCD
+timestamp per block followed by 15 heart-rate sample bytes. This is consistent
+with a 5-second per-sample cadence (15 samples x 5s = 75s per block), matching
+the task's default evidence policy. No SDK command, firmware field, or OEM
+statement indicating 1-second **stored** workout HR was found. Per Build 7A
+policy this remains `MARKETING_1S_CLAIM_UNVERIFIED`, tracked separately from
+the confirmed 5-second default, in `JCVitalCapabilities.ts`.
+
+**What was built (TypeScript layer only, fully tested):**
+
+- `src/adapters/jcvital/JCVitalCapabilities.ts` — `WorkoutHrCapability` model,
+  `resolveWorkoutHrCapabilityState()` (the six required capability states),
+  and `JCVitalCapabilityRegistry` (evidence-graded per capability:
+  `CONFIRMED_V8` / `STRONG_SDK_EVIDENCE` / `UNVERIFIED_V8` /
+  `MARKETING_CLAIM_UNVERIFIED` / `EXPLICITLY_UNSUPPORTED`).
+- `src/adapters/jcvital/HeartRateSeries.ts` — the single generic
+  `HeartRateSeries`/`HeartRateSample` model that supports 5-second, 1-second,
+  and realtime cadences without a schema fork; per-sample timestamps take
+  priority over cadence-derived ones (`timestampDerived` flag); observed-cadence
+  diagnostics (`computeCadenceDiagnostics`) never relabel a nominal cadence;
+  size-bounded, reassemblable chunking (`chunkHeartRateSeries`,
+  `DEFAULT_MAX_CHUNK_BYTES`); deterministic scalar/series/chunk IDs
+  (SHA-256 of owner+source+device+native-record-id, with a metric/timestamp
+  fallback for series chunks).
+- `src/adapters/jcvital/jcvitalBridge.ts` — the Elite+-owned Capacitor plugin
+  **contract** (method/event names are Elite+'s own bridge surface, informed
+  by but not copied from vendor command names) so the adapter can be built and
+  tested now and a native implementation can be dropped in later without a
+  redesign. **No native Kotlin implementation exists for this contract yet.**
+- `src/adapters/jcvital/JCVitalAdapter.ts` — lifecycle, capability negotiation
+  (upgrades cadence only when the connected device runtime actually reports
+  it), scalar-history sync to the existing Build 3 durable queue, workout
+  history sync producing chunked `HeartRateSeries`, activity-mode label table,
+  and logout/account-isolation cleanup. **Never calls Base44 directly.**
+
+**Base44 schema preflight — STOP condition triggered (task section 38):** the
+existing `NativeObservationInput` (`src/services/base44/base44Types.ts`) has a
+single scalar `valueNumber: number` field. It cannot represent HR series
+chunks, PPI/RR interval chunks, PPG/ECG chunks, or sleep/movement epoch
+arrays. Per explicit instruction, arrays were **not** encoded into scalar
+string fields as a workaround. `JCVitalAdapter` enqueues only genuinely scalar
+observations (heart rate, SpO2, temperature, workout calories/steps/distance)
+through the existing queue; it buffers workout HR series chunks locally
+(`getPendingSeriesChunks()`) and reports `seriesIngestionBlocked: true` with a
+reason in its diagnostics. **Required extension to unblock:** either an
+optional array/blob payload field on `NativeObservationInput` (e.g. a
+`seriesChunk` object matching `HeartRateSeriesChunk`) or a new Base44
+connector function/endpoint (e.g. `nativeConnectorSeriesChunks`) accepting
+`{ installId, connectorDeviceId, batchId, chunks }`. This is a decision for
+the Base44 backend owner, not something this build should assume.
+
+**Not implemented in Build 7A (blocked, not skipped):** native Kotlin plugin,
+BLE pairing UI, Android manifest/permission changes, `npx cap sync android`
+and `./gradlew assembleDebug`, and Base44 delivery of any series/raw-signal
+data. All of these require either the actual vendor Android SDK artifact or a
+Base44 schema decision; both are external inputs this build could not invent.
+
+Certification: `BUILD_7A_CODE_CERTIFIED` = **PARTIAL** (TypeScript capability
+model, HeartRateSeries model, and adapter architecture are code-certified and
+covered by unit tests; native bridge and Base44 series delivery are not yet
+implemented). `BUILD_7A_DEVICE_CERTIFIED` = **PENDING** (no hardware, no
+native SDK).
