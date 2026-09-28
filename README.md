@@ -139,3 +139,35 @@ claim is made. No wearable SDK or native background scheduler is integrated.
 
 The live queue tests used only synthetic connector observations. No real health
 data was sent.
+
+## Build 4B: ROOK Cloud Provider Connections
+
+Authenticated users can connect and disconnect Garmin, Oura, Polar, Fitbit,
+Withings, WHOOP, and Dexcom. The connector sends only the uppercase provider
+`dataSource` to the authenticated Base44 raw functions `rookGetAuthorization`,
+`rookAuthorizationStatus`, and `rookRevokeAuthorization`. Base44 derives the
+user's ROOK identity; no ROOK SDK, client UUID, Basic Auth, HMAC, or server
+secret is shipped in the app. No custom redirect URL is requested in Build 4B.
+If a provider requires one, its actual server-side requirement must be confirmed
+before adding it.
+
+Provider login opens via `@capacitor/browser` on iOS/Android, never inside a
+credential webview. Browser development opens a new tab; if the popup is blocked,
+the waiting provider offers an explicit Open Authorization button. Completing
+the browser flow does not itself mark the provider connected. On native foreground
+return the connector checks only the provider awaiting authorization; Check
+Connection and Refresh Connections provide manual status checks. Statuses load
+on opening the authenticated screen with at most two concurrent checks. The
+client displays only timestamps returned by Base44, and absence of health data
+does not imply disconnection. Disconnect requires confirmation and calls
+`rookRevokeAuthorization`, then checks server status; historical records remain.
+
+Cloud health records flow directly from ROOK to
+`handleRookDataWebhook` on Base44, then through existing server processing.
+They never enter the Build 3 local observation queue; no canonical scoring or
+webhook processing is performed in the mobile app.
+
+Build 4B automated connection tests are mocked and do not certify a live
+provider login. Garmin authorization URL, live provider login, webhook arrival,
+and safe server-side data verification remain pending an authenticated test
+session and approved Garmin account.

@@ -155,7 +155,8 @@ button.secondary {
 
 .result-panel,
 .diagnostics,
-.queue-panel {
+.queue-panel,
+.wearables {
   margin-top: 32px;
   padding-top: 22px;
   border-top: 1px solid #d6ddd8;
@@ -163,7 +164,8 @@ button.secondary {
 
 .result-panel h2,
 .diagnostics h2,
-.queue-panel h2 {
+.queue-panel h2,
+.wearables h2 {
   margin: 0 0 14px;
   color: #142522;
   font-family: Georgia, 'Times New Roman', serif;
@@ -201,6 +203,51 @@ button.secondary {
 
 .diagnostics button {
   justify-self: start;
+}
+
+.wearables-heading,
+.wearable-row,
+.wearable-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.wearables-heading,
+.wearable-row {
+  justify-content: space-between;
+}
+
+.wearables-heading button,
+.wearable-actions button {
+  padding: 9px 12px;
+  font-size: 0.82rem;
+}
+
+.wearable-row {
+  flex-wrap: wrap;
+  padding: 16px 0;
+  border-top: 1px solid #d6ddd8;
+}
+
+.wearable-info {
+  display: grid;
+  gap: 4px;
+  color: #5f6b66;
+  font-size: 0.88rem;
+}
+
+.wearable-info strong {
+  color: #142522;
+  font-size: 1rem;
+}
+
+.wearable-info .error-message {
+  margin: 0;
+}
+
+.wearable-actions {
+  flex-wrap: wrap;
 }
 
 .details {
