@@ -1,6 +1,6 @@
 export type ConnectorPlatform = 'web' | 'ios' | 'android'
 
-export type SourceStatus = 'unavailable' | 'disconnected' | 'ready' | 'syncing' | 'error' | 'connected' | 'permission_required' | 'unsupported'
+export type SourceStatus = 'unavailable' | 'disconnected' | 'ready' | 'syncing' | 'error' | 'connected' | 'permission_required' | 'unsupported' | 'not_installed' | 'update_required'
 
 export interface PermissionResult {
   granted: boolean

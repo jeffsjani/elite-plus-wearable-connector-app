@@ -53,6 +53,9 @@ export interface NativeObservationInput {
   provider: string
   sourceRecordId?: string
   sourceId?: string
+  originPackage?: string
+  deviceManufacturer?: string
+  deviceModel?: string
 }
 
 export interface ConnectorObservationsRequest {

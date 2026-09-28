@@ -218,3 +218,61 @@ entitlement, a physical iPhone, explicit permissions, actual samples and safe
 server-side validation are required. The optional provenance fields in the
 observation payload also require validation against production Base44 ingestion
 before claiming end-to-end device delivery.
+
+## Build 6: Direct Android Health Connect
+
+An app-local Capacitor 8 Kotlin bridge uses the official
+`androidx.health.connect:connect-client:1.1.0` SDK. The dual-platform Capacitor
+health package was not installed: it adds write permissions and an Android API
+26 requirement to the app. The official SDK also requires API 26, so the app
+retains its existing API 24 minimum with a scoped manifest library override;
+the bridge is only registered on API 28+ and reports `UNSUPPORTED` below that.
+The target/compile SDK remains 36. Android 14+ uses the system Health Connect
+provider; on supported earlier versions the separate provider app may need to
+be installed or updated. Availability distinguishes unavailable, missing and
+update-required states; permissions are checked from the native controller.
+
+Users choose read types before requesting permissions. The manifest declares
+only `READ_HEART_RATE`, `READ_RESTING_HEART_RATE`,
+`READ_HEART_RATE_VARIABILITY`, `READ_SLEEP`, `READ_STEPS`,
+`READ_ACTIVE_CALORIES_BURNED`, `READ_EXERCISE`, `READ_RESPIRATORY_RATE`,
+`READ_OXYGEN_SATURATION`, `READ_WEIGHT`, `READ_HEIGHT`, and
+`READ_BODY_TEMPERATURE`. No write, history, or background health permission is
+requested. Metrics include sampled heart rate, resting heart rate, HRV RMSSD,
+sleep sessions/stages, steps, active calories, exercise duration, respiratory
+rate, oxygen saturation, mass, height and body temperature. Health Connect
+RMSSD differs from Apple Health's SDNN. Unavailable values are not synthesized.
+
+An initial read covers seven days (configurable) with native page traversal.
+The bridge obtains a changes token before reading history and subsequently
+consumes paged upsertion and deletion events. Tokens are scoped to the Elite+
+owner and selected record types, and advance only after upsertions enter the
+durable queue. An expired token triggers a bounded history retry; changes older
+than seven days may be missed after expiry. IDs hash owner, `health_connect`,
+record ID (plus series entry index), and native last-modified time. This makes
+retries idempotent; an updated record creates a distinct version, **not** an
+in-place replacement. Deleted record IDs are counted as diagnostics but the
+existing Base44 ingestion API offers no deletion operation, so historical
+observations are not removed. Device certification must evaluate this policy.
+
+Records retain the origin package as provider, record ID, optional device
+manufacturer/model, timezone offset when present, and Health Connect dates and
+units. Health Connect aggregates many apps and wearables; records are not
+attributed to the phone by default. All measurements flow through
+`ObservationQueue.enqueueMany()` and `ObservationBatchManager`, never directly
+to Base44. Account switching stops the adapter and the Build 3 queue remains
+owner-scoped. Diagnostics show counts and timestamps only.
+
+Code tests are mocked and Android debug compilation is verified in Codespaces;
+**physical-device certification is PENDING**. On Windows with Android Studio:
+
+1. Open the `android/` project and connect an Android 9+ phone with a supported Health Connect provider.
+2. Install the debug build and sign in to the Elite+ test account.
+3. Select the desired types, authorize Health Connect and run Sync Now.
+4. Verify safe Base44 delivery and provenance, without inspecting raw values in the mobile UI.
+5. Repeat sync, restart the app, sync again and verify stable IDs/no extra uploads.
+6. Revoke a permission in Health Connect and verify the Connector returns to Permission Required.
+
+Apple Health device certification and ROOK live-provider certification remain
+deferred. Do not interpret code tests as real Android permissions or provider
+delivery. Optional provenance fields still need live Base44 ingestion validation.
