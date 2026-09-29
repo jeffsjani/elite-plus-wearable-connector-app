@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical" >
+
+    <ProgressBar
+        android:layout_marginTop="50dp"
+        android:id="@+id/progressBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:indeterminate = "false"
+        android:progress="0"
+        android:max="100"
+        android:layout_marginBottom="20dp"
+        style="@style/Widget.AppCompat.ProgressBar.Horizontal"/>
+
+    <LinearLayout
+
+        android:layout_width="match_parent"
+        android:layout_height="150dp" >
+
+        <Button
+            android:id="@+id/start"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:text="开始\nstart" />
+
+        <Button
+            android:id="@+id/send"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:text="发送血糖结果给设备\nSend the blood glucose risk result to the device" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/info"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center" />
+
+
+
+
+
+</LinearLayout>

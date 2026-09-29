@@ -1,0 +1,85 @@
+apply plugin: 'com.android.library'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+
+android {
+    compileSdkVersion 34
+
+    lintOptions{
+        abortOnError false
+    }
+
+    defaultConfig {
+        minSdkVersion 18
+        targetSdk 35
+        versionCode 1
+        versionName "2.0"
+        testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+        //testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner  build/outputs/aar"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+
+/*   task makeJar(type:Copy) {
+        include "com/jstyle/blesdk2301/**"
+        //设置拷贝的文件
+        from('build/intermediates/javac/debug/classes')
+        //打进jar包后的文件目录
+        into('outputs/')
+        //将classes.jar放入build/libs/目录下
+        //include ,exclude参数来设置过滤
+        include('classes.jar')
+        //重命名
+        rename ('classes.jar', '2301sdk' + defaultConfig.versionName + '.jar')
+    }
+
+    makeJar.dependsOn(build)*/
+
+    task makejar(type: Jar) {
+        from file('build/intermediates/javac/debug/classes')
+        archiveName = 'v8sdk' + defaultConfig.versionName + '.jar'
+        destinationDir = file('build/libs')
+        include "com/jstyle/blesdkv8/**"
+        rename ('classes.jar', 'v8sdk' + defaultConfig.versionName + '.jar')
+    }
+    kotlinOptions {
+        jvmTarget = '11'
+    }
+    makejar.dependsOn(build)
+
+   /* task makeJar(type: Copy) {
+        from file('build/intermediates/javac/debug/classes')
+        into('build/libs/')
+        include "com/jstyle/blesdk2301/**"
+//重命名
+        rename('classes.jar','2301sdk' + defaultConfig.versionName + '.jar')
+    }
+    makeJar.dependsOn(build)*/
+/*    task makejar(type: Jar) {
+
+        into = file('build/outputs'){
+            from file('build/intermediates/javac/debug/classes')
+            archiveName = '2301sdk' + defaultConfig.versionName + '.jar'
+        }
+       include "com/jstyle/blesdk2301/**"
+
+
+    }*/
+ /* makejar.dependsOn(build)*/
+
+}
+
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+
+
+    testImplementation 'junit:junit:4.12'
+    androidTestImplementation 'com.android.support.test:runner:1.0.2'
+    androidTestImplementation 'com.android.support.test.espresso:espresso-core:3.0.2'
+}

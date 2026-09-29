@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="item_options">
+        <item>设置/获取设备时间</item>
+        <item>基础信息</item>
+        <item>恢复出厂设置</item>
+        <item>电池电量</item>
+        <item>获取设备Mac</item>
+        <item>设备版本</item>
+        <item>重置MCU</item>
+        <item>实时计步</item>
+        <item>自动区间</item>
+        <item>获得计步总数据</item>
+        <item>获得步数详细数据</item>
+        <item>睡眠数据</item>
+        <item>心率历史数据</item>
+        <item>静态心率历史数据</item>
+        <item>Hrv数据</item>
+        <item>温度数据</item>
+        <item>设备自动\n测试血氧数据</item>
+        <item>运动模式</item>
+        <item>设备名</item>
+        <item>运动历史</item>
+        <item>血糖</item>
+        <item>获得睡眠详细数据</item>
+        <item>实时温度</item>
+        <item>设备基本参数</item>
+        <item>ECG</item>
+        <item>闹钟</item>
+        <item>久坐提醒</item>
+        <item>PPI</item>
+        <item>Log</item>
+    </string-array>
+
+    <string-array name="weekarray">
+        <item>Sunday</item>
+        <item>Monday</item>
+        <item>Tuesday</item>
+        <item>Wednesday</item>
+        <item>Thursday</item>
+        <item>Friday</item>
+        <item>Saturday</item>
+    </string-array>
+
+    <string-array name="nofityarray">
+        <item>Tel</item>
+        <item>Sms</item>
+        <item>Wechat</item>
+        <item>Facebook</item>
+        <item>Instagram</item>
+        <item>Skype</item>
+        <item>Telegram</item>
+        <item>Twitter</item>
+        <item>vkclient</item>
+        <item>WhatApp</item>
+        <item>QQ</item>
+        <item>In</item>
+        <item>Stop_Tel</item>
+    </string-array>
+
+    <string-array name="sport">
+        <item>跑步</item>
+        <item>骑行</item>
+        <item>步行</item>
+        <item>羽毛球</item>
+        <item>足球</item>
+        <item>网球</item>
+        <item>呼吸训练</item>
+        <item>跳舞</item>
+        <item>篮球</item>
+        <item>举重</item>
+        <item>板球</item>
+        <item>徒步</item>
+        <item>有氧训练</item>
+        <item>乒乓球</item>
+        <item>跳绳</item>
+        <item>仰卧起坐</item>
+        <item>排球</item>
+        <item>手球</item>
+        <item>棒球</item>
+        <item>曲棍球</item>
+        <item>击剑</item>
+        <item>拳击</item>
+        <item>自由搏击</item>
+        <item>摔跤</item>
+        <item>标枪</item>
+        <item>撑杆跳</item>
+        <item>跳高</item>
+        <item>双人划船</item>
+        <item>帆船</item>
+        <item>划船</item>
+        <item>平衡木</item>
+        <item>艺术体操</item>
+        <item>跳远</item>
+        <item>铅球</item>
+        <item>链球</item>
+        <item>蹦床</item>
+        <item>吊环</item>
+        <item>鞍马</item>
+        <item>单杠</item>
+        <item>铁人三项</item>
+        <item>保龄球</item>
+        <item>滑雪</item>
+        <item>滑冰</item>
+        <item>跑步机</item>
+        <item>动感单车</item>
+    </string-array>
+
+
+
+
+    <string-array name="week">
+        <item>Sun</item>
+        <item>Mon</item>
+        <item>Tue</item>
+        <item>Wed</item>
+        <item>Thu</item>
+        <item>Fri</item>
+        <item>Sat</item>
+    </string-array>
+    <string-array name="mode_name">
+        <item>跑步</item>
+        <item>骑行</item>
+        <item>羽毛球</item>
+        <item>足球</item>
+        <item>网球</item>
+        <item>瑜伽</item>
+        <item>冥想</item>
+        <item>跳舞</item>
+        <item>篮球</item>
+        <item>步行</item>
+        <item>有氧训练</item>
+        <item>板球</item>
+        <item>徒步</item>
+        <item>有氧训练</item>
+        <item>乒乓球</item>
+     <!--   <item>跑步</item>
+        <item>骑行</item>
+        <item>步行</item>
+        <item>羽毛球</item>
+        <item>足球</item>
+        <item>网球</item>
+        <item>呼吸训练</item>
+        <item>跳舞</item>
+        <item>篮球</item>
+        <item>举重</item>
+        <item>板球</item>
+        <item>徒步</item>
+        <item>有氧训练</item>
+        <item>乒乓球</item>
+        <item>跳绳</item>
+        <item>仰卧起坐</item>
+        <item>排球</item>
+        <item>手球</item>
+        <item>棒球</item>
+        <item>曲棍球</item>
+        <item>击剑</item>
+        <item>拳击</item>
+        <item>自由搏击</item>
+        <item>摔跤</item>
+        <item>标枪</item>
+        <item>撑杆跳</item>
+        <item>跳高</item>
+        <item>双人划船</item>
+        <item>帆船</item>
+        <item>划船</item>
+        <item>平衡木</item>
+        <item>艺术体操</item>
+        <item>跳远</item>
+        <item>铅球</item>
+        <item>链球</item>
+        <item>蹦床</item>
+        <item>吊环</item>
+        <item>鞍马</item>
+        <item>单杠</item>
+        <item>铁人三项</item>
+        <item>保龄球</item>
+        <item>滑雪</item>
+        <item>滑冰</item>
+        <item>跑步机</item>
+        <item>动感单车</item>-->
+    </string-array>
+
+</resources>

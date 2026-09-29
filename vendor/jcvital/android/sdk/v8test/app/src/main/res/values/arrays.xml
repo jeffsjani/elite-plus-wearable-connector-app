@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="item_options">
+        <item>Set/Get Device Time</item>
+        <item>Set Personal Information</item>
+        <item>Reset Device to Out-Of-Factory Mode</item>
+        <item>Get Battery Level</item>
+        <item>Get Device Mac Add</item>
+        <item>Device version</item>
+        <item>Reset MCU</item>
+        <item>Real Time Measurement</item>
+        <item>Auto Vital Signs Monitoring Setting</item>
+        <item>Get Total Steps</item>
+        <item>Get Detailed Steps Data</item>
+        <item>Get Detailed Sleep Data</item>
+        <item>Get History Data for Heart Rate</item>
+        <item>Get History Data for Rest Heart Rate</item>
+        <item>Get History Data for HRV</item>
+        <item>Get History Data for Temperature</item>
+        <item>Get History Data for Auto SpO2 Monitor</item>
+        <item>sports mode</item>
+        <item>device name</item>
+        <item>Exericse Mode</item>
+        <item>Blood glucose test</item>
+        <item>Obtain detailed sleep data</item>
+        <item>Real-time temperature</item>
+        <item>Basic parameters of equipment</item>
+        <item>ECG</item>
+        <item>Alarm clock</item>
+        <item>Sit-reminder</item>
+        <item>PPI</item>
+        <item>Log</item>
+
+    </string-array>
+
+    <string-array name="weekarray">
+        <item>Sunday</item>
+        <item>Monday</item>
+        <item>Tuesday</item>
+        <item>Wednesday</item>
+        <item>Thursday</item>
+        <item>Friday</item>
+        <item>Saturday</item>
+    </string-array>
+
+    <string-array name="nofityarray">
+        <item>Tel</item>
+        <item>Sms</item>
+        <item>Wechat</item>
+        <item>Facebook</item>
+        <item>Instagram</item>
+        <item>Skype</item>
+        <item>Telegram</item>
+        <item>Twitter</item>
+        <item>vkclient</item>
+        <item>WhatApp</item>
+        <item>QQ</item>
+        <item>In</item>
+        <item>Stop_Tel</item>
+    </string-array>
+
+    <string-array name="mode_name">
+        <item>Run</item>
+        <item>Cycling</item>
+        <item>Badminton</item>
+        <item>Football</item>
+        <item>Tennis</item>
+        <item>Yoga</item>
+        <item>Meditation</item>
+        <item>Dance</item>
+        <item>Basketball</item>
+        <item>Walk</item>
+        <item>Workout</item>
+        <item>Cricket</item>
+        <item>Hiking</item>
+        <item>Aerobics</item>
+        <item>Ping-Pong</item>
+   <!--     <item>Run</item>
+        <item>Cycling</item>
+        <item>Walking</item>
+        <item>Badminton</item>
+        <item>Football</item>
+        <item>Tennis</item>
+        <item>Breathing Training</item>
+        <item>Dancing</item>
+        <item>Basketball</item>
+        <item>Weightlifting</item>
+        <item>Cricket</item>
+        <item>Hiking</item>
+        <item>Aerobics</item>
+        <item>Table Tennis</item>
+        <item>Jump Rope</item>
+        <item>Sit-ups</item>
+        <item>Volleyball</item>
+        <item>Handball</item>
+        <item>Baseball</item>
+        <item>Field Hockey</item>
+        <item>Fencing</item>
+        <item>Boxing</item>
+        <item>Mixed Martial Arts</item>
+        <item>Wrestling</item>
+        <item>Javelin Throw</item>
+        <item>Pole Vault</item>
+        <item>High Jump</item>
+        <item>Double Rowing</item>
+        <item>Sailing</item>
+        <item>Rowing</item>
+        <item>Balance Beam</item>
+        <item>Artistic Gymnastics</item>
+        <item>Long Jump</item>
+        <item>Shot Put</item>
+        <item>Hammer Throw</item>
+        <item>Trampoline</item>
+        <item>Rings</item>
+        <item>Pommel Horse</item>
+        <item>Horizontal Bar</item>
+        <item>Triathlon</item>
+        <item>Bowling</item>
+        <item>Skiing</item>
+        <item>Ice Skating</item>
+        <item>Treadmill</item>
+        <item>Spinning</item>-->
+    </string-array>
+
+    <string-array name="sport">
+        <item>Run</item>
+        <item>Cycling</item>
+        <item>Walking</item>
+        <item>Badminton</item>
+        <item>Football</item>
+        <item>Tennis</item>
+        <item>Breathing Training</item>
+        <item>Dancing</item>
+        <item>Basketball</item>
+        <item>Weightlifting</item>
+        <item>Cricket</item>
+        <item>Hiking</item>
+        <item>Aerobics</item>
+        <item>Table Tennis</item>
+        <item>Jump Rope</item>
+        <item>Sit-ups</item>
+        <item>Volleyball</item>
+        <item>Handball</item>
+        <item>Baseball</item>
+        <item>Field Hockey</item>
+        <item>Fencing</item>
+        <item>Boxing</item>
+        <item>Mixed Martial Arts</item>
+        <item>Wrestling</item>
+        <item>Javelin Throw</item>
+        <item>Pole Vault</item>
+        <item>High Jump</item>
+        <item>Double Rowing</item>
+        <item>Sailing</item>
+        <item>Rowing</item>
+        <item>Balance Beam</item>
+        <item>Artistic Gymnastics</item>
+        <item>Long Jump</item>
+        <item>Shot Put</item>
+        <item>Hammer Throw</item>
+        <item>Trampoline</item>
+        <item>Rings</item>
+        <item>Pommel Horse</item>
+        <item>Horizontal Bar</item>
+        <item>Triathlon</item>
+        <item>Bowling</item>
+        <item>Skiing</item>
+        <item>Ice Skating</item>
+        <item>Treadmill</item>
+        <item>Spinning</item>
+    </string-array>
+    <string-array name="week">
+        <item>Sun</item>
+        <item>Mon</item>
+        <item>Tue</item>
+        <item>Wed</item>
+        <item>Thu</item>
+        <item>Fri</item>
+        <item>Sat</item>
+    </string-array>
+</resources>

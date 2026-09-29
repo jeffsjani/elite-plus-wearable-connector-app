@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!--BLUETOOTH-->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ ADMIN"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+
+    <application
+        android:name="com.jstyle.testv8.base.Myapp"
+        android:allowBackup="true"
+        android:preserveLegacyExternalStorage="true"
+        android:requestLegacyExternalStorage="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.MyApplication">
+        <activity
+            android:name="com.jstyle.testv8.ui.DeviceScanActivity"
+            android:theme="@style/Theme.AppCompat.DayNight.DarkActionBar"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity android:name=".MainActivity" android:exported="true"/>
+        <activity android:name=".ui.TimeActivity" android:exported="true"/>
+        <activity android:name=".ui.BasicActivity" android:exported="true"/>
+        <activity android:name=".ui.ExfactoryActivity" android:exported="true"/>
+        <activity android:name=".ui.BatteryActivity" android:exported="true"/>
+        <activity android:name=".ui.MacAddressActivity" android:exported="true"/>
+        <activity android:name=".ui.VersionActivity" android:exported="true"/>
+        <activity android:name=".ui.MCUActivity" android:exported="true"/>
+        <activity android:name=".ui.RealTimeStepCountingActivity" android:exported="true"/>
+        <activity android:name=".ui.AutoModeSetActivity" android:exported="true"/>
+        <activity android:name=".ui.AlarmListActivity" android:exported="true"/>
+        <activity android:name=".ui.AlarmSetActivity" android:exported="true"/>
+        <activity android:name=".ui.ActivityAlarmSetActivity" android:exported="true"/>
+        <activity android:name=".ui.TotalDataActivity" android:exported="true"/>
+        <activity android:name=".ui.DetailDataActivity" android:exported="true"/>
+        <activity android:name=".ui.DetailSleepActivity" android:exported="true"/>
+        <activity android:name=".ui.HeartRateInfoActivity" android:exported="true"/>
+        <activity android:name=".ui.HeartRateStaticInfoActivity" android:exported="true"/>
+        <activity android:name=".ui.HrvDataReadActivity" android:exported="true"/>
+        <activity android:name=".ui.ExerciseHistoryDataActivity" android:exported="true"/>
+        <activity android:name=".ui.ActivityModeActivity" android:exported="true"/>
+        <activity android:name=".ui.Automatically_test_blood_oxygen_dataActivity" android:exported="true"/>
+        <activity android:name=".ui.AutoTemperatureHistoryActivity" android:exported="true"/>
+        <activity android:name=".ui.ActivityDevicesNameActivity" android:exported="true"/>
+      <activity android:name=".ui.Basic_parameters_of_equipmentActivity" android:exported="true" />
+      <activity android:name=".ui.BloodGlucoseActivity" android:exported="true" />
+      <activity android:name=".ui.ECGActivity" android:exported="true" />
+      <activity android:name=".ui.ObtainDetailedSleepdataActivity" android:exported="true" />
+      <activity android:name=".ui.RealTimeTemperatureActivity" android:exported="true" />
+      <activity android:name=".ui.PPIDataActivity" android:exported="true" />
+      <activity android:name=".ui.OtaInfoActivity" android:exported="true" />
+        <activity android:name=".ui.OtaActivity" android:exported="true" android:theme="@style/Theme.MaterialComponents.Dialog"/>
+
+        <service android:name="com.jstyle.testv8.ble.DfuService" android:exported="true" />
+
+        <service
+            android:name="com.jstyle.testv8.ble.BleService"
+            android:exported="true"
+            android:foregroundServiceType="location" />
+
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.provider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/filepaths" />
+        </provider>
+
+    </application>
+
+</manifest>

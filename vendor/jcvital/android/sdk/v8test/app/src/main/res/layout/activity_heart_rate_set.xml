@@ -1,0 +1,201 @@
+
+
+
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+xmlns:tools="http://schemas.android.com/tools"
+android:layout_width="match_parent"
+android:layout_height="match_parent"
+tools:context="com.jstyle.test2151.activity.HeartRateSetActivity">
+<RadioGroup
+    android:layout_marginTop="50dp"
+    android:layout_centerHorizontal="true"
+    android:id="@+id/radioGroup_autoHeart"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:layout_gravity="center_horizontal"
+    android:orientation="horizontal" >
+
+    <RadioButton
+        android:id="@+id/radio_autoheart_disable"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:gravity="center"
+        android:checked="true"
+        android:text="关闭\n Auto Vital \n Signs Monitor \nAlways Disabled" />
+
+    <RadioButton
+        android:id="@+id/radio_autoheart_enable"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:text="一直开\nAuto Vital\n Signs Monitor\n Always Enabled" />
+    <RadioButton
+        android:id="@+id/radio_autoheart_interval"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:layout_gravity="center"
+        android:text="间断开\nAuto Vital\n Signs Monitor\n Operates at\n Intervals" />
+
+
+</RadioGroup>
+
+
+
+
+<LinearLayout
+    android:layout_below="@+id/radioGroup_autoHeart"
+    android:id="@+id/linearLayout1"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal" >
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical" >
+
+        <TextView
+            android:id="@+id/textView1"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:text="StartTime" />
+
+        <TimePicker
+            android:id="@+id/timePicker_start"
+            android:timePickerMode="spinner"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:orientation="vertical" >
+
+        <TextView
+            android:id="@+id/textView2"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:text="StopTime" />
+
+        <TimePicker
+            android:timePickerMode="spinner"
+            android:id="@+id/timePicker_stop"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content" />
+    </LinearLayout>
+</LinearLayout>
+    <RadioGroup
+        android:layout_below="@+id/linearLayout1"
+        android:id="@+id/radioGroup_all"
+        android:layout_width="match_parent"
+        android:layout_gravity="center"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal" >
+
+        <RadioButton
+            android:id="@+id/radio_1"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:layout_margin="8dp"
+            android:layout_height="wrap_content"
+            android:checked="true"
+            android:text="HeartRate" />
+        <RadioButton
+            android:layout_margin="8dp"
+            android:id="@+id/radio_2"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:layout_height="wrap_content"
+            android:text="Spo2" />
+
+        <RadioButton
+            android:layout_margin="8dp"
+            android:id="@+id/radio_3"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:layout_height="wrap_content"
+            android:text="Temp" />
+        <RadioButton
+            android:layout_margin="8dp"
+            android:id="@+id/radio_4"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:layout_height="wrap_content"
+            android:text="Hrv" />
+    </RadioGroup>
+<Button
+    android:id="@+id/button_weekchoose"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:layout_below="@+id/radioGroup_all"
+    android:layout_marginTop="20dp"
+    android:text="Week Choose" />
+
+<LinearLayout
+    android:id="@+id/ll2"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:layout_below="@+id/button_weekchoose"
+    android:orientation="horizontal" >
+
+    <TextView
+        android:id="@+id/textView"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="2"
+        android:gravity="center"
+        android:text="Minimal Interval" />
+
+    <EditText
+        android:id="@+id/edit_minute"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="2"
+        android:gravity="center" />
+
+    <TextView
+        android:id="@+id/textView4"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:gravity="center"
+        android:text="Minute" />
+</LinearLayout>
+
+
+<LinearLayout
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:layout_below="@+id/ll2"
+    android:layout_marginTop="26dp" >
+
+    <Button
+        android:id="@+id/button_set_activitytime"
+        android:layout_width="0dp"
+        android:layout_weight="1"
+        android:layout_height="wrap_content"
+        android:text="Set" />
+
+    <Button
+        android:id="@+id/button_get_activitytime"
+        android:layout_width="0dp"
+        android:layout_weight="1"
+        android:layout_height="wrap_content"
+        android:text="Get" />
+
+</LinearLayout>
+
+</RelativeLayout>
+
+

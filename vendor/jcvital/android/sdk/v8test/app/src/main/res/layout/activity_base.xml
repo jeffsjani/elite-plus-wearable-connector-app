@@ -1,0 +1,87 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    tools:context="com.jstyle.test2025.activity.TotalDataActivity">
+    <TextView
+        android:layout_marginTop="50dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:text="运动模式是否闪灯\nIs the sports mode flashing" />
+
+    <RadioGroup
+        android:id="@+id/radioGroup_mian"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:orientation="horizontal" >
+
+        <RadioButton
+            android:id="@+id/radio_yes"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:checked="true"
+            android:text="YES" />
+
+        <RadioButton
+            android:id="@+id/radio_no"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="NO" />
+    </RadioGroup>
+
+
+    <TextView
+        android:layout_marginTop="50dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:text="运动模式心率过高是否闪灯\nIs the light flashing when the heart rate is too high in sports mode" />
+
+    <RadioGroup
+        android:id="@+id/radioGroup_mian2"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:orientation="horizontal" >
+
+        <RadioButton
+            android:id="@+id/radio_yes2"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:checked="true"
+            android:text="YES" />
+
+        <RadioButton
+            android:id="@+id/radio_no2"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="NO" />
+    </RadioGroup>
+
+    <Button
+        android:layout_marginTop="50dp"
+        android:layout_width="match_parent"
+        android:text="Set"
+        android:id="@+id/set"
+        android:layout_height="wrap_content" />
+    <Button
+        android:layout_marginTop="10dp"
+        android:layout_width="match_parent"
+        android:text="Get"
+        android:id="@+id/get"
+        android:layout_height="wrap_content" />
+
+    <TextView
+        android:id="@+id/info"
+        android:textColor="@android:color/black"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"/>
+
+
+
+</LinearLayout>

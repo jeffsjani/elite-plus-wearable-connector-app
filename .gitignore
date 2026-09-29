@@ -28,3 +28,12 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# JCVital vendor SDK: generated build output, IDE state, and prebuilt demo APKs
+vendor/jcvital/android/sdk/**/build/
+vendor/jcvital/android/sdk/**/.gradle/
+vendor/jcvital/android/sdk/**/.idea/
+vendor/jcvital/android/sdk/**/.kotlin/
+vendor/jcvital/android/sdk/**/local.properties
+vendor/jcvital/android/sdk/V8.apk
+vendor/jcvital/android/sdk/V8_test_kontlin.apk

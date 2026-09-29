@@ -1,0 +1,30 @@
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    tools:context="com.jstyle.test2025.activity.AlarmListActivity">
+
+
+    <android.support.v7.widget.RecyclerView
+        android:layout_marginTop="50dp"
+        android:id="@+id/RecyclerView_alarm"
+        android:layout_width="match_parent"
+        android:layout_above="@+id/bt_add"
+        android:layout_height="match_parent"/>
+
+    <Button
+        android:id="@+id/bt_add"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_above="@+id/bt_edit"
+        android:text="Add"></Button>
+    <Button
+        android:id="@+id/bt_edit"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_alignParentBottom="true"
+        android:layout_marginBottom="50dp"
+        android:text="Edit"/>
+
+
+</RelativeLayout>                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
