@@ -220,6 +220,7 @@ export interface JCVitalV8RawEcgSession {
 export interface JCVitalV8RawEcgStartDiagnostics {
   diagnosticState: string
   diagnosticClassification: string
+  firstNotificationClassification: 'MEASUREMENT_COMMAND_RESPONSE' | 'REALTIME_FLAG_RESPONSE' | 'RAW_ECG_0X07' | 'VENDOR_STATUS' | 'UNKNOWN_NOTIFICATION' | null
   measurementStartCommand: {
     queuedAt: string | null
     writeAckAt: string | null
@@ -245,6 +246,20 @@ export interface JCVitalV8RawEcgStartDiagnostics {
   firstEcgStatusAt: string | null
   firstDataAvailableStatusAt: string | null
   ecgNoDataAfter10s: boolean
+  genericNotificationsAfterStart: Array<{
+    sequence: number
+    receivedAt: string
+    length: number
+    commandByteUnsigned: number
+    secondByteUnsigned: number | null
+    first16BytesHex: string
+    fullBytesHex?: string
+    afterMeasurementCommandAck: boolean
+    afterRealtimeFlagCommandAck: boolean
+    parserResultCount: number
+    sdkParserResult: 'NO_RESULT' | 'RESULT_WITH_DATA_TYPE' | 'RESULT_WITHOUT_DATA_TYPE' | 'MULTIPLE_RESULTS'
+    parserResults: Array<{ dataType: string; dataEnd: boolean | null }>
+  }>
 }
 
 export interface JCVitalV8RawEcgChunk {

@@ -115,6 +115,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         var realtimeFlagCommandQueuedAt: String? = null
         var realtimeFlagCommandWriteAckAt: String? = null
         var firstNotificationAfterStartAt: String? = null
+        val notificationDiagnostics = JCVitalV8RawEcgNotificationDiagnostics(System.currentTimeMillis())
         var firstCommand07NotificationAt: String? = null
         var lastCommand07NotificationAt: String? = null
         var rawCommand07NotificationCount = 0
@@ -226,6 +227,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                     "writeAckAt" to realtimeFlagCommandWriteAckAt,
                 ),
                 "firstNotificationAfterStartAt" to firstNotificationAfterStartAt,
+                "firstNotificationClassification" to notificationDiagnostics.firstNotificationClassification,
+                "genericNotificationsAfterStart" to notificationDiagnostics.genericNotificationsAfterStart,
                 "vendorDataTypesSeenAfterEcgStart" to vendorDataTypesSeenAfterEcgStart.values.toList(),
                 "rawCommand07NotificationCount" to rawCommand07NotificationCount,
                 "firstCommand07NotificationAt" to firstCommand07NotificationAt,
@@ -831,20 +834,23 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
             }
         }.also { main.postDelayed(it, 10_000L) }
 
-        enqueue(
-            "SetDeviceMeasurementWithType(ECG,50000,true)",
-            BleSDK.SetDeviceMeasurementWithType(AutoTestMode.ECG, ECG_DEMO_DURATION_ARGUMENT, true),
-        ) { written ->
+        val measurementStartCommand = BleSDK.SetDeviceMeasurementWithType(AutoTestMode.ECG, ECG_DEMO_DURATION_ARGUMENT, true)
+        capture.notificationDiagnostics.recordMeasurementCommand(measurementStartCommand)
+        enqueue("SetDeviceMeasurementWithType(ECG,50000,true)", measurementStartCommand) { written ->
             if (written) capture.recordWriteAck("SetDeviceMeasurementWithType(ECG,50000,true)")
             else capture.controlWriteFailed = true
+            if (written) capture.notificationDiagnostics.recordMeasurementCommandAck(System.currentTimeMillis())
             capture.diagnosticState = "START_COMMANDS_WRITING"
         }
         capture.recordQueued("SetDeviceMeasurementWithType(ECG,50000,true)")
-        enqueue("setECGRealtimeDuringHRVEnabled(true)", BleSDK.setECGRealtimeDuringHRVEnabled(true)) { written ->
+        val realtimeFlagCommand = BleSDK.setECGRealtimeDuringHRVEnabled(true)
+        capture.notificationDiagnostics.recordRealtimeFlagCommand(realtimeFlagCommand)
+        enqueue("setECGRealtimeDuringHRVEnabled(true)", realtimeFlagCommand) { written ->
             if (!written || capture.controlWriteFailed) {
                 failRawEcgCapture(capture, "ECG start command write failed")
             } else if (rawEcgCapture === capture && session.status == JCVitalV8RawEcgSession.STATUS_STARTING) {
                 capture.recordWriteAck("setECGRealtimeDuringHRVEnabled(true)")
+                capture.notificationDiagnostics.recordRealtimeFlagCommandAck(System.currentTimeMillis())
                 capture.startTimeout?.let(main::removeCallbacks)
                 capture.startTimeout = null
                 capture.diagnosticState = "WAITING_FOR_DEVICE"
@@ -1056,7 +1062,15 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
 
     private fun handleNotification(bytes: ByteArray) {
         if (bytes.isEmpty()) return
-        rawEcgCapture?.noteFirstNotificationAt(JCVitalV8Time.isoUtc(System.currentTimeMillis()))
+        val notificationReceivedAtMillis = System.currentTimeMillis()
+        val notificationReceivedAt = JCVitalV8Time.isoUtc(notificationReceivedAtMillis)
+        val capture = rawEcgCapture
+        capture?.noteFirstNotificationAt(notificationReceivedAt)
+        val notificationTrace = capture?.notificationDiagnostics?.captureNotification(
+            bytes,
+            notificationReceivedAt,
+            notificationReceivedAtMillis,
+        )
         val commandByte = String.format("0x%02X", bytes[0].toInt() and 0xFF)
         if ((bytes[0].toInt() and 0xFF) == JCVitalV8RawEcgSession.ECG_COMMAND_BYTE &&
             bytes.size > ECG_STREAM_MIN_NOTIFICATION_BYTES && rawEcgCapture != null
@@ -1067,12 +1081,30 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         try {
             BleSDK.DataParsingWithData(bytes, object : DataListener2301 {
                 override fun dataCallback(maps: MutableMap<String?, Any?>?) {
-                    maps?.let { vendorMaps += HashMap(it) }
+                    maps?.let {
+                        val copy = HashMap(it)
+                        if (notificationTrace != null) {
+                            capture?.notificationDiagnostics?.recordParserResult(
+                                notificationTrace,
+                                copy[DeviceKey.DataType]?.toString(),
+                                copy[DeviceKey.End] as? Boolean,
+                            )
+                        }
+                        vendorMaps += copy
+                    }
                 }
 
-                override fun dataCallback(value: ByteArray?) = Unit
+                override fun dataCallback(value: ByteArray?) {
+                    if (value != null && notificationTrace != null) {
+                        capture?.notificationDiagnostics?.recordParserResult(notificationTrace, null, null)
+                    }
+                }
             })
         } catch (t: Throwable) {
+            if (notificationTrace != null && capture != null) {
+                capture.notificationDiagnostics.finishNotification(notificationTrace, bytes)
+                emitRawEcgStatus(capture)
+            }
             Log.w(TAG, "SDK parse failed for $commandByte (${bytes.size} bytes, mtu=$negotiatedMtu): ${t.javaClass.simpleName}")
             if ((bytes[0].toInt() and 0xFF) == JCVitalV8RawEcgSession.ECG_COMMAND_BYTE) {
                 rawEcgCapture?.let { capture ->
@@ -1094,6 +1126,10 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         }
         if (vendorMaps.isEmpty()) {
             Log.d(TAG, "<- $commandByte not handled by SDK")
+            if (notificationTrace != null && capture != null) {
+                capture.notificationDiagnostics.finishNotification(notificationTrace, bytes)
+                emitRawEcgStatus(capture)
+            }
             return
         }
         vendorMaps.forEach { vendor ->
@@ -1107,6 +1143,10 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                 rawEcgCapture?.noteType64(fields[DeviceKey.packetID]?.toString()?.toIntOrNull(), sampleValues, JCVitalV8Time.isoUtc(System.currentTimeMillis()))
             }
             routeVendorData(vendor)
+        }
+        if (notificationTrace != null && capture != null) {
+            capture.notificationDiagnostics.finishNotification(notificationTrace, bytes)
+            emitRawEcgStatus(capture)
         }
     }
 
