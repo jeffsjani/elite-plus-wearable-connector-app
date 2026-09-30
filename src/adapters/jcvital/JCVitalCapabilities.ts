@@ -110,6 +110,91 @@ export interface CapabilityRecord {
   notes: string
 }
 
+export type V8SupportStatus =
+  | 'CONFIRMED_HARDWARE'
+  | 'CONFIRMED_SDK'
+  | 'PROVISIONAL'
+  | 'UNDERDOCUMENTED'
+  | 'VENDOR_DERIVED'
+  | 'UNSUPPORTED'
+  | 'ODM_REQUIRED'
+
+export interface V8Capability {
+  capability: string
+  supportStatus: V8SupportStatus
+  acquisitionMode: string
+  rawAvailable: boolean
+  historicalAvailable: boolean
+  realtimeAvailable: boolean
+  resolution: string | null
+  unit: string | null
+  validationStatus: 'PASSED' | 'HARDWARE_REQUIRED' | 'DOCUMENTATION_REQUIRED' | 'NOT_APPLICABLE'
+  nativeSdkAvailable: boolean
+}
+
+export const V8_CAPABILITY_REGISTRY: Record<string, V8Capability> = {
+  LIVE_WORKOUT_HR: {
+    capability: 'LIVE_WORKOUT_HR', supportStatus: 'PROVISIONAL', acquisitionMode: 'WORKOUT_REALTIME',
+    rawAvailable: true, historicalAvailable: false, realtimeAvailable: true, resolution: 'potential ~1 second',
+    unit: 'bpm', validationStatus: 'HARDWARE_REQUIRED', nativeSdkAvailable: true,
+  },
+  CONTINUOUS_HR_HISTORY: {
+    capability: 'CONTINUOUS_HR_HISTORY', supportStatus: 'CONFIRMED_SDK', acquisitionMode: 'HISTORICAL_SYNC',
+    rawAvailable: true, historicalAvailable: true, realtimeAvailable: false, resolution: '5 seconds nominal',
+    unit: 'bpm', validationStatus: 'HARDWARE_REQUIRED', nativeSdkAvailable: true,
+  },
+  AUTOMATIC_HR: {
+    capability: 'AUTOMATIC_HR', supportStatus: 'CONFIRMED_SDK', acquisitionMode: 'AUTOMATIC',
+    rawAvailable: true, historicalAvailable: true, realtimeAvailable: false, resolution: null,
+    unit: 'bpm', validationStatus: 'HARDWARE_REQUIRED', nativeSdkAvailable: true,
+  },
+  HISTORICAL_SPO2: {
+    capability: 'HISTORICAL_SPO2', supportStatus: 'CONFIRMED_SDK', acquisitionMode: 'HISTORICAL_SYNC',
+    rawAvailable: true, historicalAvailable: true, realtimeAvailable: false, resolution: null,
+    unit: 'percent', validationStatus: 'HARDWARE_REQUIRED', nativeSdkAvailable: true,
+  },
+  HISTORICAL_TEMPERATURE: {
+    capability: 'HISTORICAL_TEMPERATURE', supportStatus: 'CONFIRMED_SDK', acquisitionMode: 'HISTORICAL_SYNC',
+    rawAvailable: true, historicalAvailable: true, realtimeAvailable: false, resolution: null,
+    unit: 'celsius', validationStatus: 'HARDWARE_REQUIRED', nativeSdkAvailable: true,
+  },
+  PPI: {
+    capability: 'PPI', supportStatus: 'CONFIRMED_SDK', acquisitionMode: 'HISTORICAL_SYNC',
+    rawAvailable: true, historicalAvailable: true, realtimeAvailable: true, resolution: null,
+    unit: 'UNKNOWN_VENDOR_UNIT', validationStatus: 'HARDWARE_REQUIRED', nativeSdkAvailable: true,
+  },
+  RAW_PPG: {
+    capability: 'RAW_PPG', supportStatus: 'CONFIRMED_SDK', acquisitionMode: 'PPG_SESSION',
+    rawAvailable: true, historicalAvailable: false, realtimeAvailable: true, resolution: null,
+    unit: 'UNKNOWN', validationStatus: 'HARDWARE_REQUIRED', nativeSdkAvailable: true,
+  },
+  RAW_ECG: {
+    capability: 'RAW_ECG', supportStatus: 'CONFIRMED_SDK', acquisitionMode: 'ECG_SESSION',
+    rawAvailable: true, historicalAvailable: true, realtimeAvailable: true, resolution: 'three-byte vendor samples',
+    unit: 'UNKNOWN', validationStatus: 'HARDWARE_REQUIRED', nativeSdkAvailable: true,
+  },
+  RESPIRATORY_RATE_VENDOR: {
+    capability: 'RESPIRATORY_RATE_VENDOR', supportStatus: 'UNDERDOCUMENTED', acquisitionMode: 'ECG_SESSION',
+    rawAvailable: true, historicalAvailable: false, realtimeAvailable: true, resolution: null,
+    unit: 'UNKNOWN', validationStatus: 'DOCUMENTATION_REQUIRED', nativeSdkAvailable: true,
+  },
+  MOOD_VENDOR: {
+    capability: 'MOOD_VENDOR', supportStatus: 'UNDERDOCUMENTED', acquisitionMode: 'ECG_SESSION',
+    rawAvailable: true, historicalAvailable: false, realtimeAvailable: true, resolution: null,
+    unit: 'UNKNOWN', validationStatus: 'DOCUMENTATION_REQUIRED', nativeSdkAvailable: true,
+  },
+  VO2MAX_VENDOR: {
+    capability: 'VO2MAX_VENDOR', supportStatus: 'VENDOR_DERIVED', acquisitionMode: 'HISTORICAL_SYNC',
+    rawAvailable: false, historicalAvailable: false, realtimeAvailable: false, resolution: null,
+    unit: null, validationStatus: 'NOT_APPLICABLE', nativeSdkAvailable: false,
+  },
+  RAW_ACCELEROMETER: {
+    capability: 'RAW_ACCELEROMETER', supportStatus: 'ODM_REQUIRED', acquisitionMode: 'BACKGROUND',
+    rawAvailable: false, historicalAvailable: false, realtimeAvailable: false, resolution: null,
+    unit: null, validationStatus: 'DOCUMENTATION_REQUIRED', nativeSdkAvailable: false,
+  },
+}
+
 /**
  * Capability registry. `evidenceLevel` reflects what has actually been inspected for Build 7A
  * (protocol-level secondary evidence from the vendor's published @moshenguo/ms-data-sdk 0.1.13
