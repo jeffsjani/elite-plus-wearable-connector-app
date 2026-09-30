@@ -367,6 +367,7 @@ export function JCVitalV8Panel() {
         additionalFeedResults: {
           ...phase3bFeedResults,
           workoutLiveValidation,
+          ecgStartDiagnostics: rawEcgSession?.ecgStartDiagnostics ?? null,
           rawEcgValidation: buildRawEcgValidation(rawEcgSession, rawEcgChunks, rawEcgParseErrors),
         },
       })
@@ -614,6 +615,7 @@ export function JCVitalV8Panel() {
       </section>
       <details className="jcvital-diagnostics">
         <summary>Raw ECG chunk summaries · first {rawEcgChunks.firstThreeChunks.length}, last {rawEcgChunks.lastThreeChunks.length}</summary>
+        <strong>ECG start diagnostics</strong><pre>{JSON.stringify(rawEcgSession?.ecgStartDiagnostics ?? null, null, 2)}</pre>
         <strong>First chunks</strong><pre>{JSON.stringify(rawEcgChunks.firstThreeChunks, null, 2)}</pre>
         <strong>Last chunks</strong><pre>{JSON.stringify(rawEcgChunks.lastThreeChunks, null, 2)}</pre>
         <strong>Validation summary</strong><pre>{JSON.stringify(rawEcgValidation, null, 2)}</pre>

@@ -212,7 +212,39 @@ export interface JCVitalV8RawEcgSession {
   sampleFormat: 'UINT24_LE_VENDOR_RAW'
   unit: 'UNKNOWN_VENDOR_UNIT'
   source?: WearableSource
+  diagnosticState?: string
+  ecgStartDiagnostics?: JCVitalV8RawEcgStartDiagnostics
   parseErrors: Array<Record<string, unknown>>
+}
+
+export interface JCVitalV8RawEcgStartDiagnostics {
+  diagnosticState: string
+  diagnosticClassification: string
+  measurementStartCommand: {
+    queuedAt: string | null
+    writeAckAt: string | null
+  }
+  realtimeFlagCommand: {
+    queuedAt: string | null
+    writeAckAt: string | null
+  }
+  firstNotificationAfterStartAt: string | null
+  vendorDataTypesSeenAfterEcgStart: Array<Record<string, unknown>>
+  rawCommand07NotificationCount: number
+  firstCommand07NotificationAt: string | null
+  lastCommand07NotificationAt: string | null
+  rawNotificationSamples: Array<Record<string, unknown>>
+  type64CallbackCount: number
+  firstType64CallbackAt: string | null
+  lastType64CallbackAt: string | null
+  ecgPpgStatusRequestSupport: 'NO_REQUEST_METHOD_FOUND' | string
+  ecgPpgStatusRequestCount: number
+  ecgPpgStatusRequestTimes: string[]
+  ecgPpgStatusResponseCount: number
+  ecgStatusValuesSeen: number[]
+  firstEcgStatusAt: string | null
+  firstDataAvailableStatusAt: string | null
+  ecgNoDataAfter10s: boolean
 }
 
 export interface JCVitalV8RawEcgChunk {

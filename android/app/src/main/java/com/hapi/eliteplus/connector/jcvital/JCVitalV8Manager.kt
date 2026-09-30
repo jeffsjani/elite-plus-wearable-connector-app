@@ -104,9 +104,146 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         var stopCallback: ((Map<String, Any?>?, JCVitalV8Exception?) -> Unit)? = null
         var startTimeout: Runnable? = null
         var stopTimeout: Runnable? = null
+        var noDataTimeout: Runnable? = null
         var controlWriteFailed = false
         var storageErrorCount = 0
         val parseErrors = mutableListOf<Map<String, Any?>>()
+        var diagnosticState = "IDLE"
+        var startEpochMillis = System.currentTimeMillis()
+        var measurementStartCommandQueuedAt: String? = null
+        var measurementStartCommandWriteAckAt: String? = null
+        var realtimeFlagCommandQueuedAt: String? = null
+        var realtimeFlagCommandWriteAckAt: String? = null
+        var firstNotificationAfterStartAt: String? = null
+        var firstCommand07NotificationAt: String? = null
+        var lastCommand07NotificationAt: String? = null
+        var rawCommand07NotificationCount = 0
+        var rawCommand07SampleList = mutableListOf<Map<String, Any?>>()
+        var firstType64CallbackAt: String? = null
+        var lastType64CallbackAt: String? = null
+        var type64CallbackCount = 0
+        var type64SampleList = mutableListOf<Map<String, Any?>>()
+        var vendorDataTypesSeenAfterEcgStart = linkedMapOf<String, MutableMap<String, Any?>>()
+        var ecgPpgStatusRequestCount = 0
+        var ecgPpgStatusResponseCount = 0
+        var traceEcgStatusValues = mutableListOf<Int>()
+        var firstEcgStatusAt: String? = null
+        var firstDataAvailableStatusAt: String? = null
+        var ecgNoDataAfter10s = false
+        var diagnosticClassification: String? = null
+        val ecgPpgStatusRequestSupport = "NO_REQUEST_METHOD_FOUND"
+        val ecgPpgStatusRequestTimes = mutableListOf<String>()
+
+        fun recordQueued(commandName: String) {
+            val now = JCVitalV8Time.isoUtc(System.currentTimeMillis())
+            when (commandName) {
+                "SetDeviceMeasurementWithType(ECG,50000,true)" -> measurementStartCommandQueuedAt = now
+                "SetDeviceMeasurementWithType(ECG,50,000,true)" -> measurementStartCommandQueuedAt = now
+                "setECGRealtimeDuringHRVEnabled(true)" -> realtimeFlagCommandQueuedAt = now
+            }
+            if (diagnosticState == "IDLE") diagnosticState = "START_COMMANDS_QUEUED"
+        }
+
+        fun recordWriteAck(commandName: String) {
+            val now = JCVitalV8Time.isoUtc(System.currentTimeMillis())
+            when (commandName) {
+                "SetDeviceMeasurementWithType(ECG,50000,true)" -> measurementStartCommandWriteAckAt = now
+                "SetDeviceMeasurementWithType(ECG,50,000,true)" -> measurementStartCommandWriteAckAt = now
+                "setECGRealtimeDuringHRVEnabled(true)" -> realtimeFlagCommandWriteAckAt = now
+            }
+            if (diagnosticState == "START_COMMANDS_QUEUED") diagnosticState = "START_COMMANDS_WRITING"
+        }
+
+        fun noteFirstNotificationAt(receivedAt: String) {
+            if (firstNotificationAfterStartAt == null) firstNotificationAfterStartAt = receivedAt
+        }
+
+        fun noteRawCommand07(notification: ByteArray, receivedAt: String) {
+            rawCommand07NotificationCount += 1
+            if (firstCommand07NotificationAt == null) firstCommand07NotificationAt = receivedAt
+            lastCommand07NotificationAt = receivedAt
+            if (rawCommand07SampleList.size < 5) {
+                rawCommand07SampleList.add(
+                    linkedMapOf(
+                        "receivedAt" to receivedAt,
+                        "notificationLength" to notification.size,
+                        "first16BytesHex" to notification.copyOfRange(0, minOf(16, notification.size)).joinToString("") { "%02X".format(it.toInt() and 0xFF) },
+                    ),
+                )
+            }
+            if (diagnosticState == "WAITING_FOR_DEVICE" || diagnosticState == "START_COMMANDS_WRITING") diagnosticState = "RECEIVING_RAW"
+        }
+
+        fun recordVendorType(dataType: String, receivedAt: String) {
+            val existing = vendorDataTypesSeenAfterEcgStart.getOrPut(dataType) { linkedMapOf("dataType" to dataType, "count" to 0, "firstSeenAt" to receivedAt, "lastSeenAt" to receivedAt) }
+            existing["count"] = (existing["count"] as? Number)?.toInt()?.plus(1) ?: 1
+            existing["lastSeenAt"] = receivedAt
+            if (existing["firstSeenAt"] == null) existing["firstSeenAt"] = receivedAt
+        }
+
+        fun noteType64(packetId: Int?, sampleValues: List<Int>, receivedAt: String) {
+            type64CallbackCount += 1
+            if (firstType64CallbackAt == null) firstType64CallbackAt = receivedAt
+            lastType64CallbackAt = receivedAt
+            if (type64SampleList.size < 5) {
+                type64SampleList.add(
+                    linkedMapOf(
+                        "receivedAt" to receivedAt,
+                        "packetID" to packetId,
+                        "sampleCount" to sampleValues.size,
+                        "firstSamples" to sampleValues.take(8),
+                    ),
+                )
+            }
+            if (sampleValues.isNotEmpty()) diagnosticState = "DEVICE_DATA_AVAILABLE"
+            if (diagnosticState == "WAITING_FOR_DEVICE") diagnosticState = "DEVICE_DATA_AVAILABLE"
+        }
+
+        fun noteEcgStatus(value: Int?, receivedAt: String) {
+            if (value == null) return
+            traceEcgStatusValues.add(value)
+            if (firstEcgStatusAt == null) firstEcgStatusAt = receivedAt
+            if (value == 3 && firstDataAvailableStatusAt == null) firstDataAvailableStatusAt = receivedAt
+            if (value == 3) diagnosticState = "DEVICE_DATA_AVAILABLE"
+        }
+
+        fun snapshotDiagnostics(): Map<String, Any?> {
+            val classification = diagnosticClassification ?: when {
+                rawCommand07NotificationCount == 0 && type64CallbackCount == 0 -> "NO_DEVICE_DATA"
+                rawCommand07NotificationCount > 0 && type64CallbackCount == 0 -> "RAW_NOTIFICATION_NO_TYPE64"
+                type64CallbackCount > 0 && type64SampleList.all { (it["sampleCount"] as? Number)?.toInt() == 0 } -> "TYPE64_NO_SAMPLES"
+                else -> "RAW_ECG_RECEIVED"
+            }
+            return linkedMapOf(
+                "diagnosticState" to diagnosticState,
+                "diagnosticClassification" to classification,
+                "measurementStartCommand" to linkedMapOf(
+                    "queuedAt" to measurementStartCommandQueuedAt,
+                    "writeAckAt" to measurementStartCommandWriteAckAt,
+                ),
+                "realtimeFlagCommand" to linkedMapOf(
+                    "queuedAt" to realtimeFlagCommandQueuedAt,
+                    "writeAckAt" to realtimeFlagCommandWriteAckAt,
+                ),
+                "firstNotificationAfterStartAt" to firstNotificationAfterStartAt,
+                "vendorDataTypesSeenAfterEcgStart" to vendorDataTypesSeenAfterEcgStart.values.toList(),
+                "rawCommand07NotificationCount" to rawCommand07NotificationCount,
+                "firstCommand07NotificationAt" to firstCommand07NotificationAt,
+                "lastCommand07NotificationAt" to lastCommand07NotificationAt,
+                "rawNotificationSamples" to rawCommand07SampleList,
+                "type64CallbackCount" to type64CallbackCount,
+                "firstType64CallbackAt" to firstType64CallbackAt,
+                "lastType64CallbackAt" to lastType64CallbackAt,
+                "ecgPpgStatusRequestSupport" to ecgPpgStatusRequestSupport,
+                "ecgPpgStatusRequestCount" to ecgPpgStatusRequestCount,
+                "ecgPpgStatusRequestTimes" to ecgPpgStatusRequestTimes,
+                "ecgPpgStatusResponseCount" to ecgPpgStatusResponseCount,
+                "ecgStatusValuesSeen" to traceEcgStatusValues,
+                "firstEcgStatusAt" to firstEcgStatusAt,
+                "firstDataAvailableStatusAt" to firstDataAvailableStatusAt,
+                "ecgNoDataAfter10s" to ecgNoDataAfter10s,
+            )
+        }
     }
 
     private val appContext = context.applicationContext
@@ -679,23 +816,38 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         session.start()
         val capture = RawEcgCapture(session, callback, packetStore)
         rawEcgCapture = capture
+        capture.diagnosticState = "START_COMMANDS_QUEUED"
         emitRawEcgStatus(capture)
         capture.startTimeout = Runnable {
             if (rawEcgCapture === capture && session.status == JCVitalV8RawEcgSession.STATUS_STARTING) {
                 failRawEcgCapture(capture, "ECG start command write acknowledgment timed out")
             }
         }.also { main.postDelayed(it, COMMAND_TIMEOUT_MS) }
+        capture.noDataTimeout = Runnable {
+            if (rawEcgCapture === capture && capture.rawCommand07NotificationCount == 0 && capture.type64CallbackCount == 0) {
+                capture.ecgNoDataAfter10s = true
+                capture.diagnosticState = "NO_DATA_AFTER_10S"
+                emitRawEcgStatus(capture)
+            }
+        }.also { main.postDelayed(it, 10_000L) }
 
         enqueue(
             "SetDeviceMeasurementWithType(ECG,50000,true)",
             BleSDK.SetDeviceMeasurementWithType(AutoTestMode.ECG, ECG_DEMO_DURATION_ARGUMENT, true),
-        ) { written -> if (!written) capture.controlWriteFailed = true }
+        ) { written ->
+            if (written) capture.recordWriteAck("SetDeviceMeasurementWithType(ECG,50000,true)")
+            else capture.controlWriteFailed = true
+            capture.diagnosticState = "START_COMMANDS_WRITING"
+        }
+        capture.recordQueued("SetDeviceMeasurementWithType(ECG,50000,true)")
         enqueue("setECGRealtimeDuringHRVEnabled(true)", BleSDK.setECGRealtimeDuringHRVEnabled(true)) { written ->
             if (!written || capture.controlWriteFailed) {
                 failRawEcgCapture(capture, "ECG start command write failed")
             } else if (rawEcgCapture === capture && session.status == JCVitalV8RawEcgSession.STATUS_STARTING) {
+                capture.recordWriteAck("setECGRealtimeDuringHRVEnabled(true)")
                 capture.startTimeout?.let(main::removeCallbacks)
                 capture.startTimeout = null
+                capture.diagnosticState = "WAITING_FOR_DEVICE"
                 session.markRunning()
                 val result = rawEcgPayload(capture)
                 capture.startCallback?.invoke(result, null)
@@ -703,6 +855,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                 emitRawEcgStatus(capture)
             }
         }
+        capture.recordQueued("setECGRealtimeDuringHRVEnabled(true)")
     }
 
     fun stopRawEcg(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
@@ -722,16 +875,23 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         capture.stopTimeout = Runnable {
             failRawEcgCapture(capture, "ECG stop command write acknowledgment timed out")
         }.also { main.postDelayed(it, COMMAND_TIMEOUT_MS) }
+        capture.diagnosticState = "STOPPING"
         enqueue(
             "SetDeviceMeasurementWithType(ECG,0,false)",
             BleSDK.SetDeviceMeasurementWithType(AutoTestMode.ECG, 0, false),
-        ) { written -> if (!written) capture.controlWriteFailed = true }
+        ) { written ->
+            if (!written) capture.controlWriteFailed = true
+        }
+        capture.recordQueued("SetDeviceMeasurementWithType(ECG,0,false)")
         enqueue("setECGRealtimeDuringHRVEnabled(false)", BleSDK.setECGRealtimeDuringHRVEnabled(false)) { written ->
             if (!written || capture.controlWriteFailed) {
                 failRawEcgCapture(capture, "ECG stop command write failed")
             } else if (rawEcgCapture === capture && capture.session.status == JCVitalV8RawEcgSession.STATUS_STOPPING) {
+                capture.recordWriteAck("setECGRealtimeDuringHRVEnabled(false)")
                 capture.stopTimeout?.let(main::removeCallbacks)
                 capture.stopTimeout = null
+                capture.noDataTimeout?.let(main::removeCallbacks)
+                capture.diagnosticState = "STOPPED"
                 flushRawEcg(capture, capture.session.stop(JCVitalV8Time.isoUtc(System.currentTimeMillis())))
                 closeRawEcgStore(capture)
                 rawEcgCapture = null
@@ -742,6 +902,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                 capture.stopCallback = null
             }
         }
+        capture.recordQueued("setECGRealtimeDuringHRVEnabled(false)")
     }
 
     fun rawEcgStatus(): Map<String, Any?> = rawEcgCapture?.let(::rawEcgPayload)
@@ -775,6 +936,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         put("persistedPacketCount", capture.packetStore.packetCount)
         put("persistedBytes", capture.packetStore.byteCount)
         put("storageErrorCount", capture.storageErrorCount)
+        put("diagnosticState", capture.diagnosticState)
+        put("ecgStartDiagnostics", capture.snapshotDiagnostics())
     }
 
     private fun idleWorkoutPayload(): Map<String, Any?> = linkedMapOf(
@@ -893,6 +1056,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
 
     private fun handleNotification(bytes: ByteArray) {
         if (bytes.isEmpty()) return
+        rawEcgCapture?.noteFirstNotificationAt(JCVitalV8Time.isoUtc(System.currentTimeMillis()))
         val commandByte = String.format("0x%02X", bytes[0].toInt() and 0xFF)
         if ((bytes[0].toInt() and 0xFF) == JCVitalV8RawEcgSession.ECG_COMMAND_BYTE &&
             bytes.size > ECG_STREAM_MIN_NOTIFICATION_BYTES && rawEcgCapture != null
@@ -920,7 +1084,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                         "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()),
                         "rawPacketBytes" to bytes.map { it.toInt() and 0xFF },
                     )
-                    capture.parseErrors += error
+                    capture.parseErrors.add(error)
                     emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_ERROR, error)
                     emitRawEcgStatus(capture)
                 }
@@ -932,11 +1096,34 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
             Log.d(TAG, "<- $commandByte not handled by SDK")
             return
         }
-        vendorMaps.forEach(::routeVendorData)
+        vendorMaps.forEach { vendor ->
+            val dataType = vendor[DeviceKey.DataType]?.toString()
+            if (dataType == BleConst.GetECG && rawEcgCapture != null) {
+                val fields = vendor[DeviceKey.Data] as? Map<*, *> ?: emptyMap<Any?, Any?>()
+                val sampleValues = fields[DeviceKey.arrayEcgRawData]?.toString()
+                    ?.split(',')
+                    ?.mapNotNull { token -> token.trim().toIntOrNull() }
+                    ?: emptyList()
+                rawEcgCapture?.noteType64(fields[DeviceKey.packetID]?.toString()?.toIntOrNull(), sampleValues, JCVitalV8Time.isoUtc(System.currentTimeMillis()))
+            }
+            routeVendorData(vendor)
+        }
     }
 
     private fun routeVendorData(vendor: Map<String?, Any?>) {
         val dataType = vendor[DeviceKey.DataType]?.toString()
+        if (rawEcgCapture != null && dataType != null) {
+            val now = JCVitalV8Time.isoUtc(System.currentTimeMillis())
+            rawEcgCapture?.recordVendorType(dataType, now)
+            if (dataType == BleConst.GetEcgPpgStatus) {
+                val payload = vendor[DeviceKey.Data] as? Map<*, *> ?: emptyMap<Any?, Any?>()
+                val status = (payload[DeviceKey.EcgStatus] as? Number)?.toInt() ?: payload[DeviceKey.EcgStatus]?.toString()?.toIntOrNull()
+                rawEcgCapture?.let {
+                    it.ecgPpgStatusResponseCount += 1
+                    it.noteEcgStatus(status, now)
+                }
+            }
+        }
         Log.i(TAG, "<- vendor dataType=$dataType")
         val events = try {
             normalizer.normalize(
@@ -980,9 +1167,12 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     private fun handleRawEcgNotification(notification: ByteArray) {
         val capture = rawEcgCapture ?: return
         val receivedAt = JCVitalV8Time.isoUtc(System.currentTimeMillis())
+        if ((notification[0].toInt() and 0xFF) == JCVitalV8RawEcgSession.ECG_COMMAND_BYTE) {
+            capture.noteRawCommand07(notification, receivedAt)
+        }
         val result = capture.session.acceptNotification(notification, receivedAt)
         result.parseError?.let { error ->
-            capture.parseErrors += error
+            capture.parseErrors.add(error)
             emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_ERROR, error)
         }
         result.chunk?.let { flushRawEcg(capture, it) }
@@ -1011,7 +1201,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                 "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()),
                 "chunkSequence" to chunk["sequenceNumber"],
             )
-            capture.parseErrors += storageError
+            capture.parseErrors.add(storageError)
             emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_ERROR, storageError)
         }
         emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_CHUNK, chunk)
@@ -1023,10 +1213,12 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         } catch (error: Throwable) {
             capture.storageErrorCount++
             capture.session.recordSdkParseError()
-            capture.parseErrors += linkedMapOf(
-                "sessionId" to capture.session.sessionId,
-                "message" to "Could not close raw ECG store: ${error.message}",
-                "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()),
+            capture.parseErrors.add(
+                linkedMapOf(
+                    "sessionId" to capture.session.sessionId,
+                    "message" to "Could not close raw ECG store: ${error.message}",
+                    "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()),
+                ),
             )
         }
     }
@@ -1035,6 +1227,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         if (rawEcgCapture !== capture) return
         capture.startTimeout?.let(main::removeCallbacks)
         capture.stopTimeout?.let(main::removeCallbacks)
+        capture.noDataTimeout?.let(main::removeCallbacks)
         val chunk = capture.session.fail(JCVitalV8Time.isoUtc(System.currentTimeMillis()))
         flushRawEcg(capture, chunk)
         closeRawEcgStore(capture)
@@ -1042,7 +1235,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         BleSDK.setECGRealtimeDuringHRVEnabled(false)
         rawEcgCapture = null
         val error = linkedMapOf<String, Any?>("sessionId" to capture.session.sessionId, "message" to message, "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()))
-        capture.parseErrors += error
+        capture.parseErrors.add(error)
         emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_ERROR, error)
         val result = rawEcgPayload(capture)
         lastRawEcgSession = result
@@ -1084,7 +1277,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         closeRawEcgStore(capture)
         rawEcgCapture = null
         val error = linkedMapOf<String, Any?>("sessionId" to capture.session.sessionId, "message" to reason, "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()))
-        capture.parseErrors += error
+        capture.parseErrors.add(error)
         emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_ERROR, error)
         val result = rawEcgPayload(capture)
         lastRawEcgSession = result
@@ -1180,7 +1373,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                 "receivedAt" to receivedAt,
                 "rawVendorPayload" to JCVitalV8EventNormalizer.sanitize(vendor),
             )
-            capture.parseErrors += parseError
+            capture.parseErrors.add(parseError)
             emit(JCVitalV8EventNormalizer.EVENT_WORKOUT_PARSE_ERROR, parseError)
             emitWorkoutError(capture.session.sessionId, normalized.message ?: "Could not normalize workout packet")
             return
@@ -1370,10 +1563,10 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         request.recordGroupCount += records?.size ?: 0
         events.filter { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }.forEach { event ->
             val id = event.payload["id"]?.toString()
-            if (id == null) request.parseErrors += linkedMapOf("message" to "Observation has no id", "payload" to event.payload)
+            if (id == null) request.parseErrors.add(linkedMapOf("message" to "Observation has no id", "payload" to event.payload))
             else if (request.observations.putIfAbsent(id, event.payload) != null) request.duplicateCount++
         }
-        request.parseErrors += events.filter { it.name == JCVitalV8EventNormalizer.EVENT_PARSE_ERROR }.map { it.payload }
+        request.parseErrors.addAll(events.filter { it.name == JCVitalV8EventNormalizer.EVENT_PARSE_ERROR }.map { it.payload })
         if (vendor[DeviceKey.End] == true) {
             finishHistorical(request, if (request.observations.isEmpty()) "EMPTY_VALID" else "COMPLETE")
             return
