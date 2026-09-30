@@ -184,11 +184,40 @@ does not return distance, pace, METS, temperature, SpO2, or RSSI. Every packet
 retains its raw vendor payload and receipt timestamp, and HR-bearing packets
 also emit `jcvitalWorkoutHeartRate` separately from packet cadence diagnostics.
 
-Phase 3C software is implemented but **not yet physically validated**. Only a
-stopped physical workout can receive a cadence classification. Native
-heartbeat attempt/sent/skipped counts and JS packet/HR observation timing are
-reported separately; physical V8 testing must establish whether the one-second
-request produces one-second packets and whether HR refreshes at that cadence.
+### Phase 3C physical validation
+
+Validated on the physical Pro V8, firmware `0.0.8.8`, SDK `v8sdk2.0`:
+
+- Workout wall duration: 605.11 seconds.
+- Type-82 workout packets: 600; HR-bearing packets: 600.
+- Packet interval median: 994 ms; P5/P95: 977/1,030 ms; 98.83% within
+  750–1,250 ms.
+- Nonzero HR observations: 591; interval median: 993.5 ms; P5/P95:
+  978/1,029 ms; 99.49% within 750–1,250 ms.
+- Initial zero-HR packets: 9; first nonzero HR observation was 9,707 ms after
+  session start. This is a startup sensor-acquisition delay, not missing-history
+  interpolation.
+- Heartbeat attempts/sends/skips: 598/598/0. Parse errors: 0.
+- `ExerciseTime` progressed from 1 through 600 during approximately ten
+  minutes. It is normalized as `WORKOUT_ELAPSED_SECONDS`, unit `second`,
+  validation `CONFIRMED_HARDWARE`, while the original vendor string remains in
+  `exerciseTimeRaw`.
+- Classification: `CONFIRMED_1HZ_HR_OBSERVATION`.
+
+The validated claim is approximately 1 Hz workout HR observations delivered by
+the V8 SDK. Repeated identical BPM values remain valid observations and are
+reported separately as repeat/run diagnostics. This does not claim 1 Hz raw PPG
+or guarantee a newly completed optical calculation each second.
+
+Keep the three heart-rate layers distinct:
+
+- Live workout HR observations: approximately 1 second.
+- Continuous historical HR: 5-second series.
+- Automatic HR: configurable monitoring schedule; this physical device was set
+  to 10 minutes.
+
+The 10-minute run validates this device/configuration only; cadence and startup
+behavior may vary by firmware, activity mode, or sensor lock conditions.
 
 ## Files
 

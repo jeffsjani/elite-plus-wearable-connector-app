@@ -6,6 +6,7 @@ import {
   type LiveWorkoutPacket,
   type LiveWorkoutSession,
 } from './WorkoutTelemetry'
+import { V8_CAPABILITY_REGISTRY } from './JCVitalCapabilities'
 
 const source = {
   connector: 'JCVITAL_NATIVE' as const,
@@ -42,6 +43,21 @@ function stoppedSession(): LiveWorkoutSession {
 
 describe('workout capture state and cadence diagnostics', () => {
   beforeEach(() => vi.stubGlobal('crypto', { randomUUID: () => 'session-new' }))
+
+  it('keeps the three physical HR cadences and elapsed-time validation distinct', () => {
+    expect(V8_CAPABILITY_REGISTRY.LIVE_WORKOUT_HR).toMatchObject({
+      supportStatus: 'CONFIRMED_HARDWARE', resolution: 'approximately 1 second HR observations', validationStatus: 'PASSED',
+    })
+    expect(V8_CAPABILITY_REGISTRY.CONTINUOUS_HR_HISTORY).toMatchObject({
+      supportStatus: 'CONFIRMED_HARDWARE', resolution: '5 seconds observed', validationStatus: 'PASSED',
+    })
+    expect(V8_CAPABILITY_REGISTRY.AUTOMATIC_HR).toMatchObject({
+      supportStatus: 'CONFIRMED_HARDWARE', resolution: 'configurable schedule; validated at 10 minutes', validationStatus: 'PASSED',
+    })
+    expect(V8_CAPABILITY_REGISTRY.WORKOUT_ELAPSED_SECONDS).toMatchObject({
+      supportStatus: 'CONFIRMED_HARDWARE', unit: 'second', validationStatus: 'PASSED',
+    })
+  })
 
   it('starts a new capture with reset packet metadata and stops it', () => {
     const started = transitionWorkoutSession(null, 'START', '2026-09-30T10:00:00.000Z')
@@ -80,26 +96,30 @@ describe('workout capture state and cadence diagnostics', () => {
       percentagePacketsBetween750And1250Ms: 100,
       percentageHrPacketsBetween750And1250Ms: 100,
       duplicateHrCount: 0, zeroHrCount: 0, missingHrCount: 0,
-      uniqueHrValueCount: 12, classification: 'CONFIRMED_1HZ_BPM',
+      uniqueHrValueCount: 12, classification: 'CONFIRMED_1HZ_HR_OBSERVATION',
     })
   })
 
-  it('classifies one-second packets with slower HR-bearing cadence as sub-1Hz HR', () => {
-    const packets = Array.from({ length: 16 }, (_, second) => packet(second, second, second % 2 === 0 ? 80 + second : 80 + second - second % 2))
+  it('classifies one-second packets with HR-bearing observations every two seconds as sub-1Hz HR', () => {
+    const packets = Array.from({ length: 16 }, (_, second) => packet(
+      second,
+      second,
+      second % 2 === 1 ? null : 80 + second - second % 4,
+    ))
     const diagnostics = computeWorkoutCadenceDiagnostics(stoppedSession(), packets)
     expect(diagnostics.medianPacketIntervalMs).toBe(1000)
     expect(diagnostics.duplicateHrCount).toBeGreaterThan(0)
     expect(diagnostics.classification).toBe('SUB_1HZ_HR')
   })
 
-  it('classifies a five-second HR refresh carried in one-second workout packets', () => {
+  it('does not infer five-second HR cadence from repeated values in one-second observations', () => {
     const packets = Array.from({ length: 21 }, (_, second) => packet(second, second, 80 + second - second % 5))
     const diagnostics = computeWorkoutCadenceDiagnostics(stoppedSession(), packets)
     expect(diagnostics.medianPacketIntervalMs).toBe(1000)
     expect(diagnostics.medianHrPacketIntervalMs).toBe(1000)
     expect(diagnostics.medianNonZeroHrIntervalMs).toBe(1000)
     expect(diagnostics.longestRepeatedHrRun).toBe(5)
-    expect(diagnostics.classification).toBe('FIVE_SECOND_HR')
+    expect(diagnostics.classification).toBe('CONFIRMED_1HZ_HR_OBSERVATION')
   })
 
   it('allows repeated BPM values when nonzero HR-bearing packets remain stable at 1 Hz', () => {
@@ -111,7 +131,7 @@ describe('workout capture state and cadence diagnostics', () => {
       medianNonZeroHrIntervalMs: 1000,
       consecutiveRepeatedHrCount: 11,
       longestRepeatedHrRun: 12,
-      classification: 'CONFIRMED_1HZ_BPM',
+      classification: 'CONFIRMED_1HZ_HR_OBSERVATION',
     })
   })
 
@@ -149,10 +169,59 @@ describe('workout capture state and cadence diagnostics', () => {
     expect(computeWorkoutCadenceDiagnostics(stoppedSession(), packets).classification).toBe('VARIABLE_APPROX_1HZ')
   })
 
+  it('matches the validated 600-packet startup-lock profile while retaining repeats', () => {
+    const baseMs = Date.parse('2026-09-30T10:00:00.000Z')
+    const packets = Array.from({ length: 600 }, (_, index) => ({
+      ...packet(index, 0, index < 9 ? 0 : 72),
+      receivedAt: new Date(baseMs + 761 + index * 994).toISOString(),
+      exerciseTimeRaw: String(index + 1),
+      elapsedSeconds: index + 1,
+    }))
+    const physicalSession = {
+      ...stoppedSession(),
+      stoppedAt: new Date(baseMs + 605_110).toISOString(),
+      heartbeatAttemptCount: 598,
+      heartbeatSentCount: 598,
+      heartbeatSkippedCount: 0,
+    }
+    const diagnostics = computeWorkoutCadenceDiagnostics(physicalSession, packets)
+
+    expect(diagnostics).toMatchObject({
+      packetCount: 600,
+      hrPacketCount: 600,
+      zeroHrCount: 9,
+      firstNonZeroHrDelayMs: 9_707,
+      medianPacketIntervalMs: 994,
+      p5PacketIntervalMs: 994,
+      p95PacketIntervalMs: 994,
+      percentagePacketsBetween750And1250Ms: 100,
+      medianNonZeroHrIntervalMs: 994,
+      p5NonZeroHrIntervalMs: 994,
+      p95NonZeroHrIntervalMs: 994,
+      percentageNonZeroHrIntervalsBetween750And1250Ms: 100,
+      uniqueHrValueCount: 1,
+      longestRepeatedHrRun: 591,
+      classification: 'CONFIRMED_1HZ_HR_OBSERVATION',
+    })
+
+    const report = buildWorkoutLiveValidation(physicalSession, packets, [])
+    expect(report).toMatchObject({
+      heartbeatAttemptCount: 598,
+      heartbeatSentCount: 598,
+      heartbeatSkippedCount: 0,
+      packetCount: 600,
+      hrPacketCount: 600,
+      classification: 'CONFIRMED_1HZ_HR_OBSERVATION',
+    })
+    expect((report.first10Packets as LiveWorkoutPacket[])).toHaveLength(10)
+    expect((report.last10Packets as LiveWorkoutPacket[]).at(-1)?.exerciseTimeRaw).toBe('600')
+    expect(report).not.toHaveProperty('packets')
+  })
+
   it('exports only first and last ten packets with distinct cadence summaries', () => {
     const packets = Array.from({ length: 25 }, (_, second) => packet(second, second, 80 + second))
     const report = buildWorkoutLiveValidation(stoppedSession(), packets, [])
-    expect(report).toMatchObject({ packetCount: 25, hrPacketCount: 25, classification: 'CONFIRMED_1HZ_BPM' })
+    expect(report).toMatchObject({ packetCount: 25, hrPacketCount: 25, classification: 'CONFIRMED_1HZ_HR_OBSERVATION' })
     expect(report).toHaveProperty('packetCadenceDiagnostics.medianIntervalMs', 1000)
     expect(report).toHaveProperty('hrBearingCadenceDiagnostics.medianIntervalMs', 1000)
     expect((report.first10Packets as unknown[]).length).toBe(10)

@@ -527,7 +527,7 @@ export function JCVitalV8Panel() {
         <span>HR packets: {workoutDiagnostics?.hrPacketCount ?? 0}</span>
         <span>Current HR: {currentWorkoutHr ?? '—'} bpm</span>
         <span>Current steps: {currentWorkoutPacket?.steps ?? '—'} · calories: {currentWorkoutPacket?.calories ?? '—'}</span>
-        <span>ExerciseTime raw: {currentWorkoutPacket?.exerciseTimeRaw ?? '—'}</span>
+        <span>ExerciseTime: {currentWorkoutPacket?.elapsedSeconds ?? '—'} s · raw vendor value: {currentWorkoutPacket?.exerciseTimeRaw ?? '—'} · {currentWorkoutPacket?.exerciseTimeValidationStatus ?? 'not emitted'}</span>
         <span>Last packet age: {lastWorkoutPacketAgeSeconds === null ? '—' : `${lastWorkoutPacketAgeSeconds.toFixed(1)} s`}</span>
         <span>Heartbeat attempts/sent/skipped: {workoutSession?.heartbeatAttemptCount ?? 0}/{workoutSession?.heartbeatSentCount ?? 0}/{workoutSession?.heartbeatSkippedCount ?? 0}</span>
           <span>App-supplied sendHeartPackage inputs: distance {workoutSession?.heartbeatInputs?.distanceKm ?? '—'} km · pace {workoutSession?.heartbeatInputs?.paceSeconds ?? '—'} s · signal {workoutSession?.heartbeatInputs?.rssiStrength ?? '—'} (vendor scale, not Android dBm)</span>
@@ -547,7 +547,7 @@ export function JCVitalV8Panel() {
           <thead><tr><th>Seq</th><th>Received</th><th>HR</th><th>Steps</th><th>Calories</th><th>ExerciseTime raw</th></tr></thead>
           <tbody>{workoutPackets.slice(-10).map((packet) => <tr key={`${packet.sessionId}-${packet.packetSequence}`}>
             <td>{packet.packetSequence}</td><td>{new Date(packet.receivedAt).toLocaleTimeString()}</td><td>{packet.heartRate ?? '—'}</td>
-            <td>{packet.steps ?? '—'}</td><td>{packet.calories ?? '—'}</td><td>{packet.exerciseTimeRaw ?? '—'}</td>
+            <td>{packet.steps ?? '—'}</td><td>{packet.calories ?? '—'}</td><td>{packet.elapsedSeconds ?? '—'} s ({packet.exerciseTimeRaw ?? '—'})</td>
           </tr>)}</tbody>
         </table>
       </div>

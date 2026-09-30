@@ -23,6 +23,8 @@ class JCVitalV8WorkoutNormalizer {
         val data = JCVitalV8EventNormalizer.sanitize(vendor[DeviceKey.Data]) as? Map<String, Any?>
             ?: throw JCVitalV8Exception(JCVitalV8ErrorCode.RESPONSE_PARSE_FAILED, "Workout response data is not an object")
         val returnedFields = data.keys.sorted()
+        val exerciseTimeRaw = data[DeviceKey.ActiveMinutes]
+        val exerciseElapsedSeconds = exerciseTimeRaw.asInt()
         return linkedMapOf(
             "sessionId" to context.sessionId,
             "deviceId" to context.deviceId,
@@ -30,8 +32,11 @@ class JCVitalV8WorkoutNormalizer {
             "vendorTimestamp" to null,
             "packetSequence" to context.packetSequence,
             "heartRate" to data[DeviceKey.HeartRate].asInt(),
-            "elapsedSeconds" to null,
-            "exerciseTimeRaw" to data[DeviceKey.ActiveMinutes],
+            "elapsedSeconds" to exerciseElapsedSeconds,
+            "exerciseTimeRaw" to exerciseTimeRaw,
+            "exerciseTimeMetricType" to if (exerciseElapsedSeconds != null) "WORKOUT_ELAPSED_SECONDS" else null,
+            "exerciseTimeUnit" to if (exerciseElapsedSeconds != null) "second" else null,
+            "exerciseTimeValidationStatus" to if (exerciseElapsedSeconds != null) "CONFIRMED_HARDWARE" else null,
             "steps" to data[DeviceKey.Step].asInt(),
             "calories" to data[DeviceKey.Calories].asDouble(),
             "distance" to null,

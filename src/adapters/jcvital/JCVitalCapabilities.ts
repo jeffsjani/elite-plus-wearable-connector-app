@@ -135,19 +135,19 @@ export interface V8Capability {
 
 export const V8_CAPABILITY_REGISTRY: Record<string, V8Capability> = {
   LIVE_WORKOUT_HR: {
-    capability: 'LIVE_WORKOUT_HR', supportStatus: 'PROVISIONAL', acquisitionMode: 'WORKOUT_REALTIME',
-    rawAvailable: true, historicalAvailable: false, realtimeAvailable: true, resolution: 'potential ~1 second',
-    unit: 'bpm', validationStatus: 'HARDWARE_REQUIRED', nativeSdkAvailable: true,
+    capability: 'LIVE_WORKOUT_HR', supportStatus: 'CONFIRMED_HARDWARE', acquisitionMode: 'WORKOUT_REALTIME',
+    rawAvailable: true, historicalAvailable: false, realtimeAvailable: true, resolution: 'approximately 1 second HR observations',
+    unit: 'bpm', validationStatus: 'PASSED', nativeSdkAvailable: true,
   },
   CONTINUOUS_HR_HISTORY: {
-    capability: 'CONTINUOUS_HR_HISTORY', supportStatus: 'CONFIRMED_SDK', acquisitionMode: 'HISTORICAL_SYNC',
-    rawAvailable: true, historicalAvailable: true, realtimeAvailable: false, resolution: '5 seconds nominal',
-    unit: 'bpm', validationStatus: 'HARDWARE_REQUIRED', nativeSdkAvailable: true,
+    capability: 'CONTINUOUS_HR_HISTORY', supportStatus: 'CONFIRMED_HARDWARE', acquisitionMode: 'HISTORICAL_SYNC',
+    rawAvailable: true, historicalAvailable: true, realtimeAvailable: false, resolution: '5 seconds observed',
+    unit: 'bpm', validationStatus: 'PASSED', nativeSdkAvailable: true,
   },
   AUTOMATIC_HR: {
-    capability: 'AUTOMATIC_HR', supportStatus: 'CONFIRMED_SDK', acquisitionMode: 'AUTOMATIC',
-    rawAvailable: true, historicalAvailable: true, realtimeAvailable: false, resolution: null,
-    unit: 'bpm', validationStatus: 'HARDWARE_REQUIRED', nativeSdkAvailable: true,
+    capability: 'AUTOMATIC_HR', supportStatus: 'CONFIRMED_HARDWARE', acquisitionMode: 'AUTOMATIC',
+    rawAvailable: true, historicalAvailable: true, realtimeAvailable: false, resolution: 'configurable schedule; validated at 10 minutes',
+    unit: 'bpm', validationStatus: 'PASSED', nativeSdkAvailable: true,
   },
   HISTORICAL_SPO2: {
     capability: 'HISTORICAL_SPO2', supportStatus: 'CONFIRMED_SDK', acquisitionMode: 'HISTORICAL_SYNC',
@@ -198,6 +198,11 @@ export const V8_CAPABILITY_REGISTRY: Record<string, V8Capability> = {
     capability: 'WORKOUT_METS', supportStatus: 'NOT_EMITTED_ANDROID', acquisitionMode: 'HISTORICAL_SYNC',
     rawAvailable: false, historicalAvailable: false, realtimeAvailable: false, resolution: null,
     unit: 'MET', validationStatus: 'NOT_APPLICABLE', nativeSdkAvailable: false,
+  },
+  WORKOUT_ELAPSED_SECONDS: {
+    capability: 'WORKOUT_ELAPSED_SECONDS', supportStatus: 'CONFIRMED_HARDWARE', acquisitionMode: 'WORKOUT_REALTIME',
+    rawAvailable: true, historicalAvailable: false, realtimeAvailable: true, resolution: '1 second elapsed-time increment observed',
+    unit: 'second', validationStatus: 'PASSED', nativeSdkAvailable: true,
   },
 }
 

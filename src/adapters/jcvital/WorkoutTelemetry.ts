@@ -1,7 +1,7 @@
 import type { WearableSource } from '../../models/wearableObservation'
 
 export type LiveWorkoutStatus = 'IDLE' | 'STARTING' | 'RUNNING' | 'PAUSED' | 'STOPPING' | 'STOPPED' | 'ERROR' | 'DISCONNECTED'
-export type WorkoutHrClassification = 'PENDING' | 'CONFIRMED_1HZ_BPM' | 'VARIABLE_APPROX_1HZ' | 'SUB_1HZ_HR' | 'FIVE_SECOND_HR' | 'OTHER'
+export type WorkoutHrClassification = 'PENDING' | 'CONFIRMED_1HZ_HR_OBSERVATION' | 'VARIABLE_APPROX_1HZ' | 'SUB_1HZ_HR' | 'FIVE_SECOND_HR' | 'OTHER'
 
 export interface LiveWorkoutSession {
   sessionId: string | null
@@ -36,6 +36,9 @@ export interface LiveWorkoutPacket {
   heartRate: number | null
   elapsedSeconds: number | null
   exerciseTimeRaw: string | number | null
+  exerciseTimeMetricType?: 'WORKOUT_ELAPSED_SECONDS' | null
+  exerciseTimeUnit?: 'second' | null
+  exerciseTimeValidationStatus?: 'CONFIRMED_HARDWARE' | null
   steps: number | null
   calories: number | null
   distance: number | null
@@ -144,21 +147,17 @@ function summarizeIntervals(values: number[]) {
 function classifyWorkoutHr(
   packetSummary: ReturnType<typeof summarizeIntervals>,
   hrSummary: ReturnType<typeof summarizeIntervals>,
-  changedValueIntervals: number[],
   isStopped: boolean,
 ): WorkoutHrClassification {
   if (!isStopped) return 'PENDING'
   const packetNear1Hz = (packetSummary.percentageNear1Hz ?? 0) >= 75
   const hrNear1Hz = (hrSummary.percentageNear1Hz ?? 0) >= 90
-  const changedSummary = summarizeIntervals(changedValueIntervals)
   if (hrSummary.median !== null && hrSummary.median >= 4_000 && hrSummary.median <= 6_000) return 'FIVE_SECOND_HR'
-  if (changedSummary.median !== null && changedSummary.median >= 4_000 && changedSummary.median <= 6_000) return 'FIVE_SECOND_HR'
   if (packetNear1Hz && (
     (hrSummary.median !== null && hrSummary.median > 1_250)
-    || (changedSummary.median !== null && changedSummary.median > 1_250)
   )) return 'SUB_1HZ_HR'
   if (packetSummary.median !== null && packetSummary.median >= 4_000 && packetSummary.median <= 6_000) return 'FIVE_SECOND_HR'
-  if (hrNear1Hz) return 'CONFIRMED_1HZ_BPM'
+  if (hrNear1Hz && hrSummary.median !== null && hrSummary.median >= 750 && hrSummary.median <= 1_250) return 'CONFIRMED_1HZ_HR_OBSERVATION'
   if (hrSummary.median !== null && hrSummary.median >= 750 && hrSummary.median <= 1_500) return 'VARIABLE_APPROX_1HZ'
   return 'OTHER'
 }
@@ -173,27 +172,22 @@ export function computeWorkoutCadenceDiagnostics(
   const nonZeroHrPackets = hrPackets.filter((packet) => (packet.heartRate ?? 0) > 0)
   const hrIntervals = intervals(hrPackets)
   const nonZeroHrIntervals = intervals(nonZeroHrPackets)
-  const changedValueIntervals: number[] = []
   let duplicateHrCount = 0
   let longestRepeatedHrRun = 0
   let currentHrRun = 0
-  let previousChangedAt: number | null = null
   let previousHr: number | null = null
   const uniqueHrValues = new Set<number>()
 
   for (const packet of nonZeroHrPackets) {
     const hr = packet.heartRate!
-    const receivedAt = Date.parse(packet.receivedAt)
     uniqueHrValues.add(hr)
     if (previousHr === hr) {
       duplicateHrCount++
       currentHrRun++
     } else {
-      if (previousChangedAt !== null && Number.isFinite(receivedAt)) changedValueIntervals.push(receivedAt - previousChangedAt)
       currentHrRun = 1
     }
     longestRepeatedHrRun = Math.max(longestRepeatedHrRun, currentHrRun)
-    if (previousHr !== hr && Number.isFinite(receivedAt)) previousChangedAt = receivedAt
     previousHr = hr
   }
 
@@ -231,7 +225,7 @@ export function computeWorkoutCadenceDiagnostics(
     uniqueHrValueCount: uniqueHrValues.size,
     firstNonZeroHrDelayMs: firstNonZero === undefined || !Number.isFinite(startedAt) ? null : firstNonZero - startedAt,
     sessionDurationSeconds: Number.isFinite(startedAt) && Number.isFinite(endedAt) ? Math.max(0, (endedAt - startedAt) / 1000) : 0,
-    classification: classifyWorkoutHr(packetSummary, nonZeroHrSummary, changedValueIntervals, stopped),
+    classification: classifyWorkoutHr(packetSummary, nonZeroHrSummary, stopped),
   }
 }
 
