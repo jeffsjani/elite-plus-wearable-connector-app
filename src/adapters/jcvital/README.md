@@ -17,9 +17,54 @@ Tested 2026-09-30:
 
 The native Android bridge covers the physically validated connection lifecycle,
 device metadata, battery, realtime heart rate, realtime wearable temperature,
-and Phase 3A historical physiology. Phase 3A is ready for physical validation;
+and Phase 3A historical physiology. Phase 3A physical validation passed;
 its observations remain on the diagnostic bridge and are not uploaded through
 the scalar-only Base44 contract.
+
+## Phase 3A physical validation
+
+Validated 2026-09-30 with a JCVital Pro V8, firmware `0.0.8.8`, and SDK
+`v8sdk2.0`. All feeds completed with no parse errors.
+
+### Continuous and automatic heart rate
+
+- Continuous history returned 1,320 accepted samples.
+- Median interval: 5 seconds.
+- Minimum interval: 5 seconds.
+- Maximum observed gap: 130 seconds.
+- 99.545% of intervals were between 4 and 6 seconds.
+- Classification: `CONFIRMED_HARDWARE_5_SECOND_CONTINUOUS_HR`.
+- Automatic HR monitoring was enabled at a 10-minute configured interval,
+  from 00:00 through 23:59, seven days per week.
+
+These are separate acquisition concepts: **continuous HR history is a 5-second
+series**, while the **automatic HR schedule is configured at 10-minute
+intervals**. The automatic schedule must not be used as the historical series
+cadence.
+
+### Other physiology
+
+- SpO2 historical ingestion passed. Observed cadence was approximately 30
+  minutes; configured monitoring interval was 30 minutes.
+- Temperature historical ingestion passed. Observed cadence and configured
+  monitoring interval were both 10 minutes. Its canonical label remains
+  `wearable_temperature_c`.
+- HRV returned physical records at a configured 60-minute interval. Each source
+  record emitted vendor HRV, associated HR, stress, estimated systolic BP, and
+  estimated diastolic BP. `fatigueDegree` was not emitted.
+- The HRV raw payload included `vascularAging`. It remains preserved in
+  `rawPayload`; normalized `VASCULAR_AGING_VENDOR_RAW` exposure is deferred to
+  Phase 3E because Phase 3A acquisition/parser behavior is frozen. Its status is
+  `UNDERDOCUMENTED`, vendor-derived, with unknown unit.
+- PPI returned 4 groups with 56 slots per group (224 total slots). Zero values
+  remain in the lossless arrays and are diagnosed as probable unused-capacity
+  padding, not invalid physiology. Unit remains `UNKNOWN_VENDOR_UNIT` pending
+  vendor confirmation.
+
+For HRV diagnostics, `sourceRecordsReceived` counts measurement epochs (2 in
+the physical test), while `normalizedObservationsProduced` counts the separate
+metrics emitted from those epochs. The latter must not be read as independent
+HRV measurement epochs.
 
 ## Phase 3A historical physiology
 
@@ -125,6 +170,5 @@ merged into the confirmed default.
    function (e.g. `nativeConnectorSeriesChunks`). Until decided,
    `JCVitalAdapter.getPendingSeriesChunks()` holds chunks locally and
    `diagnostics.seriesIngestionBlocked` is always `true`.
-2. **Phase 3A physical validation.** Historical record availability, retention,
-  units, timestamp behavior, pagination, and the nominal 5-second HR cadence
-  remain `PENDING` on the physical V8.
+2. **Vendor semantics.** PPI units and the `vascularAging` scale/unit remain
+  undocumented by the vendor.

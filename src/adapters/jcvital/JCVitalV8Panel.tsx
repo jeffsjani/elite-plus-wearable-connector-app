@@ -1,4 +1,7 @@
 import { useEffect, useState } from 'react'
+import { Capacitor } from '@capacitor/core'
+import { Directory, Encoding, Filesystem } from '@capacitor/filesystem'
+import { Share } from '@capacitor/share'
 import {
   JCVitalV8,
   type JCVitalV8Battery,
@@ -7,44 +10,19 @@ import {
   type JCVitalV8DeviceInfo,
   type JCVitalV8ErrorEvent,
   type JCVitalV8HistoricalSyncResult,
-  type JCVitalV8MonitoringConfiguration,
   type JCVitalV8Observation,
   type JCVitalV8PermissionResult,
 } from './jcvitalV8Bridge'
+import {
+  buildHistoricalFeedResult,
+  buildMonitoringFeedResult,
+  buildPhase3AValidationReport,
+  type HistoricalFeedKey,
+  type HistoricalFeedRun,
+  type MonitoringFeedRun,
+} from './Phase3AValidation'
 
-type SyncKey = 'HR' | 'SpO2' | 'Temperature' | 'HRV' | 'PPI'
-
-function median(values: number[]): number | null {
-  if (!values.length) return null
-  const sorted = [...values].sort((a, b) => a - b)
-  const middle = Math.floor(sorted.length / 2)
-  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
-}
-
-function syncDiagnostics(result: JCVitalV8HistoricalSyncResult) {
-  const observations = result.observations
-  const times = observations.map((item) => item.observedAt ? Date.parse(item.observedAt) : Number.NaN).filter(Number.isFinite).sort((a, b) => a - b)
-  const intervals = times.slice(1).map((time, index) => time - times[index])
-  const nominal = observations.find((item) => item.samplingIntervalMs)?.samplingIntervalMs ?? null
-  const ppiValues = observations.flatMap((item) => item.metricType === 'PPI' ? (item.values ?? []).filter((value): value is number => typeof value === 'number') : [])
-  return {
-    status: result.completionStatus,
-    count: observations.length,
-    earliestTimestamp: result.earliestObservation,
-    latestTimestamp: result.latestObservation,
-    intervalMs: intervals.length ? { median: median(intervals), min: Math.min(...intervals), max: Math.max(...intervals) } : null,
-    missingIntervalCount: nominal ? intervals.filter((interval) => interval > nominal * 1.5).length : null,
-    duplicateCount: result.recordsDeduplicated,
-    parseErrors: result.parseErrors,
-    ppi: ppiValues.length ? {
-      count: ppiValues.length, min: Math.min(...ppiValues), max: Math.max(...ppiValues), median: median(ppiValues),
-      zeroCount: ppiValues.filter((value) => value === 0).length,
-      invalidCount: result.recordsRejected,
-    } : null,
-    first5: observations.slice(0, 5),
-    last5: observations.slice(-5),
-  }
-}
+type ExportStatus = 'EXPORTING' | 'EXPORT SUCCESS' | 'EXPORT FAILED'
 
 function errorText(error: unknown): string {
   const { code, message } = (error ?? {}) as { code?: string; message?: string }
@@ -63,8 +41,10 @@ export function JCVitalV8Panel() {
   const [lastError, setLastError] = useState<JCVitalV8ErrorEvent | null>(null)
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
-  const [syncResults, setSyncResults] = useState<Partial<Record<SyncKey, JCVitalV8HistoricalSyncResult>>>({})
-  const [monitoring, setMonitoring] = useState<JCVitalV8MonitoringConfiguration | null>(null)
+  const [historicalRuns, setHistoricalRuns] = useState<Partial<Record<HistoricalFeedKey, HistoricalFeedRun>>>({})
+  const [monitoringRun, setMonitoringRun] = useState<MonitoringFeedRun | undefined>()
+  const [exportStatus, setExportStatus] = useState<ExportStatus | null>(null)
+  const [exportLocation, setExportLocation] = useState<string | null>(null)
 
   useEffect(() => {
     const handles = [
@@ -90,40 +70,103 @@ export function JCVitalV8Panel() {
     try { await action() } catch (error) { setMessage(errorText(error)) } finally { setBusy(false) }
   }
 
-  async function runSync(key: SyncKey, action: () => Promise<JCVitalV8HistoricalSyncResult>): Promise<void> {
-    await run(async () => {
+  async function executeHistoricalSync(key: HistoricalFeedKey, action: () => Promise<JCVitalV8HistoricalSyncResult>): Promise<void> {
+    const requestStartedAt = new Date().toISOString()
+    setHistoricalRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: null, result: null, error: null } }))
+    try {
       const result = await action()
-      setSyncResults((current) => ({ ...current, [key]: result }))
-    })
+      setHistoricalRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result, error: null } }))
+    } catch (error) {
+      const text = errorText(error)
+      setHistoricalRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result: null, error: text } }))
+      setMessage((current) => current ? `${current}; ${text}` : text)
+    }
+  }
+
+  async function runSync(key: HistoricalFeedKey, action: () => Promise<JCVitalV8HistoricalSyncResult>): Promise<void> {
+    setBusy(true)
+    setMessage('')
+    try { await executeHistoricalSync(key, action) } finally { setBusy(false) }
   }
 
   async function syncHrvAndPpi(): Promise<void> {
     setBusy(true)
     setMessage('')
     try {
-      const hrv = await JCVitalV8.syncHistoricalHrv()
-      setSyncResults((current) => ({ ...current, HRV: hrv }))
-      const ppi = await JCVitalV8.syncHistoricalPpi()
-      setSyncResults((current) => ({ ...current, PPI: ppi }))
-    } catch (error) {
-      setMessage(errorText(error))
+      await executeHistoricalSync('hrv', () => JCVitalV8.syncHistoricalHrv())
+      await executeHistoricalSync('ppi', () => JCVitalV8.syncHistoricalPpi())
     } finally {
       setBusy(false)
     }
   }
 
-  function downloadDiagnostics(): void {
-    const payload = Object.fromEntries(Object.entries(syncResults).map(([key, result]) => [key, syncDiagnostics(result)]))
-    const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }))
-    const anchor = document.createElement('a')
-    anchor.href = url
-    anchor.download = `jcvital-v8-phase3a-${new Date().toISOString()}.json`
-    anchor.click()
-    URL.revokeObjectURL(url)
+  async function syncMonitoringConfiguration(): Promise<void> {
+    const requestStartedAt = new Date().toISOString()
+    setBusy(true)
+    setMessage('')
+    setMonitoringRun({ requestStartedAt, requestCompletedAt: null, result: null, error: null })
+    try {
+      const result = await JCVitalV8.getMonitoringConfiguration()
+      setMonitoringRun({ requestStartedAt, requestCompletedAt: new Date().toISOString(), result, error: null })
+    } catch (error) {
+      const text = errorText(error)
+      setMonitoringRun({ requestStartedAt, requestCompletedAt: new Date().toISOString(), result: null, error: text })
+      setMessage(text)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function exportValidationReport(): Promise<void> {
+    setExportStatus('EXPORTING')
+    setExportLocation(null)
+    try {
+      let deviceInfo = info
+      if (!deviceInfo && ready) {
+        deviceInfo = await JCVitalV8.getDeviceInfo()
+        setInfo(deviceInfo)
+      }
+      const payload = buildPhase3AValidationReport({ deviceInfo, historicalRuns, monitoringRun })
+      const filename = `jcvital-v8-phase3a-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+      const json = JSON.stringify(payload, null, 2)
+
+      if (Capacitor.isNativePlatform()) {
+        const saved = await Filesystem.writeFile({ path: filename, data: json, directory: Directory.Cache, encoding: Encoding.UTF8 })
+        await Share.share({
+          title: 'JCVital V8 Phase 3A Validation',
+          text: filename,
+          files: [saved.uri],
+          dialogTitle: 'Save or share Phase 3A validation JSON',
+        })
+        setExportLocation(`${filename} · ${saved.uri}`)
+      } else {
+        const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }))
+        const anchor = document.createElement('a')
+        anchor.href = url
+        anchor.download = filename
+        anchor.click()
+        URL.revokeObjectURL(url)
+        setExportLocation(filename)
+      }
+      setExportStatus('EXPORT SUCCESS')
+    } catch (error) {
+      setExportStatus('EXPORT FAILED')
+      setExportLocation(errorText(error))
+    }
   }
 
   const ready = state === 'READY'
   const linked = state === 'CONNECTING' || state === 'CONNECTED' || state === 'INITIALIZING' || ready
+  const feedDiagnostics = {
+    heartRate: buildHistoricalFeedResult('heartRate', historicalRuns.heartRate),
+    spo2: buildHistoricalFeedResult('spo2', historicalRuns.spo2),
+    temperature: buildHistoricalFeedResult('temperature', historicalRuns.temperature),
+    hrv: buildHistoricalFeedResult('hrv', historicalRuns.hrv),
+    ppi: buildHistoricalFeedResult('ppi', historicalRuns.ppi),
+    monitoringConfiguration: buildMonitoringFeedResult(monitoringRun),
+  }
+  const automaticHrInterval = monitoringRun?.result?.configurations.HEART_RATE.intervalMinutesRaw ?? null
+  const historicalHrDiagnostics = feedDiagnostics.heartRate.sampleDiagnostics as { medianIntervalSeconds?: number | null } | null
   return (
     <section className="wearables" aria-labelledby="jcvital-v8-title">
       <div className="wearables-heading"><h2 id="jcvital-v8-title">JCVital Pro V8</h2><strong>{state}</strong></div>
@@ -135,7 +178,7 @@ export function JCVitalV8Panel() {
       </div>
       {!linked && devices.length > 0 && <ul className="jcvital-devices">
         {devices.map((device) => <li key={device.id}>
-          <button type="button" disabled={busy} onClick={() => void run(async () => { setInfo(null); setBattery(null); setHeartRate(null); await JCVitalV8.connect({ deviceId: device.id }) })}>Connect</button>
+          <button type="button" disabled={busy} onClick={() => void run(async () => { setInfo(null); setBattery(null); setHeartRate(null); await JCVitalV8.connect({ deviceId: device.id }); setInfo(await JCVitalV8.getDeviceInfo()) })}>Connect</button>
           {' '}{device.name ?? 'Unnamed'} · {device.macAddress} · {device.rssi} dBm{device.advertisesJcvitalService ? ' · JCVital service' : ''}{device.bonded ? ' · bonded' : ''}
         </li>)}
       </ul>}
@@ -151,26 +194,33 @@ export function JCVitalV8Panel() {
       {heartRate && <p>Heart rate: <strong>{heartRate.value} {heartRate.unit}</strong> · received {new Date(heartRate.receiptTimestamp).toLocaleTimeString()} · packet type {heartRate.vendorDataType}</p>}
       <h3>Data Sync</h3>
       <div className="wearable-actions">
-        <button type="button" disabled={busy || !ready} onClick={() => void runSync('HR', () => JCVitalV8.syncHistoricalHeartRate())}>Sync HR</button>
-        <button type="button" disabled={busy || !ready} onClick={() => void runSync('SpO2', () => JCVitalV8.syncHistoricalSpo2())}>Sync SpO2</button>
-        <button type="button" disabled={busy || !ready} onClick={() => void runSync('Temperature', () => JCVitalV8.syncHistoricalTemperature())}>Sync Temperature</button>
+        <button type="button" disabled={busy || !ready} onClick={() => void runSync('heartRate', () => JCVitalV8.syncHistoricalHeartRate())}>Sync HR</button>
+        <button type="button" disabled={busy || !ready} onClick={() => void runSync('spo2', () => JCVitalV8.syncHistoricalSpo2())}>Sync SpO2</button>
+        <button type="button" disabled={busy || !ready} onClick={() => void runSync('temperature', () => JCVitalV8.syncHistoricalTemperature())}>Sync Temperature</button>
         <button type="button" disabled={busy || !ready} onClick={() => void syncHrvAndPpi()}>Sync HRV/PPI</button>
-        <button type="button" disabled={busy || !ready} onClick={() => void run(async () => setMonitoring(await JCVitalV8.getMonitoringConfiguration()))}>Monitoring Config</button>
+        <button type="button" disabled={busy || !ready} onClick={() => void syncMonitoringConfiguration()}>Sync Automatic Monitoring / Configuration</button>
         <button type="button" disabled title="Phase 3B">Sync Activity</button>
         <button type="button" disabled title="Phase 3B">Sync Sleep</button>
         <button type="button" disabled title="Phase 3B">Sync Workouts</button>
-        <button type="button" className="secondary" disabled={!Object.keys(syncResults).length} onClick={downloadDiagnostics}>Download Diagnostics</button>
+        <button type="button" className="secondary" disabled={!Object.keys(historicalRuns).length && !monitoringRun} onClick={() => void exportValidationReport()}>Export Phase 3A Validation JSON</button>
       </div>
-      {monitoring && <details className="jcvital-diagnostics"><summary>Monitoring configuration</summary><pre>{JSON.stringify(monitoring, null, 2)}</pre></details>}
-      {Object.entries(syncResults).map(([key, result]) => {
-        const diagnostics = syncDiagnostics(result)
+      <p><strong>Automatic HR monitoring interval:</strong> {automaticHrInterval === null ? '—' : `${automaticHrInterval} minutes (vendor configuration)`}</p>
+      <p><strong>Historical HR observed median interval:</strong> {historicalHrDiagnostics?.medianIntervalSeconds == null ? '—' : `${historicalHrDiagnostics.medianIntervalSeconds} seconds (observed data)`}</p>
+      {exportStatus && <p role="status"><strong>{exportStatus}</strong>{exportLocation ? ` · ${exportLocation}` : ''}</p>}
+      {Object.entries(feedDiagnostics).map(([key, diagnostics]) => {
+        const showAllRecords = key === 'spo2' || key === 'hrv' || key === 'ppi' || key === 'monitoringConfiguration'
         return <details key={key} className="jcvital-diagnostics">
-          <summary>{key}: {diagnostics.status} · {diagnostics.count} observations · {diagnostics.parseErrors.length} parse errors</summary>
-          <p>First: {diagnostics.earliestTimestamp ?? '—'} · Last: {diagnostics.latestTimestamp ?? '—'} · Duplicates: {diagnostics.duplicateCount}</p>
-          {diagnostics.intervalMs && <p>Interval ms: median {diagnostics.intervalMs.median} · min {diagnostics.intervalMs.min} · max {diagnostics.intervalMs.max} · missing {diagnostics.missingIntervalCount ?? '—'}</p>}
-          {diagnostics.ppi && <p>PPI values: {diagnostics.ppi.count} · min {diagnostics.ppi.min} · max {diagnostics.ppi.max} · median {diagnostics.ppi.median} · zero {diagnostics.ppi.zeroCount} · invalid {diagnostics.ppi.invalidCount}</p>}
-          <strong>First 5</strong><pre>{JSON.stringify(diagnostics.first5, null, 2)}</pre>
-          <strong>Last 5</strong><pre>{JSON.stringify(diagnostics.last5, null, 2)}</pre>
+          <summary>{key}: {diagnostics.completionStatus} · {diagnostics.recordsAccepted} accepted · {diagnostics.parseErrors.length} parse errors</summary>
+          <p>Started: {diagnostics.requestStartedAt ?? '—'} · Completed: {diagnostics.requestCompletedAt ?? '—'}</p>
+          <p>Source records received: {diagnostics.sourceRecordsReceived} · Normalized observations produced: {diagnostics.normalizedObservationsProduced}</p>
+          <p>Accepted: {diagnostics.recordsAccepted} · Deduplicated: {diagnostics.recordsDeduplicated} · Rejected: {diagnostics.recordsRejected}</p>
+          <p>Earliest: {diagnostics.earliestObservation ?? '—'} · Latest: {diagnostics.latestObservation ?? '—'}</p>
+          <p>Vendor type: {diagnostics.vendorDataType ?? '—'} · Acquisition: {diagnostics.acquisitionMode ?? '—'}</p>
+          <strong>Sample diagnostics</strong><pre>{JSON.stringify(diagnostics.sampleDiagnostics, null, 2)}</pre>
+          <strong>Parse errors</strong><pre>{JSON.stringify(diagnostics.parseErrors, null, 2)}</pre>
+          <strong>First 5 normalized observations</strong><pre>{JSON.stringify(diagnostics.firstFive, null, 2)}</pre>
+          <strong>Last 5 normalized observations</strong><pre>{JSON.stringify(diagnostics.lastFive, null, 2)}</pre>
+          {showAllRecords && <><strong>All returned diagnostic records</strong><pre>{JSON.stringify(diagnostics.allRecords, null, 2)}</pre></>}
         </details>
       })}
       <h3>Raw</h3>
