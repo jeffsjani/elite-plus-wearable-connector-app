@@ -170,6 +170,11 @@ export interface JCVitalV8Plugin {
   syncHistoricalTemperature(): Promise<JCVitalV8HistoricalSyncResult>
   syncHistoricalHrv(): Promise<JCVitalV8HistoricalSyncResult>
   syncHistoricalPpi(): Promise<JCVitalV8HistoricalSyncResult>
+  syncHistoricalActivity(): Promise<JCVitalV8HistoricalSyncResult>
+  syncDetailedActivity(): Promise<JCVitalV8HistoricalSyncResult>
+  syncHistoricalSleepStages(): Promise<JCVitalV8HistoricalSyncResult>
+  syncHistoricalSleepMovement(): Promise<JCVitalV8HistoricalSyncResult>
+  syncHistoricalWorkouts(): Promise<JCVitalV8HistoricalSyncResult>
   getMonitoringConfiguration(): Promise<JCVitalV8MonitoringConfiguration>
 
   addListener(event: 'jcvitalScanResult', listener: (device: JCVitalV8Device) => void): Promise<PluginListenerHandle>

@@ -135,6 +135,21 @@ class JCVitalV8Plugin : Plugin() {
     fun syncHistoricalPpi(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalPpi)
 
     @PluginMethod
+    fun syncHistoricalActivity(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalActivity)
+
+    @PluginMethod
+    fun syncDetailedActivity(call: PluginCall) = resolveHistorical(call, manager::syncDetailedActivity)
+
+    @PluginMethod
+    fun syncHistoricalSleepStages(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalSleepStages)
+
+    @PluginMethod
+    fun syncHistoricalSleepMovement(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalSleepMovement)
+
+    @PluginMethod
+    fun syncHistoricalWorkouts(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalWorkouts)
+
+    @PluginMethod
     fun getMonitoringConfiguration(call: PluginCall) = resolveHistorical(call, manager::requestMonitoringConfiguration)
 
     private fun resolveHistorical(

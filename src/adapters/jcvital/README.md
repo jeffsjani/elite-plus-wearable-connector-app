@@ -77,6 +77,26 @@ HRV measurement epochs.
 | PPI groups | `GetPPI` | `GetPPIData` (`127`) | `date`, `serial_number`, `ppiData` | `UNKNOWN_VENDOR_UNIT` | device-local `date` |
 | Monitor configuration | `GetAutomatic` for HR, SpO2, temperature, HRV | `GetAutomatic` (`16`) | mode, interval, start/end, weekdays | raw vendor configuration values | receipt time |
 
+## Phase 3B Android SDK audit
+
+The implementation uses only the checked-in Android V8 SDK and its demo. All
+five feeds use mode `0x00` to start, `0x02` to continue, and `0x99` to delete.
+The demo continues after each 50 callback packets until `DeviceKey.End` is true.
+
+| Feed | Request | Vendor type | Returned keys | Timestamp and units |
+| --- | --- | --- | --- | --- |
+| Daily activity | `BleSDK.GetTotalActivityDataWithMode(mode, "")` | `GetTotalActivityData` (`24`) | `date`, `step`, `exerciseMinutes`, `distance`, `calories`, `goal` | Device date `yyyy.MM.dd`; steps=count, exercise time=vendor minutes; Android parser divides distance and calories by 100 but does not document their final units, so units remain unknown and raw values are retained. `ExerciseTime` is calculated internally but commented out and not emitted. |
+| Detailed activity | `BleSDK.GetDetailActivityDataWithMode(mode, "")` | `GetDetailActivityData` (`25`) | `date`, `detailMinterStep`, `calories`, `distance`, `arraySteps` | Device-local `yyyy.MM.dd HH:mm:ss`; ten `arraySteps` values are documented by Android `DeviceKey` as one-minute steps. Block distance/calorie units remain unknown. |
+| Sleep stages | `BleSDK.GetDetailSleepDataWithMode(mode, "")` | `GetDetailSleepData` (`26`) | `date`, `arraySleepQuality`, `sleepUnitLength` | Device-local `yyyy-MM-dd HH:mm:ss`; `sleepUnitLength` is emitted as 1 or 5 minutes and controls epoch timestamps. No Android source/documentation maps stage codes, so every code is retained and canonical stage remains `UNKNOWN` pending physical/vendor validation. |
+| Detailed sleep movement | `BleSDK.getObtainDetailedSleepData(mode, "")` | `Obtain_detailed_sleep_data` (`121`) | `date`, `sleepLength`, `Sleep_level`, `ActivityData` | Device-local `yyyy.MM.dd HH:mm:ss`; stage and movement values are nibble-expanded arrays. No interval or alignment is documented, so arrays remain independent, unaligned, and lossless. |
+| Workout history | `BleSDK.GetActivityModeDataWithMode(mode)` | `GetActivityModeData` (`29`) | `date`, `sportModel`, `heartRate`, `ExerciseTime`, `step`, `sportModelSpeed`, `distance`, `calories` | Device-local `yyyy.MM.dd HH:mm:ss`; pace is the vendor `MM'SS"` string. Duration, distance, and calorie units are not asserted until hardware validation. Android emits no METS field (`NOT_EMITTED_ANDROID`). |
+
+Workout mode mapping is the active Android `ExerciseMode.modes` table: 0 run,
+1 cycling, 2 badminton, 3 football, 4 tennis, 5 yoga, 6 breathing training,
+7 dance, 8 basketball, 9 walking, 10 generic workout, 11 cricket, 12 hiking,
+13 aerobics, and 14 table tennis. Other integers remain
+`OTHER_VENDOR_MODE_<number>`.
+
 History requests use mode `0x00` to start and mode `0x02` to continue after 50
 callback packets. `DeviceKey.End` is the completion marker. Every callback is
 first emitted as sanitized `jcvitalRawVendorData`; recognized records additionally

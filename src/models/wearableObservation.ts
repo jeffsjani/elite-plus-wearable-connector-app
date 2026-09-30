@@ -72,17 +72,32 @@ export interface RawSignalChunk {
 
 export interface WorkoutSession {
   sessionId: string
-  activityType: string | null
-  sourceActivityType: number | string | null
+  vendorActivityMode: number | null
+  canonicalActivityType: string
   startedAt: string | null
   endedAt: string | null
-  status: string | null
   durationSeconds: number | null
+  durationRaw: number | null
+  heartRateSummary: number | null
   steps: number | null
   distanceMeters: number | null
+  distanceRaw: number | null
   caloriesKcal: number | null
-  pace: number | null
+  caloriesRaw: number | null
+  pace: string | null
   mets: number | null
+  metsSupportStatus: 'EMITTED' | 'NOT_EMITTED_ANDROID'
+  source: WearableSource
+  rawVendorPayload: SerializableValue
+}
+
+export interface ActivityEpoch {
+  startTime: string | null
+  durationSeconds: number | null
+  steps: number | null
+  activityValue: number | null
+  activityIntensity: number | null
+  sourceValue: SerializableValue
   source: WearableSource
 }
 
@@ -106,6 +121,9 @@ export interface SleepEpisode {
   stageEpochs: SleepEpoch[]
   movementEpochs: SleepEpoch[]
   source: WearableSource
+  deviceId: string | null
+  firmwareVersion: string | null
+  rawVendorPayload: SerializableValue
 }
 
 export interface VendorDerivedObservation {

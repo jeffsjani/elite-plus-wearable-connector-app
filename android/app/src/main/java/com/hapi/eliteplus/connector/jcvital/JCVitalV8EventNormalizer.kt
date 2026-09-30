@@ -88,6 +88,11 @@ class JCVitalV8EventNormalizer {
             BleConst.Temperature_history -> events += historicalRecords(vendor, fields, dataType, ctx, receipt, ::temperature)
             BleConst.GetHRVData -> events += historicalRecords(vendor, fields, dataType, ctx, receipt, ::hrv)
             BleConst.GetPPIData -> events += historicalRecords(vendor, fields, dataType, ctx, receipt, ::ppi)
+            BleConst.GetTotalActivityData -> events += historicalRecords(vendor, fields, dataType, ctx, receipt, ::dailyActivity)
+            BleConst.GetDetailActivityData -> events += historicalRecords(vendor, fields, dataType, ctx, receipt, ::detailedActivity)
+            BleConst.GetDetailSleepData -> events += historicalRecords(vendor, fields, dataType, ctx, receipt, ::sleepStages)
+            BleConst.Obtain_detailed_sleep_data -> events += historicalRecords(vendor, fields, dataType, ctx, receipt, ::sleepMovement)
+            BleConst.GetActivityModeData -> events += historicalRecords(vendor, fields, dataType, ctx, receipt, ::workout)
         }
         return events
     }
@@ -201,6 +206,116 @@ class JCVitalV8EventNormalizer {
         )
     }
 
+    private fun dailyActivity(record: Map<String, Any?>, envelope: Map<*, *>, dataType: String, ctx: Context, receipt: String): List<Map<String, Any?>> {
+        val sourceTime = record[DeviceKey.Date]?.toString()
+        val observedAt = parseVendorDate(sourceTime, ctx.timezone)?.let { JCVitalV8Time.isoUtc(it.time) }
+        val fields = listOf(
+            ObservationField("DAILY_STEPS", DeviceKey.Step, "count", false),
+            ObservationField("DAILY_EXERCISE_MINUTES", DeviceKey.ExerciseMinutes, "minute", false),
+            ObservationField("DAILY_DISTANCE", DeviceKey.Distance, "UNKNOWN_VENDOR_UNIT", false),
+            ObservationField("DAILY_CALORIES", DeviceKey.Calories, "UNKNOWN_VENDOR_UNIT", false),
+            ObservationField("DAILY_GOAL_COMPLETION", DeviceKey.Goal, "UNKNOWN_VENDOR_UNIT", false),
+            ObservationField("DAILY_ACTIVE_MINUTES", DeviceKey.ActiveMinutes, "minute", false),
+        )
+        return fields.filter { record.containsKey(it.vendorField) }.map { field ->
+            observation(
+                field.metricType, record[field.vendorField].asDoubleOrInt(), field.unit, sourceTime, observedAt,
+                dataType, field.vendorField, field.vendorDerived, "DAILY_ACTIVITY", null, null, null,
+                record, envelope, ctx, receipt,
+            )
+        }
+    }
+
+    private fun detailedActivity(record: Map<String, Any?>, envelope: Map<*, *>, dataType: String, ctx: Context, receipt: String): List<Map<String, Any?>> {
+        val sourceTime = record[DeviceKey.Date]?.toString()
+        val startedAt = parseVendorDate(sourceTime, ctx.timezone)
+        val values = record[DeviceKey.ArraySteps].integerArray()
+        val observations = values.mapIndexed { sequence, value ->
+            observation(
+                "DETAILED_ACTIVITY_EPOCH", value, "count", sourceTime,
+                startedAt?.let { JCVitalV8Time.isoUtc(it.time + sequence * DETAIL_ACTIVITY_INTERVAL_MS) },
+                dataType, DeviceKey.ArraySteps, false, "ONE_MINUTE_STEP_EPOCH", sequence,
+                DETAIL_ACTIVITY_INTERVAL_MS, null, record, envelope, ctx, receipt,
+            )
+        }.toMutableList()
+        val summaryFields = listOf(
+            ObservationField("DETAILED_ACTIVITY_STEPS_TOTAL", DeviceKey.KDetailMinterStep, "count", false),
+            ObservationField("DETAILED_ACTIVITY_DISTANCE", DeviceKey.Distance, "UNKNOWN_VENDOR_UNIT", false),
+            ObservationField("DETAILED_ACTIVITY_CALORIES", DeviceKey.Calories, "UNKNOWN_VENDOR_UNIT", false),
+        )
+        summaryFields.filter { record.containsKey(it.vendorField) }.forEach { field ->
+            observations += observation(
+                field.metricType, record[field.vendorField].asDoubleOrInt(), field.unit, sourceTime,
+                startedAt?.let { JCVitalV8Time.isoUtc(it.time) }, dataType, field.vendorField, false,
+                "DETAIL_ACTIVITY_BLOCK", null, null, null, record, envelope, ctx, receipt,
+            )
+        }
+        return observations
+    }
+
+    private fun sleepStages(record: Map<String, Any?>, envelope: Map<*, *>, dataType: String, ctx: Context, receipt: String): List<Map<String, Any?>> {
+        val sourceTime = record[DeviceKey.Date]?.toString()
+        val startedAt = parseVendorDate(sourceTime, ctx.timezone)
+        val sourceCodes = record[DeviceKey.ArraySleep].integerArray()
+        val epochMinutes = record[DeviceKey.sleepUnitLength].asInt()
+        val epochMs = epochMinutes?.takeIf { it > 0 }?.times(60_000L)
+        val episode = observation(
+            "SLEEP_EPISODE", null, "source_stage_code", sourceTime,
+            startedAt?.let { JCVitalV8Time.isoUtc(it.time) }, dataType, DeviceKey.ArraySleep, false,
+            "SLEEP_EPISODE_SOURCE_ARRAY", null, epochMs, null, record, envelope, ctx, receipt, sourceCodes,
+            acquisitionMode = "SLEEP",
+        )
+        val epochs = sourceCodes.mapIndexed { sequence, sourceCode ->
+            observation(
+                "SLEEP_STAGE", sourceCode, "source_stage_code", sourceTime,
+                if (epochMs == null) null else startedAt?.let { JCVitalV8Time.isoUtc(it.time + sequence * epochMs) },
+                dataType, DeviceKey.ArraySleep, false, "CANONICAL_STAGE_UNKNOWN", sequence, epochMs,
+                null, record, envelope, ctx, receipt, acquisitionMode = "SLEEP",
+            )
+        }
+        return listOf(episode) + epochs
+    }
+
+    private fun sleepMovement(record: Map<String, Any?>, envelope: Map<*, *>, dataType: String, ctx: Context, receipt: String): List<Map<String, Any?>> {
+        val sourceTime = record[DeviceKey.Date]?.toString()
+        val observedAt = parseVendorDate(sourceTime, ctx.timezone)?.let { JCVitalV8Time.isoUtc(it.time) }
+        return listOf(
+            observation(
+                "SLEEP_STAGE_DETAIL_RAW", null, "source_stage_code", sourceTime, observedAt, dataType,
+                DeviceKey.Sleep_level, false, "UNALIGNED_DETAIL_STAGE_ARRAY", null, null, null,
+                record, envelope, ctx, receipt, record[DeviceKey.Sleep_level].integerArray(), "SLEEP",
+            ),
+            observation(
+                "SLEEP_MOVEMENT", null, "UNKNOWN_VENDOR_UNIT", sourceTime, observedAt, dataType,
+                DeviceKey.ActivityData, false, "UNALIGNED_MOVEMENT_ARRAY", null, null, null,
+                record, envelope, ctx, receipt, record[DeviceKey.ActivityData].integerArray(), "SLEEP",
+            ),
+        )
+    }
+
+    private fun workout(record: Map<String, Any?>, envelope: Map<*, *>, dataType: String, ctx: Context, receipt: String): List<Map<String, Any?>> {
+        val sourceTime = record[DeviceKey.Date]?.toString()
+        val observedAt = parseVendorDate(sourceTime, ctx.timezone)?.let { JCVitalV8Time.isoUtc(it.time) }
+        val vendorMode = record[DeviceKey.ActivityMode].asInt()
+        val fields = listOf(
+            ObservationField("WORKOUT_TYPE", DeviceKey.ActivityMode, "vendor_mode", false),
+            ObservationField("WORKOUT_HR", DeviceKey.HeartRate, "bpm", false),
+            ObservationField("WORKOUT_DURATION", DeviceKey.ActiveMinutes, "UNKNOWN_VENDOR_UNIT", false),
+            ObservationField("WORKOUT_STEPS", DeviceKey.Step, "count", false),
+            ObservationField("WORKOUT_PACE", DeviceKey.Pace, "UNKNOWN_VENDOR_UNIT", false),
+            ObservationField("WORKOUT_DISTANCE", DeviceKey.Distance, "UNKNOWN_VENDOR_UNIT", false),
+            ObservationField("WORKOUT_CALORIES", DeviceKey.Calories, "UNKNOWN_VENDOR_UNIT", false),
+        )
+        return fields.filter { record.containsKey(it.vendorField) }.map { field ->
+            val value = if (field.vendorField == DeviceKey.ActivityMode) JCVitalV8ActivityModes.canonicalType(vendorMode) else record[field.vendorField].asNumberOrString()
+            observation(
+                field.metricType, value, field.unit, sourceTime, observedAt, dataType, field.vendorField, false,
+                "VENDOR_ACTIVITY_MODE_${vendorMode ?: "UNKNOWN"}", null, null, null,
+                record, envelope, ctx, receipt,
+            )
+        }
+    }
+
     private fun observation(
         metricType: String,
         value: Any?,
@@ -264,13 +379,17 @@ class JCVitalV8EventNormalizer {
 
     private fun parseVendorDate(value: String?, timezone: String): Date? {
         if (value.isNullOrBlank()) return null
-        val format = SimpleDateFormat("yyyy.MM.dd HH:mm:ss", Locale.US).apply {
-            isLenient = false
-            timeZone = TimeZone.getTimeZone(timezone)
+        val formats = listOf("yyyy.MM.dd HH:mm:ss", "yyyy-MM-dd HH:mm:ss", "yyyy.MM.dd", "yyyy-MM-dd")
+        for (pattern in formats) {
+            val format = SimpleDateFormat(pattern, Locale.US).apply {
+                isLenient = false
+                timeZone = TimeZone.getTimeZone(timezone)
+            }
+            val position = ParsePosition(0)
+            val parsed = format.parse(value, position)
+            if (parsed != null && position.index == value.length) return parsed
         }
-        val position = ParsePosition(0)
-        val parsed = format.parse(value, position)
-        return parsed?.takeIf { position.index == value.length }
+        return null
     }
 
     private fun Any?.integerArray(): List<Int> = when (this) {
@@ -287,6 +406,8 @@ class JCVitalV8EventNormalizer {
     }
 
     private fun Any?.asDoubleOrInt(): Number? = asDouble()?.let { if (it % 1.0 == 0.0) it.toInt() else it }
+
+    private fun Any?.asNumberOrString(): Any? = asDoubleOrInt() ?: toString().takeIf { it.isNotBlank() }
 
     private data class ObservationField(val metricType: String, val vendorField: String, val unit: String, val vendorDerived: Boolean)
 
@@ -334,8 +455,9 @@ class JCVitalV8EventNormalizer {
         const val EVENT_PARSE_ERROR = "jcvitalParseError"
         const val EVENT_RAW_VENDOR_DATA = "jcvitalRawVendorData"
         const val EVENT_ERROR = "jcvitalError"
-        const val PARSER_VERSION = "phase3a-1"
+        const val PARSER_VERSION = "phase3b-1"
         private const val CONTINUOUS_HR_INTERVAL_MS = 5_000L
+        private const val DETAIL_ACTIVITY_INTERVAL_MS = 60_000L
 
         fun sanitize(value: Any?): Any? = when (value) {
             null -> null

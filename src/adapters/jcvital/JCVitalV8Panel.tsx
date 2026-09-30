@@ -21,6 +21,12 @@ import {
   type HistoricalFeedRun,
   type MonitoringFeedRun,
 } from './Phase3AValidation'
+import {
+  buildPhase3BFeedResults,
+  buildPhase3BExportResults,
+  type Phase3BFeedKey,
+  type SleepFeedRun,
+} from './Phase3BValidation'
 
 type ExportStatus = 'EXPORTING' | 'EXPORT SUCCESS' | 'EXPORT FAILED'
 
@@ -43,6 +49,8 @@ export function JCVitalV8Panel() {
   const [busy, setBusy] = useState(false)
   const [historicalRuns, setHistoricalRuns] = useState<Partial<Record<HistoricalFeedKey, HistoricalFeedRun>>>({})
   const [monitoringRun, setMonitoringRun] = useState<MonitoringFeedRun | undefined>()
+  const [phase3bRuns, setPhase3bRuns] = useState<Partial<Record<Exclude<Phase3BFeedKey, 'sleep'>, HistoricalFeedRun>>>({})
+  const [sleepRun, setSleepRun] = useState<SleepFeedRun>({})
   const [exportStatus, setExportStatus] = useState<ExportStatus | null>(null)
   const [exportLocation, setExportLocation] = useState<string | null>(null)
 
@@ -117,6 +125,55 @@ export function JCVitalV8Panel() {
     }
   }
 
+  async function executePhase3BSync(
+    key: Exclude<Phase3BFeedKey, 'sleep'>,
+    action: () => Promise<JCVitalV8HistoricalSyncResult>,
+  ): Promise<void> {
+    const requestStartedAt = new Date().toISOString()
+    setPhase3bRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: null, result: null, error: null } }))
+    try {
+      const result = await action()
+      setPhase3bRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result, error: null } }))
+    } catch (error) {
+      const text = errorText(error)
+      setPhase3bRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result: null, error: text } }))
+      setMessage((current) => current ? `${current}; ${text}` : text)
+    }
+  }
+
+  async function runPhase3BSync(
+    key: Exclude<Phase3BFeedKey, 'sleep'>,
+    action: () => Promise<JCVitalV8HistoricalSyncResult>,
+  ): Promise<void> {
+    setBusy(true)
+    setMessage('')
+    try { await executePhase3BSync(key, action) } finally { setBusy(false) }
+  }
+
+  async function executeSleepSyncPart(part: keyof SleepFeedRun, action: () => Promise<JCVitalV8HistoricalSyncResult>): Promise<void> {
+    const requestStartedAt = new Date().toISOString()
+    setSleepRun((current) => ({ ...current, [part]: { requestStartedAt, requestCompletedAt: null, result: null, error: null } }))
+    try {
+      const result = await action()
+      setSleepRun((current) => ({ ...current, [part]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result, error: null } }))
+    } catch (error) {
+      const text = errorText(error)
+      setSleepRun((current) => ({ ...current, [part]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result: null, error: text } }))
+      setMessage((current) => current ? `${current}; ${text}` : text)
+    }
+  }
+
+  async function syncSleep(): Promise<void> {
+    setBusy(true)
+    setMessage('')
+    try {
+      await executeSleepSyncPart('stages', () => JCVitalV8.syncHistoricalSleepStages())
+      await executeSleepSyncPart('movement', () => JCVitalV8.syncHistoricalSleepMovement())
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function exportValidationReport(): Promise<void> {
     setExportStatus('EXPORTING')
     setExportLocation(null)
@@ -126,17 +183,26 @@ export function JCVitalV8Panel() {
         deviceInfo = await JCVitalV8.getDeviceInfo()
         setInfo(deviceInfo)
       }
-      const payload = buildPhase3AValidationReport({ deviceInfo, historicalRuns, monitoringRun })
-      const filename = `jcvital-v8-phase3a-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+      const phase3bFeedResults = buildPhase3BExportResults({
+        activity: phase3bRuns.activity,
+        detailedActivity: phase3bRuns.detailedActivity,
+        sleep: sleepRun,
+        workouts: phase3bRuns.workouts,
+      })
+      const payload = buildPhase3AValidationReport({
+        deviceInfo, historicalRuns, monitoringRun,
+        additionalFeedResults: phase3bFeedResults,
+      })
+      const filename = `jcvital-v8-phase3ab-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
       const json = JSON.stringify(payload, null, 2)
 
       if (Capacitor.isNativePlatform()) {
         const saved = await Filesystem.writeFile({ path: filename, data: json, directory: Directory.Cache, encoding: Encoding.UTF8 })
         await Share.share({
-          title: 'JCVital V8 Phase 3A Validation',
+          title: 'JCVital V8 Phase 3A/3B Validation',
           text: filename,
           files: [saved.uri],
-          dialogTitle: 'Save or share Phase 3A validation JSON',
+          dialogTitle: 'Save or share Phase 3A/3B validation JSON',
         })
         setExportLocation(`${filename} · ${saved.uri}`)
       } else {
@@ -165,6 +231,12 @@ export function JCVitalV8Panel() {
     ppi: buildHistoricalFeedResult('ppi', historicalRuns.ppi),
     monitoringConfiguration: buildMonitoringFeedResult(monitoringRun),
   }
+  const phase3bDiagnostics = buildPhase3BFeedResults({
+    activity: phase3bRuns.activity,
+    detailedActivity: phase3bRuns.detailedActivity,
+    sleep: sleepRun,
+    workouts: phase3bRuns.workouts,
+  })
   const automaticHrInterval = monitoringRun?.result?.configurations.HEART_RATE.intervalMinutesRaw ?? null
   const historicalHrDiagnostics = feedDiagnostics.heartRate.sampleDiagnostics as { medianIntervalSeconds?: number | null } | null
   return (
@@ -199,10 +271,11 @@ export function JCVitalV8Panel() {
         <button type="button" disabled={busy || !ready} onClick={() => void runSync('temperature', () => JCVitalV8.syncHistoricalTemperature())}>Sync Temperature</button>
         <button type="button" disabled={busy || !ready} onClick={() => void syncHrvAndPpi()}>Sync HRV/PPI</button>
         <button type="button" disabled={busy || !ready} onClick={() => void syncMonitoringConfiguration()}>Sync Automatic Monitoring / Configuration</button>
-        <button type="button" disabled title="Phase 3B">Sync Activity</button>
-        <button type="button" disabled title="Phase 3B">Sync Sleep</button>
-        <button type="button" disabled title="Phase 3B">Sync Workouts</button>
-        <button type="button" className="secondary" disabled={!Object.keys(historicalRuns).length && !monitoringRun} onClick={() => void exportValidationReport()}>Export Phase 3A Validation JSON</button>
+        <button type="button" disabled={busy || !ready} onClick={() => void runPhase3BSync('activity', () => JCVitalV8.syncHistoricalActivity())}>Sync Activity</button>
+        <button type="button" disabled={busy || !ready} onClick={() => void runPhase3BSync('detailedActivity', () => JCVitalV8.syncDetailedActivity())}>Sync Detailed Activity</button>
+        <button type="button" disabled={busy || !ready} onClick={() => void syncSleep()}>Sync Sleep</button>
+        <button type="button" disabled={busy || !ready} onClick={() => void runPhase3BSync('workouts', () => JCVitalV8.syncHistoricalWorkouts())}>Sync Workouts</button>
+        <button type="button" className="secondary" disabled={!Object.keys(historicalRuns).length && !monitoringRun && !Object.keys(phase3bRuns).length && !sleepRun.stages && !sleepRun.movement} onClick={() => void exportValidationReport()}>Export Phase 3A/3B Validation JSON</button>
       </div>
       <p><strong>Automatic HR monitoring interval:</strong> {automaticHrInterval === null ? '—' : `${automaticHrInterval} minutes (vendor configuration)`}</p>
       <p><strong>Historical HR observed median interval:</strong> {historicalHrDiagnostics?.medianIntervalSeconds == null ? '—' : `${historicalHrDiagnostics.medianIntervalSeconds} seconds (observed data)`}</p>
@@ -223,6 +296,17 @@ export function JCVitalV8Panel() {
           {showAllRecords && <><strong>All returned diagnostic records</strong><pre>{JSON.stringify(diagnostics.allRecords, null, 2)}</pre></>}
         </details>
       })}
+      <h3>Phase 3B History</h3>
+      {Object.entries(phase3bDiagnostics).map(([key, diagnostics]) => <details key={key} className="jcvital-diagnostics">
+        <summary>{key}: {diagnostics.completionStatus} · {diagnostics.recordsAccepted} accepted · {diagnostics.parseErrors.length} parse errors</summary>
+        <p>Source records received: {diagnostics.sourceRecordsReceived} · Normalized observations produced: {diagnostics.normalizedObservationsProduced}</p>
+        <p>Accepted: {diagnostics.recordsAccepted} · Deduplicated: {diagnostics.recordsDeduplicated} · Rejected: {diagnostics.recordsRejected}</p>
+        <p>Earliest: {diagnostics.earliestObservation ?? '—'} · Latest: {diagnostics.latestObservation ?? '—'}</p>
+        <strong>Diagnostics</strong><pre>{JSON.stringify(diagnostics.sampleDiagnostics, null, 2)}</pre>
+        <strong>Parse errors</strong><pre>{JSON.stringify(diagnostics.parseErrors, null, 2)}</pre>
+        <strong>First 5</strong><pre>{JSON.stringify(diagnostics.firstFive, null, 2)}</pre>
+        <strong>Last 5</strong><pre>{JSON.stringify(diagnostics.lastFive, null, 2)}</pre>
+      </details>)}
       <h3>Raw</h3>
       <div className="wearable-actions">
         <button type="button" disabled title="Phase 3D">Start PPG</button>

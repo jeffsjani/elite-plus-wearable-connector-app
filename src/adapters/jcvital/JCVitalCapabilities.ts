@@ -116,6 +116,7 @@ export type V8SupportStatus =
   | 'PROVISIONAL'
   | 'UNDERDOCUMENTED'
   | 'VENDOR_DERIVED'
+  | 'NOT_EMITTED_ANDROID'
   | 'UNSUPPORTED'
   | 'ODM_REQUIRED'
 
@@ -193,6 +194,11 @@ export const V8_CAPABILITY_REGISTRY: Record<string, V8Capability> = {
     rawAvailable: false, historicalAvailable: false, realtimeAvailable: false, resolution: null,
     unit: null, validationStatus: 'DOCUMENTATION_REQUIRED', nativeSdkAvailable: false,
   },
+  WORKOUT_METS: {
+    capability: 'WORKOUT_METS', supportStatus: 'NOT_EMITTED_ANDROID', acquisitionMode: 'HISTORICAL_SYNC',
+    rawAvailable: false, historicalAvailable: false, realtimeAvailable: false, resolution: null,
+    unit: 'MET', validationStatus: 'NOT_APPLICABLE', nativeSdkAvailable: false,
+  },
 }
 
 /**
@@ -218,7 +224,7 @@ export const JCVitalCapabilityRegistry: Record<JCVitalCapabilityKey, CapabilityR
   SLEEP_STAGE_ARRAYS: { key: 'SLEEP_STAGE_ARRAYS', evidenceLevel: 'CONFIRMED_V8', notes: 'CMD_Get_SleepData / getDetailSleepDataWithMode present.' },
   SLEEP_MOVEMENT_ARRAYS: { key: 'SLEEP_MOVEMENT_ARRAYS', evidenceLevel: 'CONFIRMED_V8', notes: 'CMD_Get_SleepActivityData / getSleepActivityLevelsData present.' },
   WORKOUT_SESSIONS: { key: 'WORKOUT_SESSIONS', evidenceLevel: 'CONFIRMED_V8', notes: 'EnterActivityMode / getActivityExerciseData present; measurementWithTypeV8 shows dedicated V8 handling.' },
-  METS: { key: 'METS', evidenceLevel: 'STRONG_SDK_EVIDENCE', notes: 'needMETS-style field not directly observed in secondary evidence; workout activity records carry calories/distance/pace so a METS field is plausible but not directly confirmed in this wrapper.' },
+  METS: { key: 'METS', evidenceLevel: 'EXPLICITLY_UNSUPPORTED', notes: 'The authoritative Android V8 getExerciseData parser does not emit METS. Phase 3B status: NOT_EMITTED_ANDROID; no replacement is calculated.' },
   BATTERY: { key: 'BATTERY', evidenceLevel: 'CONFIRMED_V8', notes: 'CMD_Get_BatteryLevel / getDeviceBatteryLevel present.' },
   FIRMWARE_DEVICE_METADATA: { key: 'FIRMWARE_DEVICE_METADATA', evidenceLevel: 'CONFIRMED_V8', notes: 'CMD_Get_Version / getDeviceVersion, CMD_Get_NewDeviceInfo present.' },
   REALTIME_PPI: { key: 'REALTIME_PPI', evidenceLevel: 'STRONG_SDK_EVIDENCE', notes: 'PPI history command confirmed; a dedicated realtime PPI callback was not directly isolated in the wrapper docs.' },

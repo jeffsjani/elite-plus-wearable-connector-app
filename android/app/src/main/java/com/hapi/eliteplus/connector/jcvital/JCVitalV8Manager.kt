@@ -513,6 +513,26 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         "GetPPI", BleConst.GetPPIData, { mode -> BleSDK.GetPPI(mode, "") }, callback,
     )
 
+    fun syncHistoricalActivity(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
+        "GetTotalActivityDataWithMode", BleConst.GetTotalActivityData, { mode -> BleSDK.GetTotalActivityDataWithMode(mode, "") }, callback,
+    )
+
+    fun syncDetailedActivity(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
+        "GetDetailActivityDataWithMode", BleConst.GetDetailActivityData, { mode -> BleSDK.GetDetailActivityDataWithMode(mode, "") }, callback,
+    )
+
+    fun syncHistoricalSleepStages(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
+        "GetDetailSleepDataWithMode", BleConst.GetDetailSleepData, { mode -> BleSDK.GetDetailSleepDataWithMode(mode, "") }, callback,
+    )
+
+    fun syncHistoricalSleepMovement(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
+        "getObtainDetailedSleepData", BleConst.Obtain_detailed_sleep_data, { mode -> BleSDK.getObtainDetailedSleepData(mode, "") }, callback,
+    )
+
+    fun syncHistoricalWorkouts(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
+        "GetActivityModeDataWithMode", BleConst.GetActivityModeData, { mode -> BleSDK.GetActivityModeDataWithMode(mode) }, callback,
+    )
+
     fun requestMonitoringConfiguration(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
         if (!requireReady(callback)) return@onMain
         if (historicalRequest != null || monitoringRequest != null) {

@@ -304,6 +304,7 @@ export function buildPhase3AValidationReport(options: {
   deviceInfo: JCVitalV8DeviceInfo | null
   historicalRuns: Partial<Record<HistoricalFeedKey, HistoricalFeedRun>>
   monitoringRun?: MonitoringFeedRun
+  additionalFeedResults?: Record<string, unknown>
 }) {
   const feeds = {
     heartRate: buildHistoricalFeedResult('heartRate', options.historicalRuns.heartRate),
@@ -335,6 +336,7 @@ export function buildPhase3AValidationReport(options: {
       hrv: exportFeed(feeds.hrv),
       ppi: exportFeed(feeds.ppi),
       monitoringConfiguration: exportFeed(feeds.monitoringConfiguration),
+      ...options.additionalFeedResults,
     },
   }
 }

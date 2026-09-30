@@ -258,4 +258,118 @@ class JCVitalV8EventNormalizerTest {
             .single { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }
         assertEquals(observations.first().payload["id"], duplicate.payload["id"])
     }
+
+    @Test
+    fun dailyActivityRecordPreservesEveryAndroidField() {
+        val observations = historical(
+            BleConst.GetTotalActivityData,
+            listOf(mapOf(
+                DeviceKey.Date to "2026.09.30", DeviceKey.Step to "1234", DeviceKey.ExerciseMinutes to "44",
+                DeviceKey.Distance to "1.23", DeviceKey.Calories to "45.60", DeviceKey.Goal to "80",
+                "unexpectedDailyField" to "preserved",
+            )),
+        ).filter { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }.map { it.payload }
+
+        assertEquals(
+            setOf("DAILY_STEPS", "DAILY_EXERCISE_MINUTES", "DAILY_DISTANCE", "DAILY_CALORIES", "DAILY_GOAL_COMPLETION"),
+            observations.map { it["metricType"] }.toSet(),
+        )
+        assertEquals("count", observations.single { it["metricType"] == "DAILY_STEPS" }["unit"])
+        @Suppress("UNCHECKED_CAST")
+        val raw = observations.first()["rawPayload"] as Map<String, Any?>
+        @Suppress("UNCHECKED_CAST")
+        assertEquals("preserved", (raw["record"] as Map<String, Any?>)["unexpectedDailyField"])
+    }
+
+    @Test
+    fun detailedActivityPreservesTenOneMinuteStepEpochsAndBlockSummaries() {
+        val observations = historical(
+            BleConst.GetDetailActivityData,
+            listOf(mapOf(
+                DeviceKey.Date to "2026.09.30 10:00:00", DeviceKey.ArraySteps to "1 2 3 4 5 6 7 8 9 10",
+                DeviceKey.KDetailMinterStep to "55", DeviceKey.Distance to "0.50", DeviceKey.Calories to "4.20",
+            )),
+        ).filter { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }.map { it.payload }
+
+        val epochs = observations.filter { it["metricType"] == "DETAILED_ACTIVITY_EPOCH" }
+        assertEquals(10, epochs.size)
+        assertEquals(60_000L, epochs.first()["samplingIntervalMs"])
+        assertEquals("2026-09-30T09:00:00.000Z", epochs.first()["observedAt"])
+        assertEquals("2026-09-30T09:09:00.000Z", epochs.last()["observedAt"])
+        assertEquals(55, observations.single { it["metricType"] == "DETAILED_ACTIVITY_STEPS_TOTAL" }["value"])
+    }
+
+    @Test
+    fun sleepEpisodeUsesVendorEpochLengthAndPreservesAllSourceCodesAsUnknown() {
+        val observations = historical(
+            BleConst.GetDetailSleepData,
+            listOf(mapOf(
+                DeviceKey.Date to "2026-09-30 22:00:00", DeviceKey.ArraySleep to "0 1 2 3 4",
+                DeviceKey.sleepUnitLength to "5",
+            )),
+        ).filter { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }.map { it.payload }
+
+        val episode = observations.single { it["metricType"] == "SLEEP_EPISODE" }
+        val epochs = observations.filter { it["metricType"] == "SLEEP_STAGE" }
+        assertEquals(listOf(0, 1, 2, 3, 4), episode["values"])
+        assertEquals(300_000L, episode["samplingIntervalMs"])
+        assertEquals(5, epochs.size)
+        assertTrue(epochs.all { it["measurementContext"] == "CANONICAL_STAGE_UNKNOWN" })
+        assertEquals(listOf(0, 1, 2, 3, 4), epochs.map { it["value"] })
+    }
+
+    @Test
+    fun sleepMovementArraysRemainSeparateWhenAlignmentIsUnknown() {
+        val observations = historical(
+            BleConst.Obtain_detailed_sleep_data,
+            listOf(mapOf(
+                DeviceKey.Date to "2026.09.30 22:00:00", DeviceKey.KSleepLength to "4",
+                DeviceKey.Sleep_level to "[0, 1, 2, 3]", DeviceKey.ActivityData to "[4, 5, 6]",
+            )),
+        ).filter { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }.map { it.payload }
+
+        assertEquals(listOf(0, 1, 2, 3), observations.single { it["metricType"] == "SLEEP_STAGE_DETAIL_RAW" }["values"])
+        assertEquals(listOf(4, 5, 6), observations.single { it["metricType"] == "SLEEP_MOVEMENT" }["values"])
+        assertTrue(observations.all { it["samplingIntervalMs"] == null })
+    }
+
+    @Test
+    fun emptyAndMalformedSleepResponsesAreExplicit() {
+        val empty = historical(BleConst.GetDetailSleepData, emptyList())
+        assertEquals(listOf(JCVitalV8EventNormalizer.EVENT_RAW_VENDOR_DATA), empty.map { it.name })
+
+        val malformed = historical(
+            BleConst.GetDetailSleepData,
+            listOf(mapOf(DeviceKey.Date to "not-a-date", DeviceKey.ArraySleep to "bad", DeviceKey.sleepUnitLength to "bad")),
+        )
+        assertTrue(malformed.any { it.name == JCVitalV8EventNormalizer.EVENT_PARSE_ERROR })
+        assertTrue(malformed.any { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION })
+    }
+
+    @Test
+    fun workoutHistoryMapsKnownAndUnknownModesWithoutFabricatingMets() {
+        val knownRecord = mapOf<String, Any?>(
+            DeviceKey.Date to "2026.09.30 12:00:00", DeviceKey.ActivityMode to "0", DeviceKey.HeartRate to "120",
+            DeviceKey.ActiveMinutes to "600", DeviceKey.Step to "1234", DeviceKey.Pace to "05'30\"",
+            DeviceKey.Distance to "2.50", DeviceKey.Calories to "123.4",
+        )
+        val known = historical(BleConst.GetActivityModeData, listOf(knownRecord))
+            .filter { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }.map { it.payload }
+        assertEquals("RUN", known.single { it["metricType"] == "WORKOUT_TYPE" }["value"])
+        assertFalse(known.any { it["metricType"] == "WORKOUT_METS" })
+
+        val unknown = historical(BleConst.GetActivityModeData, listOf(knownRecord + (DeviceKey.ActivityMode to "99")))
+            .filter { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }
+        assertEquals("OTHER_VENDOR_MODE_99", unknown.single { it.payload["metricType"] == "WORKOUT_TYPE" }.payload["value"])
+    }
+
+    @Test
+    fun workoutSessionFingerprintIsDeterministicAndCompletionMarkerIsRetained() {
+        val record = mapOf<String, Any?>(DeviceKey.Date to "2026.09.30 12:00:00", DeviceKey.ActivityMode to "9", DeviceKey.Step to "50")
+        val first = historical(BleConst.GetActivityModeData, listOf(record), end = false)
+            .filter { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }
+        val duplicate = historical(BleConst.GetActivityModeData, listOf(record), end = true)
+        assertEquals(first.map { it.payload["id"] }, duplicate.filter { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }.map { it.payload["id"] })
+        assertEquals(true, duplicate.single { it.name == JCVitalV8EventNormalizer.EVENT_RAW_VENDOR_DATA }.payload["dataEnd"])
+    }
 }
