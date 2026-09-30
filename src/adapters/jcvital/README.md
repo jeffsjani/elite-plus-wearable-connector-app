@@ -219,6 +219,63 @@ Keep the three heart-rate layers distinct:
 The 10-minute run validates this device/configuration only; cadence and startup
 behavior may vary by firmware, activity mode, or sensor lock conditions.
 
+## Phase 3D raw-signal implementation preparation
+
+The packaged `android/app/libs/v8sdk2.0.jar` and checked-in Android source were
+audited. No implemented `realtimePPGData_V8` or `arrayPPGData` API was found;
+`BleConst.realtimePPGData` (`99`) exists as an unused constant in the inspected
+SDK source. Do not treat that constant alone as an acquisition method.
+
+### PPG-related Android workflow
+
+- `BleSDK.ppgWithMode(mode, status)` sends `DeviceConst.CMD_Get_Bloodsugar`
+  (`0x78`). The Android demo uses mode 1 to start, mode 4 for progress, mode 3
+  to stop, mode 2 to report a vendor workflow result, and mode 5 to quit.
+- Sample payloads arrive as `DeviceConst.Bloodsugar_data` (`0x3a`), normalized
+  by the SDK as `BleConst.Blood_glucose_data` (`119`) with `Time` and `PPG`.
+  This is a vendor-named glucose workflow; Phase 3D must expose waveform data
+  only as raw PPG and must not represent any workflow result as blood glucose.
+- For 153-byte notifications, the parser strips the first three bytes and
+  interprets 50 successive 3-byte values as unsigned big-endian integers. Its
+  203-byte branch groups by four bytes but repeats the first byte in its
+  arithmetic; do not use that branch to redefine raw values. Capture original
+  BLE bytes at the native notification boundary and preserve the SDK-decoded
+  map separately for comparison.
+- No sample rate, packet cadence, sample interval, or reliable packet sequence
+  field is documented for this PPG workflow. Keep those fields null until
+  measured on hardware.
+
+### ECG Android stream
+
+- Start: `BleSDK.SetDeviceMeasurementWithType(AutoTestMode.ECG, duration, true)`
+  plus `BleSDK.setECGRealtimeDuringHRVEnabled(true)`. The latter sends
+  `DeviceConst.PPG` (`0x07`) and enables the SDK's ECG raw parser. The Android
+  demo passes `50 * 1000` as its duration; the unit interpretation needs
+  verification before using that literal in a new session controller.
+- Stop: the same measurement call with `open=false`, followed by
+  `setECGRealtimeDuringHRVEnabled(false)`.
+- Notifications on command byte `0x07` with the SDK gate enabled and packet
+  length above 16 are parsed as `BleConst.GetECG` (`64`). `arrayEcgRawData`
+  contains unsigned 24-bit little-endian values rendered as comma-separated
+  decimal integers; `packetID` is notification byte 1. The SDK reports
+  `End=false` for each packet.
+- Sample frequency and packet cadence are not provided by Android source.
+  Preserve the original byte triplets; do not convert to millivolts or infer a
+  sample rate.
+
+### Phase 3D boundary
+
+Raw ECG can be captured from native notifications while retaining the SDK
+packet ID and parsed fields. Raw PPG should be captured from `0x3a` notification
+bytes because the SDK parser transforms the frame and has inconsistent 153/203
+byte decoding paths. Both feeds require native bounded buffering, session
+lifecycle, sequence/drop accounting, and chunk transfer/storage; they must not
+emit each sample individually through Capacitor. The existing GATT receive path
+already owns the raw notification bytes, so implementation should add a
+session-scoped buffer at that boundary without replacing transport behavior.
+PPG start/stop semantics, ECG duration units, sample frequency, rates, and
+buffer-loss behavior require Phase 3D hardware validation.
+
 ## Files
 
 - `JCVitalCapabilities.ts` — capability/evidence model and registry.
