@@ -119,6 +119,31 @@ class JCVitalV8Plugin : Plugin() {
         manager.stopRealtime { result, error -> if (error != null) reject(call, error) else call.resolve(toJsObject(result!!)) }
     }
 
+    @PluginMethod
+    fun syncHistoricalHeartRate(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalHeartRate)
+
+    @PluginMethod
+    fun syncHistoricalSpo2(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalSpo2)
+
+    @PluginMethod
+    fun syncHistoricalTemperature(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalTemperature)
+
+    @PluginMethod
+    fun syncHistoricalHrv(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalHrv)
+
+    @PluginMethod
+    fun syncHistoricalPpi(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalPpi)
+
+    @PluginMethod
+    fun getMonitoringConfiguration(call: PluginCall) = resolveHistorical(call, manager::requestMonitoringConfiguration)
+
+    private fun resolveHistorical(
+        call: PluginCall,
+        operation: ((Map<String, Any?>?, JCVitalV8Exception?) -> Unit) -> Unit,
+    ) {
+        operation { result, error -> if (error != null) reject(call, error) else call.resolve(toJsObject(result!!)) }
+    }
+
     private fun alias(): String = JCVitalV8Permissions.alias(Build.VERSION.SDK_INT)
 
     private fun permissionStatus(): JCVitalV8PermissionStatus {

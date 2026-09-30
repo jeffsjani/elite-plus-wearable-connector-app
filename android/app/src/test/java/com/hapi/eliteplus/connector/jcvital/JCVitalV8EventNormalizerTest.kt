@@ -2,6 +2,8 @@ package com.hapi.eliteplus.connector.jcvital
 
 import com.jstyle.blesdkv8.Util.BleSDK
 import com.jstyle.blesdkv8.callback.DataListener2301
+import com.jstyle.blesdkv8.constant.BleConst
+import com.jstyle.blesdkv8.constant.DeviceKey
 import com.jstyle.blesdkv8.model.AutoTestMode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -113,6 +115,19 @@ class JCVitalV8EventNormalizerTest {
     }
 
     @Test
+    fun realtimeTemperatureIsIndependentFromHeartRate() {
+        val packet = realtimePacket(78)
+        packet[22] = 0x6D
+        packet[23] = 0x01
+        val temperature = events(*packet, size = 25).single {
+            it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION && it.payload["metricType"] == "WEARABLE_TEMPERATURE"
+        }.payload
+        assertEquals(36.5, temperature["value"])
+        assertEquals("REALTIME", temperature["acquisitionMode"])
+        assertNull(temperature["observedAt"])
+    }
+
+    @Test
     fun rawVendorEventIsSanitizedCopy() {
         val raw = events(0x27, 0, 0, 3, 4).single { it.name == "jcvitalRawVendorData" }.payload
         assertEquals("11", raw["vendorDataType"])
@@ -131,5 +146,116 @@ class JCVitalV8EventNormalizerTest {
     fun realtimePacketTruncatedByDefaultMtuCannotBeParsedBySdk() {
         // 20 bytes = default ATT MTU 23 payload; the SDK reads up to byte 24. This is why MTU is negotiated.
         assertThrows(ArrayIndexOutOfBoundsException::class.java) { vendorParse(*realtimePacket(78).copyOf(20), size = 20) }
+    }
+
+    private fun historical(dataType: String, records: List<Map<String, Any?>>, end: Boolean = true) = normalizer.normalize(
+        mapOf(DeviceKey.DataType to dataType, DeviceKey.End to end, DeviceKey.Data to records),
+        ctx,
+    )
+
+    @Test
+    fun continuousHeartRatePreservesAllSamplesAtNativeCadence() {
+        val observations = historical(
+            BleConst.GetDynamicHR,
+            listOf(mapOf(DeviceKey.Date to "2026.09.30 10:00:00", DeviceKey.ArrayDynamicHR to "70 71 0 73")),
+        ).filter { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }.map { it.payload }
+
+        assertEquals(listOf(70, 71, 0, 73), observations.map { it["value"] })
+        assertEquals(listOf(0, 1, 2, 3), observations.map { it["sequenceNumber"] })
+        assertTrue(observations.all { it["metricType"] == "HEART_RATE_CONTINUOUS" })
+        assertTrue(observations.all { it["samplingIntervalMs"] == 5_000L })
+        assertEquals("2026-09-30T09:00:00.000Z", observations.first()["observedAt"])
+        assertEquals("2026-09-30T09:00:15.000Z", observations.last()["observedAt"])
+    }
+
+    @Test
+    fun automaticSpo2AndTemperatureRemainIndependentObservations() {
+        val spo2 = historical(
+            BleConst.GetAutomaticSpo2Monitoring,
+            listOf(mapOf(DeviceKey.Date to "2026.09.30 01:02:03", DeviceKey.Blood_oxygen to "97")),
+        ).single { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }.payload
+        val temperature = historical(
+            BleConst.Temperature_history,
+            listOf(mapOf(DeviceKey.Date to "2026.09.30 01:02:03", DeviceKey.temperature to "36.4")),
+        ).single { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }.payload
+
+        assertEquals("SPO2", spo2["metricType"])
+        assertEquals(97, spo2["value"])
+        assertEquals("percent", spo2["unit"])
+        assertEquals("WEARABLE_TEMPERATURE", temperature["metricType"])
+        assertEquals(36.4, temperature["value"])
+        assertEquals("celsius", temperature["unit"])
+        assertEquals("WEARABLE_TEMPERATURE_C", temperature["measurementContext"])
+    }
+
+    @Test
+    fun hrvRecordKeepsVendorMetricsSeparateAndDoesNotInterpretScales() {
+        val record = mapOf<String, Any?>(
+            DeviceKey.Date to "2026.09.30 01:02:03", DeviceKey.HRV to "42", DeviceKey.HeartRate to "66",
+            DeviceKey.Stress to "3", DeviceKey.highBP to "118", DeviceKey.lowBP to "76", DeviceKey.Fatiguedegree to "5",
+            "unexpected" to "preserved",
+        )
+        val observations = historical(BleConst.GetHRVData, listOf(record))
+            .filter { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }.map { it.payload }
+
+        assertEquals(
+            setOf("HRV_VENDOR", "HEART_RATE_AUTOMATIC", "STRESS_VENDOR", "BP_SYSTOLIC_ESTIMATED", "BP_DIASTOLIC_ESTIMATED", "FATIGUE_VENDOR"),
+            observations.map { it["metricType"] }.toSet(),
+        )
+        assertEquals("UNKNOWN_VENDOR_UNIT", observations.single { it["metricType"] == "HRV_VENDOR" }["unit"])
+        assertEquals(true, observations.single { it["metricType"] == "BP_SYSTOLIC_ESTIMATED" }["vendorDerived"])
+        @Suppress("UNCHECKED_CAST")
+        val rawPayload = observations.first()["rawPayload"] as Map<String, Any?>
+        @Suppress("UNCHECKED_CAST")
+        val rawRecord = rawPayload["record"] as Map<String, Any?>
+        assertEquals("preserved", rawRecord["unexpected"])
+    }
+
+    @Test
+    fun ppiArrayPreservesGroupAndUnknownUnit() {
+        val observation = historical(
+            BleConst.GetPPIData,
+            listOf(mapOf(DeviceKey.Date to "2026.09.30 01:02:03", DeviceKey.serial_number to "513", DeviceKey.KPPIData to "[812, 0, 799]")),
+        ).single { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }.payload
+
+        assertEquals("PPI", observation["metricType"])
+        assertEquals(listOf(812, 0, 799), observation["values"])
+        assertEquals("UNKNOWN_VENDOR_UNIT", observation["unit"])
+        assertEquals("513", observation["packetId"])
+    }
+
+    @Test
+    fun emptyCompletionResponseRetainsRawEnvelopeWithoutInventingRecords() {
+        val events = historical(BleConst.GetHRVData, emptyList())
+        assertEquals(listOf(JCVitalV8EventNormalizer.EVENT_RAW_VENDOR_DATA), events.map { it.name })
+        assertEquals(true, events.single().payload["dataEnd"])
+    }
+
+    @Test
+    fun missingAndMalformedRecordsProduceParseErrorsWithoutDroppingRawData() {
+        val missing = historical(BleConst.GetAutomaticSpo2Monitoring, listOf(mapOf(DeviceKey.Date to "2026.09.30 01:02:03")))
+        assertTrue(missing.any { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION && it.payload["value"] == null })
+        assertTrue(missing.any { it.name == JCVitalV8EventNormalizer.EVENT_PARSE_ERROR })
+
+        val malformed = normalizer.normalize(
+            mapOf(DeviceKey.DataType to BleConst.GetHRVData, DeviceKey.End to true, DeviceKey.Data to "not-a-list"),
+            ctx,
+        )
+        assertTrue(malformed.any { it.name == JCVitalV8EventNormalizer.EVENT_RAW_VENDOR_DATA })
+        assertTrue(malformed.any { it.name == JCVitalV8EventNormalizer.EVENT_PARSE_ERROR })
+    }
+
+    @Test
+    fun multiRecordResponsesAndDuplicateFingerprintsAreDeterministic() {
+        val records = listOf(
+            mapOf<String, Any?>(DeviceKey.Date to "2026.09.30 01:02:03", DeviceKey.Blood_oxygen to "97"),
+            mapOf<String, Any?>(DeviceKey.Date to "2026.09.30 01:07:03", DeviceKey.Blood_oxygen to "96"),
+        )
+        val observations = historical(BleConst.GetAutomaticSpo2Monitoring, records)
+            .filter { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }
+        assertEquals(2, observations.size)
+        val duplicate = historical(BleConst.GetAutomaticSpo2Monitoring, listOf(records.first()))
+            .single { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }
+        assertEquals(observations.first().payload["id"], duplicate.payload["id"])
     }
 }

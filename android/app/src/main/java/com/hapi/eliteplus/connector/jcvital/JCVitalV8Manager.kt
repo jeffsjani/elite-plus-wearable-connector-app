@@ -28,6 +28,7 @@ import com.jstyle.blesdkv8.callback.DataListener2301
 import com.jstyle.blesdkv8.constant.BleConst
 import com.jstyle.blesdkv8.constant.DeviceKey
 import com.jstyle.blesdkv8.model.AutoTestMode
+import com.jstyle.blesdkv8.model.AutoMode
 import java.util.TimeZone
 import java.util.UUID
 
@@ -53,6 +54,31 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         val expected: MutableSet<String>,
         val complete: (missing: Set<String>) -> Unit,
     ) {
+        var timeout: Runnable? = null
+    }
+
+    private class HistoricalRequest(
+        val syncId: String,
+        val name: String,
+        val dataType: String,
+        val command: (Byte) -> ByteArray,
+        val startedAt: Long,
+        val callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit,
+    ) {
+        val observations = LinkedHashMap<String, Map<String, Any?>>()
+        val parseErrors = mutableListOf<Map<String, Any?>>()
+        var packetCount = 0
+        var recordGroupCount = 0
+        var duplicateCount = 0
+        var timeout: Runnable? = null
+    }
+
+    private class MonitoringRequest(
+        val callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit,
+    ) {
+        val remaining = ArrayDeque(MONITOR_MODES)
+        val configurations = LinkedHashMap<String, Any?>()
+        var current: Pair<String, AutoMode>? = null
         var timeout: Runnable? = null
     }
 
@@ -92,6 +118,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     private var writeInFlight: Command? = null
     private var writeTimeout: Runnable? = null
     private val pendingRequests = mutableListOf<PendingRequest>()
+    private var historicalRequest: HistoricalRequest? = null
+    private var monitoringRequest: MonitoringRequest? = null
 
     private val deviceInfo = LinkedHashMap<String, Any?>()
     private var lastBattery: Map<String, Any?>? = null
@@ -465,6 +493,52 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         callback(linkedMapOf("sessionId" to sessionId), null)
     }
 
+    fun syncHistoricalHeartRate(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
+        "GetDynamicHRWithMode", BleConst.GetDynamicHR, { mode -> BleSDK.GetDynamicHRWithMode(mode, "") }, callback,
+    )
+
+    fun syncHistoricalSpo2(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
+        "Oxygen_data", BleConst.GetAutomaticSpo2Monitoring, { mode -> BleSDK.Oxygen_data(mode, "") }, callback,
+    )
+
+    fun syncHistoricalTemperature(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
+        "GetTemperature_historyData", BleConst.Temperature_history, { mode -> BleSDK.GetTemperature_historyData(mode, "") }, callback,
+    )
+
+    fun syncHistoricalHrv(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
+        "GetHRVDataWithMode", BleConst.GetHRVData, { mode -> BleSDK.GetHRVDataWithMode(mode, "") }, callback,
+    )
+
+    fun syncHistoricalPpi(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
+        "GetPPI", BleConst.GetPPIData, { mode -> BleSDK.GetPPI(mode, "") }, callback,
+    )
+
+    fun requestMonitoringConfiguration(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
+        if (!requireReady(callback)) return@onMain
+        if (historicalRequest != null || monitoringRequest != null) {
+            return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, "Another acquisition request is already running"))
+        }
+        val request = MonitoringRequest(callback)
+        monitoringRequest = request
+        requestNextMonitorMode(request)
+    }
+
+    private fun startHistorical(
+        name: String,
+        dataType: String,
+        command: (Byte) -> ByteArray,
+        callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit,
+    ) = onMain {
+        if (!requireReady(callback)) return@onMain
+        if (historicalRequest != null || monitoringRequest != null) {
+            return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, "A historical sync is already running"))
+        }
+        val request = HistoricalRequest(UUID.randomUUID().toString(), name, dataType, command, System.currentTimeMillis(), callback)
+        historicalRequest = request
+        armHistoricalTimeout(request)
+        enqueue("$name(start)", command(HISTORY_MODE_START))
+    }
+
     private fun enqueue(name: String, bytes: ByteArray) {
         commandQueue.addLast(Command(name, bytes))
         pump()
@@ -542,7 +616,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                 JCVitalV8EventNormalizer.Context(
                     deviceId = connectedDeviceId,
                     firmwareVersion = deviceInfo["firmwareVersion"] as? String,
-                    sessionId = realtimeSessionId,
+                    sessionId = historicalRequest?.syncId ?: realtimeSessionId,
                     receiptMillis = System.currentTimeMillis(),
                     timezone = TimeZone.getDefault().id,
                 ),
@@ -565,7 +639,116 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                 else -> emit(event.name, event.payload)
             }
         }
+        handleHistoricalResponse(dataType, vendor, events)
+        handleMonitoringResponse(dataType, vendor)
         if (dataType != null) resolveResponse(dataType)
+    }
+
+    private fun requestNextMonitorMode(request: MonitoringRequest) {
+        request.timeout?.let(main::removeCallbacks)
+        val next = request.remaining.removeFirstOrNull()
+        if (next == null) {
+            monitoringRequest = null
+            request.callback(
+                linkedMapOf(
+                    "deviceId" to connectedDeviceId,
+                    "provider" to "JCVITAL",
+                    "acquisitionMode" to "DEVICE_CONFIGURATION",
+                    "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()),
+                    "configurations" to request.configurations,
+                ),
+                null,
+            )
+            return
+        }
+        request.current = next
+        request.timeout = Runnable {
+            if (monitoringRequest !== request) return@Runnable
+            monitoringRequest = null
+            request.callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, "No ${next.first} monitoring configuration response"))
+        }.also { main.postDelayed(it, COMMAND_TIMEOUT_MS) }
+        enqueue("GetAutomatic(${next.first})", BleSDK.GetAutomatic(next.second))
+    }
+
+    private fun handleMonitoringResponse(dataType: String?, vendor: Map<String?, Any?>) {
+        val request = monitoringRequest ?: return
+        if (dataType != BleConst.GetAutomatic) return
+        val mode = request.current ?: return
+        @Suppress("UNCHECKED_CAST")
+        val raw = JCVitalV8EventNormalizer.sanitize(vendor[DeviceKey.Data]) as? Map<String, Any?> ?: emptyMap()
+        request.configurations[mode.first] = linkedMapOf(
+            "enabledModeRaw" to raw[DeviceKey.WorkMode],
+            "intervalMinutesRaw" to raw[DeviceKey.IntervalTime],
+            "startHourRaw" to raw[DeviceKey.StartTime],
+            "startMinuteRaw" to raw[DeviceKey.KHeartStartMinter],
+            "endHourRaw" to raw[DeviceKey.EndTime],
+            "endMinuteRaw" to raw[DeviceKey.KHeartEndMinter],
+            "weekdaysRaw" to raw[DeviceKey.Weeks],
+            "vendorDataType" to dataType,
+            "rawPayload" to JCVitalV8EventNormalizer.sanitize(vendor),
+        )
+        request.current = null
+        requestNextMonitorMode(request)
+    }
+
+    private fun handleHistoricalResponse(dataType: String?, vendor: Map<String?, Any?>, events: List<JCVitalV8EventNormalizer.Event>) {
+        val request = historicalRequest ?: return
+        if (dataType != request.dataType) return
+        request.packetCount++
+        val records = vendor[DeviceKey.Data] as? List<*>
+        request.recordGroupCount += records?.size ?: 0
+        events.filter { it.name == JCVitalV8EventNormalizer.EVENT_OBSERVATION }.forEach { event ->
+            val id = event.payload["id"]?.toString()
+            if (id == null) request.parseErrors += linkedMapOf("message" to "Observation has no id", "payload" to event.payload)
+            else if (request.observations.putIfAbsent(id, event.payload) != null) request.duplicateCount++
+        }
+        request.parseErrors += events.filter { it.name == JCVitalV8EventNormalizer.EVENT_PARSE_ERROR }.map { it.payload }
+        if (vendor[DeviceKey.End] == true) {
+            finishHistorical(request, if (request.observations.isEmpty()) "EMPTY_VALID" else "COMPLETE")
+            return
+        }
+        armHistoricalTimeout(request)
+        if (request.packetCount % HISTORY_PAGE_PACKETS == 0) enqueue("${request.name}(continue)", request.command(HISTORY_MODE_CONTINUE))
+    }
+
+    private fun armHistoricalTimeout(request: HistoricalRequest) {
+        request.timeout?.let(main::removeCallbacks)
+        request.timeout = Runnable {
+            if (historicalRequest !== request) return@Runnable
+            finishHistorical(request, if (request.observations.isEmpty()) "FAILED" else "PARTIAL")
+        }.also { main.postDelayed(it, HISTORY_TIMEOUT_MS) }
+    }
+
+    private fun finishHistorical(request: HistoricalRequest, completionStatus: String) {
+        if (historicalRequest !== request) return
+        request.timeout?.let(main::removeCallbacks)
+        historicalRequest = null
+        val observations = request.observations.values.toList()
+        val times = observations.mapNotNull { it["observedAt"] as? String }.sorted()
+        request.callback(
+            linkedMapOf(
+                "syncId" to request.syncId,
+                "deviceId" to connectedDeviceId,
+                "provider" to "JCVITAL",
+                "sdkCommand" to request.name,
+                "vendorDataType" to request.dataType,
+                "startedAt" to JCVitalV8Time.isoUtc(request.startedAt),
+                "completedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()),
+                "recordsReceived" to observations.size,
+                "recordGroupsReceived" to request.recordGroupCount,
+                "recordsStored" to 0,
+                "recordsDeduplicated" to request.duplicateCount,
+                "recordsRejected" to request.parseErrors.size,
+                "earliestObservation" to times.firstOrNull(),
+                "latestObservation" to times.lastOrNull(),
+                "partial" to (completionStatus == "PARTIAL"),
+                "completionStatus" to completionStatus,
+                "packetCount" to request.packetCount,
+                "parseErrors" to request.parseErrors,
+                "observations" to observations,
+            ),
+            null,
+        )
     }
 
     private fun awaitResponses(dataTypes: Set<String>, timeoutMs: Long, complete: (missing: Set<String>) -> Unit) {
@@ -629,6 +812,16 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         requests.forEach { request ->
             request.timeout?.let(main::removeCallbacks)
             request.complete(request.expected.toSet())
+        }
+        historicalRequest?.let { request ->
+            request.timeout?.let(main::removeCallbacks)
+            historicalRequest = null
+            request.callback(null, error)
+        }
+        monitoringRequest?.let { request ->
+            request.timeout?.let(main::removeCallbacks)
+            monitoringRequest = null
+            request.callback(null, error)
         }
     }
 
@@ -745,6 +938,10 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         private const val CONNECT_TIMEOUT_MS = 20_000L
         private const val INIT_TIMEOUT_MS = 10_000L
         private const val COMMAND_TIMEOUT_MS = 8_000L
+        private const val HISTORY_TIMEOUT_MS = 15_000L
+        private const val HISTORY_PAGE_PACKETS = 50
+        private const val HISTORY_MODE_START: Byte = 0x00
+        private const val HISTORY_MODE_CONTINUE: Byte = 0x02
         private const val WRITE_TIMEOUT_MS = 3_000L
         private const val DEFAULT_ATT_MTU = 23
         // V8 reports MTUlength=244 in its SetDeviceTime response; 247 ATT MTU = 244-byte payload.
@@ -764,6 +961,13 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
             BleConst.GetDeviceVersion to "firmwareVersion",
             BleConst.GetPersonalInfo to "vendorDeviceId",
             BleConst.GetDeviceBatteryLevel to "batteryLevel",
+        )
+
+        private val MONITOR_MODES = listOf(
+            "HEART_RATE" to AutoMode.AutoHeartRate,
+            "SPO2" to AutoMode.AutoSpo2,
+            "TEMPERATURE" to AutoMode.AutoTemp,
+            "HRV" to AutoMode.AutoHrv,
         )
     }
 }

@@ -1,4 +1,4 @@
-# JCVital V8 adapter (Build 7A)
+# JCVital V8 adapter
 
 ## JCVital Pro V8 physical validation
 
@@ -15,34 +15,57 @@ Tested 2026-09-30:
 
 ## Status
 
-**Update (V8 native SDK phase 1):** the vendor SDK is now in
-`vendor/jcvital/android/sdk/` and a native Android bridge exists:
-`android/app/src/main/java/com/hapi/eliteplus/connector/jcvital/` (Capacitor
-plugin `JCVitalV8`, TS contract `jcvitalV8Bridge.ts`). It covers scan, connect,
-device info, battery, and realtime heart rate only. The `EliteJCVital`
-contract in `jcvitalBridge.ts` below is still unimplemented natively.
+The native Android bridge covers the physically validated connection lifecycle,
+device metadata, battery, realtime heart rate, realtime wearable temperature,
+and Phase 3A historical physiology. Phase 3A is ready for physical validation;
+its observations remain on the diagnostic bridge and are not uploaded through
+the scalar-only Base44 contract.
 
-Architecture and TypeScript-side implementation only. **No native Android
-bridge exists yet.** See "Blockers" below before extending this adapter.
+## Phase 3A historical physiology
 
-## Why there is no native Kotlin plugin in this build
+| Feed | SDK command | Vendor data type | Fields | Unit | Timestamp |
+| --- | --- | --- | --- | --- | --- |
+| Continuous HR | `GetDynamicHRWithMode` | `GetDynamicHR` (`27`) | `date`, `arrayDynamicHR` | bpm | device-local `date`; subsequent samples use the SDK-supported nominal 5-second offset and remain marked with source date and interval |
+| Automatic SpO2 | `Oxygen_data` | `GetAutomaticSpo2Monitoring` (`68`) | `date`, `Blood_oxygen` | percent | device-local `date` |
+| Temperature | `GetTemperature_historyData` | `Temperature_history` (`59`) | `date`, `temperature` | Celsius | device-local `date` |
+| HRV and vendor metrics | `GetHRVDataWithMode` | `GetHRVData` (`42`) | `date`, `hrv`, `heartRate`, `stress`, `highBP`, `lowBP`, optional `fatigueDegree` | bpm for HR; unknown vendor unit for all other fields | device-local `date` |
+| PPI groups | `GetPPI` | `GetPPIData` (`127`) | `date`, `serial_number`, `ppiData` | `UNKNOWN_VENDOR_UNIT` | device-local `date` |
+| Monitor configuration | `GetAutomatic` for HR, SpO2, temperature, HRV | `GetAutomatic` (`16`) | mode, interval, start/end, weekdays | raw vendor configuration values | receipt time |
 
-Build 7A's instructions require using the actual vendor JCVital V8 SDK and
-forbid inventing native API method names. A full workspace and filesystem
-search (including Gradle caches) found:
+History requests use mode `0x00` to start and mode `0x02` to continue after 50
+callback packets. `DeviceKey.End` is the completion marker. Every callback is
+first emitted as sanitized `jcvitalRawVendorData`; recognized records additionally
+emit `jcvitalObservation`. Unknown keys remain in `rawPayload`.
 
-- No `.aar`/`.jar` vendor binary
-- No vendor Java/Kotlin source or Android sample project
-- No BLE manager/service, command classes, parsers, or callback interfaces
-- No firmware/device API documentation
+`highBP` and `lowBP` are classified only as vendor-estimated BP. HRV, stress,
+fatigue, BP, and PPI units/scales remain unknown until physically or explicitly
+documented. The SDK has no separate automatic-HR history command: HR embedded in
+HRV history is retained as `HEART_RATE_AUTOMATIC`, while `GetDynamicHRWithMode`
+remains the independent continuous stream.
 
-Nothing was attached to this task either. Writing a Kotlin plugin that calls
-real BLE GATT services/characteristics for the V8 would have required
-inventing UUIDs and class names that cannot be verified — exactly what the
-task prohibits. The native bridge (`android/.../EliteJCVitalPlugin.kt`) is
-therefore not implemented. `src/adapters/jcvital/jcvitalBridge.ts` defines the
-contract it must satisfy so this gap can be closed without redesigning the
-TypeScript layer.
+### Storage-volume review
+
+No raw waveform persistence is selected in Phase 3A. The current Base44 input is
+scalar-only, so Phase 3A reports `recordsStored: 0` and offers lossless diagnostic
+JSON instead of coercing arrays/raw payloads into scalar rows.
+
+Estimates before JSON/database overhead:
+
+- 1 hour workout HR: 3,600 samples at 1 Hz or 720 samples at 5 seconds; about 58 KB or 12 KB at 16 bytes/sample.
+- 24 hours continuous HR: 17,280 samples at 5 seconds; about 276 KB at 16 bytes/sample.
+- One 8-hour sleep at 1-minute epochs: 480 epochs; about 8 KB at 16 bytes/epoch.
+- 5 minutes PPG with 32-bit samples: `sampleRateHz * 1,200` bytes; 30-120 KB at 25-100 Hz. Sample rate is not assumed by the schema.
+- 5 minutes ECG with native three-byte samples: `sampleRateHz * 900` bytes; 115-461 KB at 128-512 Hz. Sample rate is not assumed by the schema.
+
+Serialized observation JSON can be several times larger. PPG/ECG therefore must
+use chunked native buffering and blob/chunk storage in Phase 3D, never one row or
+one Capacitor event per sample.
+
+## Historical implementation note
+
+The earlier architecture-only build had no vendor binary, source, sample, or
+firmware documentation. The vendor SDK and sample are now present, and the
+native bridge uses their verified APIs rather than inferred command names.
 
 ## Secondary evidence actually inspected
 
@@ -83,27 +106,25 @@ merged into the confirmed default.
 - `JCVitalCapabilities.ts` — capability/evidence model and registry.
 - `HeartRateSeries.ts` — generic series model, cadence diagnostics, chunking,
   deterministic IDs.
-- `jcvitalBridge.ts` — Capacitor plugin contract (Elite+-owned surface; no
-  native implementation yet).
+- `jcvitalV8Bridge.ts` — active Capacitor contract backed by the native Android
+  `JCVitalV8Plugin`.
+- `jcvitalBridge.ts` — legacy adapter contract retained for the older
+  source-agnostic orchestration tests; it is not the native V8 bridge.
 - `JCVitalAdapter.ts` — orchestration: lifecycle, capability negotiation,
   scalar sync to the Build 3 queue, workout HR series chunking, logout
   isolation. Never calls Base44 directly.
 - `JCVitalAdapter.test.ts` — unit tests, including the mandatory workout-HR
   cadence-flexibility tests (A–L) from the Build 7A spec.
 
-## Blockers to close before Build 7B/8A can proceed on this source
+## Remaining blockers
 
-1. **Native Android SDK.** Attach the actual vendor AAR/JAR, Kotlin/Java
-   source, or Android sample project so the real BLE transport, GATT
-   UUIDs, and callback wiring can be implemented in
-   `android/.../EliteJCVitalPlugin.kt` against `jcvitalBridge.ts`.
-2. **Base44 schema extension.** `NativeObservationInput` only carries a
+1. **Base44 schema extension.** `NativeObservationInput` only carries a
    scalar `valueNumber`. Workout HR series chunks, PPI/RR interval chunks,
    PPG/ECG chunks, and sleep/movement epoch arrays need either an optional
    series/blob field on `NativeObservationInput` or a dedicated connector
    function (e.g. `nativeConnectorSeriesChunks`). Until decided,
    `JCVitalAdapter.getPendingSeriesChunks()` holds chunks locally and
    `diagnostics.seriesIngestionBlocked` is always `true`.
-3. **Physical validation.** 1-second stored workout HR, real-time cadence
-   stability, BLE disconnect handling, and battery impact all remain
-   `PENDING` device certification per the task's certification policy.
+2. **Phase 3A physical validation.** Historical record availability, retention,
+  units, timestamp behavior, pagination, and the nominal 5-second HR cadence
+  remain `PENDING` on the physical V8.

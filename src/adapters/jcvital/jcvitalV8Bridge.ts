@@ -1,4 +1,6 @@
 import { registerPlugin, type PluginListenerHandle } from '@capacitor/core'
+import type { CompletionStatus } from '../../models/metricTaxonomy'
+import type { NativeObservation, SerializableValue } from '../../models/wearableObservation'
 
 /** Native implementation: android/app/src/main/java/com/hapi/eliteplus/connector/jcvital/JCVitalV8Plugin.kt */
 
@@ -89,6 +91,53 @@ export interface JCVitalV8RawVendorDataEvent {
   receiptTimestamp: string
 }
 
+export interface JCVitalV8ParseErrorEvent {
+  vendorDataType: string
+  message: string
+  rawRecord: SerializableValue
+  receivedAt: string
+}
+
+export interface JCVitalV8HistoricalSyncResult {
+  syncId: string
+  deviceId: string | null
+  provider: 'JCVITAL'
+  sdkCommand: string
+  vendorDataType: string
+  startedAt: string
+  completedAt: string
+  recordsReceived: number
+  recordGroupsReceived: number
+  recordsStored: 0
+  recordsDeduplicated: number
+  recordsRejected: number
+  earliestObservation: string | null
+  latestObservation: string | null
+  partial: boolean
+  completionStatus: CompletionStatus
+  packetCount: number
+  parseErrors: JCVitalV8ParseErrorEvent[]
+  observations: NativeObservation[]
+}
+
+export interface JCVitalV8MonitoringConfiguration {
+  deviceId: string | null
+  provider: 'JCVITAL'
+  acquisitionMode: 'DEVICE_CONFIGURATION'
+  receivedAt: string
+  configurations: Record<'HEART_RATE' | 'SPO2' | 'TEMPERATURE' | 'HRV', {
+    enabledModeRaw: string | null
+    intervalMinutesRaw: string | null
+    startHourRaw: string | null
+    startMinuteRaw: string | null
+    endHourRaw: string | null
+    endMinuteRaw: string | null
+    weekdaysRaw: string | null
+    vendorDataType: string
+    rawPayload: SerializableValue
+  }>
+}
+
 export interface JCVitalV8PermissionResult {
   status: JCVitalV8PermissionStatus
   bluetoothEnabled: boolean
@@ -116,12 +165,20 @@ export interface JCVitalV8Plugin {
   /** measurementSeconds: V8 heart-rate measurement window, 31–65535 s (default 60). */
   startRealtimeData(options?: { measurementSeconds?: number }): Promise<{ sessionId: string; measurementSeconds: number }>
   stopRealtimeData(): Promise<{ sessionId: string | null }>
+  syncHistoricalHeartRate(): Promise<JCVitalV8HistoricalSyncResult>
+  syncHistoricalSpo2(): Promise<JCVitalV8HistoricalSyncResult>
+  syncHistoricalTemperature(): Promise<JCVitalV8HistoricalSyncResult>
+  syncHistoricalHrv(): Promise<JCVitalV8HistoricalSyncResult>
+  syncHistoricalPpi(): Promise<JCVitalV8HistoricalSyncResult>
+  getMonitoringConfiguration(): Promise<JCVitalV8MonitoringConfiguration>
 
   addListener(event: 'jcvitalScanResult', listener: (device: JCVitalV8Device) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalConnectionState', listener: (event: JCVitalV8ConnectionStateEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalDeviceInfo', listener: (info: JCVitalV8DeviceInfo) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalBattery', listener: (battery: JCVitalV8Battery) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalHeartRate', listener: (observation: JCVitalV8Observation) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalObservation', listener: (observation: NativeObservation) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalParseError', listener: (error: JCVitalV8ParseErrorEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalRawVendorData', listener: (event: JCVitalV8RawVendorDataEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalError', listener: (error: JCVitalV8ErrorEvent) => void): Promise<PluginListenerHandle>
   removeAllListeners(): Promise<void>

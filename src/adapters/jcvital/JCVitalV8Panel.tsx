@@ -6,9 +6,45 @@ import {
   type JCVitalV8Device,
   type JCVitalV8DeviceInfo,
   type JCVitalV8ErrorEvent,
+  type JCVitalV8HistoricalSyncResult,
+  type JCVitalV8MonitoringConfiguration,
   type JCVitalV8Observation,
   type JCVitalV8PermissionResult,
 } from './jcvitalV8Bridge'
+
+type SyncKey = 'HR' | 'SpO2' | 'Temperature' | 'HRV' | 'PPI'
+
+function median(values: number[]): number | null {
+  if (!values.length) return null
+  const sorted = [...values].sort((a, b) => a - b)
+  const middle = Math.floor(sorted.length / 2)
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
+}
+
+function syncDiagnostics(result: JCVitalV8HistoricalSyncResult) {
+  const observations = result.observations
+  const times = observations.map((item) => item.observedAt ? Date.parse(item.observedAt) : Number.NaN).filter(Number.isFinite).sort((a, b) => a - b)
+  const intervals = times.slice(1).map((time, index) => time - times[index])
+  const nominal = observations.find((item) => item.samplingIntervalMs)?.samplingIntervalMs ?? null
+  const ppiValues = observations.flatMap((item) => item.metricType === 'PPI' ? (item.values ?? []).filter((value): value is number => typeof value === 'number') : [])
+  return {
+    status: result.completionStatus,
+    count: observations.length,
+    earliestTimestamp: result.earliestObservation,
+    latestTimestamp: result.latestObservation,
+    intervalMs: intervals.length ? { median: median(intervals), min: Math.min(...intervals), max: Math.max(...intervals) } : null,
+    missingIntervalCount: nominal ? intervals.filter((interval) => interval > nominal * 1.5).length : null,
+    duplicateCount: result.recordsDeduplicated,
+    parseErrors: result.parseErrors,
+    ppi: ppiValues.length ? {
+      count: ppiValues.length, min: Math.min(...ppiValues), max: Math.max(...ppiValues), median: median(ppiValues),
+      zeroCount: ppiValues.filter((value) => value === 0).length,
+      invalidCount: result.recordsRejected,
+    } : null,
+    first5: observations.slice(0, 5),
+    last5: observations.slice(-5),
+  }
+}
 
 function errorText(error: unknown): string {
   const { code, message } = (error ?? {}) as { code?: string; message?: string }
@@ -27,6 +63,8 @@ export function JCVitalV8Panel() {
   const [lastError, setLastError] = useState<JCVitalV8ErrorEvent | null>(null)
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
+  const [syncResults, setSyncResults] = useState<Partial<Record<SyncKey, JCVitalV8HistoricalSyncResult>>>({})
+  const [monitoring, setMonitoring] = useState<JCVitalV8MonitoringConfiguration | null>(null)
 
   useEffect(() => {
     const handles = [
@@ -50,6 +88,38 @@ export function JCVitalV8Panel() {
     setBusy(true)
     setMessage('')
     try { await action() } catch (error) { setMessage(errorText(error)) } finally { setBusy(false) }
+  }
+
+  async function runSync(key: SyncKey, action: () => Promise<JCVitalV8HistoricalSyncResult>): Promise<void> {
+    await run(async () => {
+      const result = await action()
+      setSyncResults((current) => ({ ...current, [key]: result }))
+    })
+  }
+
+  async function syncHrvAndPpi(): Promise<void> {
+    setBusy(true)
+    setMessage('')
+    try {
+      const hrv = await JCVitalV8.syncHistoricalHrv()
+      setSyncResults((current) => ({ ...current, HRV: hrv }))
+      const ppi = await JCVitalV8.syncHistoricalPpi()
+      setSyncResults((current) => ({ ...current, PPI: ppi }))
+    } catch (error) {
+      setMessage(errorText(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function downloadDiagnostics(): void {
+    const payload = Object.fromEntries(Object.entries(syncResults).map(([key, result]) => [key, syncDiagnostics(result)]))
+    const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }))
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `jcvital-v8-phase3a-${new Date().toISOString()}.json`
+    anchor.click()
+    URL.revokeObjectURL(url)
   }
 
   const ready = state === 'READY'
@@ -79,6 +149,42 @@ export function JCVitalV8Panel() {
       {info && <p>Device: {info.deviceName ?? info.advertisedName ?? '—'} · MAC {info.macAddress ?? info.deviceId} · Firmware {info.firmwareVersion ?? '—'} · ID {info.vendorDeviceId ?? '—'} · SDK {info.sdkVersion}{info.missingFields.length ? ` · missing: ${info.missingFields.join(', ')}` : ''}</p>}
       {battery && <p>Battery: {battery.level ?? '—'}%{battery.charging === null ? '' : battery.charging ? ' (charging)' : ' (not charging)'}</p>}
       {heartRate && <p>Heart rate: <strong>{heartRate.value} {heartRate.unit}</strong> · received {new Date(heartRate.receiptTimestamp).toLocaleTimeString()} · packet type {heartRate.vendorDataType}</p>}
+      <h3>Data Sync</h3>
+      <div className="wearable-actions">
+        <button type="button" disabled={busy || !ready} onClick={() => void runSync('HR', () => JCVitalV8.syncHistoricalHeartRate())}>Sync HR</button>
+        <button type="button" disabled={busy || !ready} onClick={() => void runSync('SpO2', () => JCVitalV8.syncHistoricalSpo2())}>Sync SpO2</button>
+        <button type="button" disabled={busy || !ready} onClick={() => void runSync('Temperature', () => JCVitalV8.syncHistoricalTemperature())}>Sync Temperature</button>
+        <button type="button" disabled={busy || !ready} onClick={() => void syncHrvAndPpi()}>Sync HRV/PPI</button>
+        <button type="button" disabled={busy || !ready} onClick={() => void run(async () => setMonitoring(await JCVitalV8.getMonitoringConfiguration()))}>Monitoring Config</button>
+        <button type="button" disabled title="Phase 3B">Sync Activity</button>
+        <button type="button" disabled title="Phase 3B">Sync Sleep</button>
+        <button type="button" disabled title="Phase 3B">Sync Workouts</button>
+        <button type="button" className="secondary" disabled={!Object.keys(syncResults).length} onClick={downloadDiagnostics}>Download Diagnostics</button>
+      </div>
+      {monitoring && <details className="jcvital-diagnostics"><summary>Monitoring configuration</summary><pre>{JSON.stringify(monitoring, null, 2)}</pre></details>}
+      {Object.entries(syncResults).map(([key, result]) => {
+        const diagnostics = syncDiagnostics(result)
+        return <details key={key} className="jcvital-diagnostics">
+          <summary>{key}: {diagnostics.status} · {diagnostics.count} observations · {diagnostics.parseErrors.length} parse errors</summary>
+          <p>First: {diagnostics.earliestTimestamp ?? '—'} · Last: {diagnostics.latestTimestamp ?? '—'} · Duplicates: {diagnostics.duplicateCount}</p>
+          {diagnostics.intervalMs && <p>Interval ms: median {diagnostics.intervalMs.median} · min {diagnostics.intervalMs.min} · max {diagnostics.intervalMs.max} · missing {diagnostics.missingIntervalCount ?? '—'}</p>}
+          {diagnostics.ppi && <p>PPI values: {diagnostics.ppi.count} · min {diagnostics.ppi.min} · max {diagnostics.ppi.max} · median {diagnostics.ppi.median} · zero {diagnostics.ppi.zeroCount} · invalid {diagnostics.ppi.invalidCount}</p>}
+          <strong>First 5</strong><pre>{JSON.stringify(diagnostics.first5, null, 2)}</pre>
+          <strong>Last 5</strong><pre>{JSON.stringify(diagnostics.last5, null, 2)}</pre>
+        </details>
+      })}
+      <h3>Raw</h3>
+      <div className="wearable-actions">
+        <button type="button" disabled title="Phase 3D">Start PPG</button>
+        <button type="button" disabled title="Phase 3D">Stop PPG</button>
+        <button type="button" disabled title="Phase 3D">Start ECG</button>
+        <button type="button" disabled title="Phase 3D">Stop ECG</button>
+      </div>
+      <h3>Workout Test</h3>
+      <div className="wearable-actions">
+        <button type="button" disabled title="Phase 3C">Start Workout Capture</button>
+        <button type="button" disabled title="Phase 3C">Stop Workout Capture</button>
+      </div>
       {message && <p className="error-message" role="alert">{message}</p>}
       {lastError && <p>Last native error: {lastError.code} — {lastError.message}</p>}
     </section>
