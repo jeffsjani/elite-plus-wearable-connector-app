@@ -317,7 +317,7 @@ export function buildPhase3AValidationReport(options: {
   const starts = Object.values(feeds).map((feed) => feed.requestStartedAt).filter((value): value is string => value !== null).sort()
   const completions = Object.values(feeds).map((feed) => feed.requestCompletedAt).filter((value): value is string => value !== null).sort()
   return {
-    reportType: 'JCVITAL_V8_PHASE_3A_PHYSICAL_VALIDATION',
+    reportType: 'JCVITAL_V8_PHASE_3A_3B_3C_PHYSICAL_VALIDATION',
     generatedAt: new Date().toISOString(),
     device: {
       model: 'PRO_V8',

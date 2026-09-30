@@ -120,6 +120,39 @@ class JCVitalV8Plugin : Plugin() {
     }
 
     @PluginMethod
+    fun startWorkoutCapture(call: PluginCall) {
+        manager.startWorkoutCapture(call.getInt("activityMode") ?: 0) { result, error ->
+            if (error != null) reject(call, error) else call.resolve(toJsObject(result!!))
+        }
+    }
+
+    @PluginMethod
+    fun stopWorkoutCapture(call: PluginCall) {
+        manager.stopWorkoutCapture { result, error ->
+            if (error != null) reject(call, error) else call.resolve(toJsObject(result!!))
+        }
+    }
+
+    @PluginMethod
+    fun pauseWorkoutCapture(call: PluginCall) {
+        manager.pauseWorkoutCapture { result, error ->
+            if (error != null) reject(call, error) else call.resolve(toJsObject(result!!))
+        }
+    }
+
+    @PluginMethod
+    fun resumeWorkoutCapture(call: PluginCall) {
+        manager.resumeWorkoutCapture { result, error ->
+            if (error != null) reject(call, error) else call.resolve(toJsObject(result!!))
+        }
+    }
+
+    @PluginMethod
+    fun getWorkoutCaptureStatus(call: PluginCall) {
+        call.resolve(toJsObject(manager.workoutCaptureStatus()))
+    }
+
+    @PluginMethod
     fun syncHistoricalHeartRate(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalHeartRate)
 
     @PluginMethod

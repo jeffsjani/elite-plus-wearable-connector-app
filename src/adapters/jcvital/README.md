@@ -166,6 +166,30 @@ band-to-phone 1 Hz HR guarantee, and it is unrelated to *stored* history. The
 (`MARKETING_STORED_HR_1S_CLAIM` in `JCVitalCapabilities.ts`) and is never
 merged into the confirmed default.
 
+## Phase 3C live workout telemetry
+
+Android V8 workout control uses `BleSDK.EnterActivityMode(2, activityMode,
+ExerciseMode.Status_*)`: command byte `0x19`, response type `EnterActivityMode`
+(`30`). Start, pause, continue, and finish use the SDK's corresponding
+`ExerciseMode.Status_*` values. The Android demo documents calling
+`BleSDK.sendHeartPackage(float distance, int space, int rssi)` every second.
+The native Handler schedules it at 1,000 ms and supplies explicit zero
+placeholders for distance, pace, and vendor signal strength because GPS/pace
+and an Android RSSI-to-vendor-scale mapping are not available.
+
+The V8 responds as `BleConst.SportData` type `82`. The Android parser returns
+`heartRate`, `step`, `calories`, and `ExerciseTime`; the latter is retained as
+`exerciseTimeRaw` because its unit/cadence semantics are undocumented. Type 82
+does not return distance, pace, METS, temperature, SpO2, or RSSI. Every packet
+retains its raw vendor payload and receipt timestamp, and HR-bearing packets
+also emit `jcvitalWorkoutHeartRate` separately from packet cadence diagnostics.
+
+Phase 3C software is implemented but **not yet physically validated**. Only a
+stopped physical workout can receive a cadence classification. Native
+heartbeat attempt/sent/skipped counts and JS packet/HR observation timing are
+reported separately; physical V8 testing must establish whether the one-second
+request produces one-second packets and whether HR refreshes at that cadence.
+
 ## Files
 
 - `JCVitalCapabilities.ts` — capability/evidence model and registry.

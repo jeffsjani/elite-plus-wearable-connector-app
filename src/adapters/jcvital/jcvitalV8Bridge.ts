@@ -1,6 +1,7 @@
 import { registerPlugin, type PluginListenerHandle } from '@capacitor/core'
 import type { CompletionStatus } from '../../models/metricTaxonomy'
-import type { NativeObservation, SerializableValue } from '../../models/wearableObservation'
+import type { NativeObservation, SerializableValue, WearableSource } from '../../models/wearableObservation'
+import type { LiveWorkoutPacket, LiveWorkoutStatus } from './WorkoutTelemetry'
 
 /** Native implementation: android/app/src/main/java/com/hapi/eliteplus/connector/jcvital/JCVitalV8Plugin.kt */
 
@@ -138,6 +139,91 @@ export interface JCVitalV8MonitoringConfiguration {
   }>
 }
 
+export interface JCVitalV8LiveWorkoutSession {
+  sessionId: string | null
+  deviceId: string | null
+  activityType: string | null
+  vendorActivityMode: number | null
+  startedAt: string | null
+  stoppedAt: string | null
+  status: LiveWorkoutStatus
+  packetCount: number
+  firstPacketAt: string | null
+  lastPacketAt: string | null
+  heartbeatAttemptCount: number
+  heartbeatSentCount: number
+  heartbeatSkippedCount: number
+  heartbeatIntervalMs: number
+  firmwareVersion: string | null
+  sdkVersion: string
+  source?: WearableSource
+  heartbeatInputs?: {
+    distanceKm: number
+    paceSeconds: number
+    rssiStrength: number
+    inputSource: string
+    note: string
+  }
+  parseErrors: Array<{ message: string; vendorDataType: string; receivedAt: string }>
+}
+
+export interface JCVitalV8WorkoutHeartRateEvent {
+  sessionId: string
+  heartRate: number
+  receivedAt: string
+  packetSequence: number
+  vendorDataType: string
+  acquisitionMode: 'WORKOUT_REALTIME'
+}
+
+export interface JCVitalV8WorkoutErrorEvent {
+  sessionId: string
+  message: string
+  receivedAt: string
+}
+
+export interface JCVitalV8LiveWorkoutSession {
+  sessionId: string | null
+  deviceId: string | null
+  activityType: string | null
+  vendorActivityMode: number | null
+  startedAt: string | null
+  stoppedAt: string | null
+  status: LiveWorkoutStatus
+  packetCount: number
+  firstPacketAt: string | null
+  lastPacketAt: string | null
+  heartbeatAttemptCount: number
+  heartbeatSentCount: number
+  heartbeatSkippedCount: number
+  heartbeatIntervalMs: number
+  firmwareVersion: string | null
+  sdkVersion: string
+  heartbeatInputs?: {
+    distanceKm: number
+    paceSeconds: number
+    rssiStrength: number
+    inputSource: string
+    note: string
+  }
+  parseErrors: Array<{ message: string; vendorDataType: string; receivedAt: string }>
+}
+
+export interface JCVitalV8WorkoutHeartRateEvent {
+  sessionId: string
+  heartRate: number
+  receivedAt: string
+  packetSequence: number
+  vendorDataType: string
+  acquisitionMode: 'WORKOUT_REALTIME'
+}
+
+export interface JCVitalV8WorkoutErrorEvent {
+  sessionId: string
+  message: string
+  receivedAt: string
+}
+
 export interface JCVitalV8PermissionResult {
   status: JCVitalV8PermissionStatus
   bluetoothEnabled: boolean
@@ -176,6 +262,11 @@ export interface JCVitalV8Plugin {
   syncHistoricalSleepMovement(): Promise<JCVitalV8HistoricalSyncResult>
   syncHistoricalWorkouts(): Promise<JCVitalV8HistoricalSyncResult>
   getMonitoringConfiguration(): Promise<JCVitalV8MonitoringConfiguration>
+  startWorkoutCapture(options?: { activityMode?: number }): Promise<JCVitalV8LiveWorkoutSession>
+  stopWorkoutCapture(): Promise<JCVitalV8LiveWorkoutSession>
+  pauseWorkoutCapture(): Promise<JCVitalV8LiveWorkoutSession>
+  resumeWorkoutCapture(): Promise<JCVitalV8LiveWorkoutSession>
+  getWorkoutCaptureStatus(): Promise<JCVitalV8LiveWorkoutSession>
 
   addListener(event: 'jcvitalScanResult', listener: (device: JCVitalV8Device) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalConnectionState', listener: (event: JCVitalV8ConnectionStateEvent) => void): Promise<PluginListenerHandle>
@@ -186,6 +277,11 @@ export interface JCVitalV8Plugin {
   addListener(event: 'jcvitalParseError', listener: (error: JCVitalV8ParseErrorEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalRawVendorData', listener: (event: JCVitalV8RawVendorDataEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalError', listener: (error: JCVitalV8ErrorEvent) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalWorkoutState', listener: (session: JCVitalV8LiveWorkoutSession) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalWorkoutPacket', listener: (packet: LiveWorkoutPacket) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalWorkoutHeartRate', listener: (event: JCVitalV8WorkoutHeartRateEvent) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalWorkoutError', listener: (event: JCVitalV8WorkoutErrorEvent) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalWorkoutParseError', listener: (event: SerializableValue) => void): Promise<PluginListenerHandle>
   removeAllListeners(): Promise<void>
 }
 

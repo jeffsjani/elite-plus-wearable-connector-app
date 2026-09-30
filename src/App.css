@@ -278,6 +278,62 @@ button.secondary {
   color: #142522;
 }
 
+.workout-mode {
+  display: grid;
+  gap: 4px;
+  min-width: 190px;
+  color: #5f6b66;
+  font-size: 0.78rem;
+}
+
+.workout-mode select {
+  min-height: 36px;
+  padding: 6px 8px;
+  border: 1px solid #cbd4cf;
+  background: #fff;
+  color: #142522;
+}
+
+.workout-live-diagnostics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 6px 14px;
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid #d6ddd8;
+  color: #5f6b66;
+  font-size: 0.78rem;
+}
+
+.workout-live-diagnostics strong {
+  color: #142522;
+}
+
+.workout-packet-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 10px 0 18px;
+}
+
+.workout-packet-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.75rem;
+  text-align: left;
+}
+
+.workout-packet-table th,
+.workout-packet-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid #d6ddd8;
+  white-space: nowrap;
+}
+
+.workout-packet-table th {
+  color: #5f6b66;
+  font-weight: 600;
+}
+
 .health-types {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));

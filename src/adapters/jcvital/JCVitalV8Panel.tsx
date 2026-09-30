@@ -10,8 +10,11 @@ import {
   type JCVitalV8DeviceInfo,
   type JCVitalV8ErrorEvent,
   type JCVitalV8HistoricalSyncResult,
+  type JCVitalV8LiveWorkoutSession,
   type JCVitalV8Observation,
   type JCVitalV8PermissionResult,
+  type JCVitalV8WorkoutErrorEvent,
+  type JCVitalV8WorkoutHeartRateEvent,
 } from './jcvitalV8Bridge'
 import {
   buildHistoricalFeedResult,
@@ -28,6 +31,13 @@ import {
   type SleepFeedRun,
 } from './Phase3BValidation'
 import { phase3bDisabledReason } from './Phase3BBridgeStatus'
+import { workoutStartDisabledReason, workoutStopDisabledReason } from './WorkoutCaptureGuard'
+import {
+  buildWorkoutLiveValidation,
+  computeWorkoutCadenceDiagnostics,
+  type LiveWorkoutPacket,
+  type LiveWorkoutSession,
+} from './WorkoutTelemetry'
 
 type ExportStatus = 'EXPORTING' | 'EXPORT SUCCESS' | 'EXPORT FAILED'
 
@@ -50,6 +60,13 @@ export function JCVitalV8Panel() {
   const [busy, setBusy] = useState(false)
   const [pluginAvailable, setPluginAvailable] = useState<boolean | null>(null)
   const [activeSync, setActiveSync] = useState<string | null>(null)
+  const [workoutSession, setWorkoutSession] = useState<JCVitalV8LiveWorkoutSession | null>(null)
+  const [workoutPackets, setWorkoutPackets] = useState<LiveWorkoutPacket[]>([])
+  const [workoutParseErrors, setWorkoutParseErrors] = useState<Array<Record<string, unknown>>>([])
+  const [workoutHeartRateEvent, setWorkoutHeartRateEvent] = useState<JCVitalV8WorkoutHeartRateEvent | null>(null)
+  const [workoutError, setWorkoutError] = useState<JCVitalV8WorkoutErrorEvent | null>(null)
+  const [workoutClock, setWorkoutClock] = useState(Date.now())
+  const [activityMode, setActivityMode] = useState(0)
   const [historicalRuns, setHistoricalRuns] = useState<Partial<Record<HistoricalFeedKey, HistoricalFeedRun>>>({})
   const [monitoringRun, setMonitoringRun] = useState<MonitoringFeedRun | undefined>()
   const [phase3bRuns, setPhase3bRuns] = useState<Partial<Record<Exclude<Phase3BFeedKey, 'sleep'>, HistoricalFeedRun>>>({})
@@ -63,18 +80,49 @@ export function JCVitalV8Panel() {
         setDevices((current) => [device, ...current.filter((item) => item.id !== device.id)].sort((a, b) => Number(b.advertisesJcvitalService) - Number(a.advertisesJcvitalService) || b.rssi - a.rssi))),
       JCVitalV8.addListener('jcvitalConnectionState', (event) => {
         setState(event.state)
-        if (event.state !== 'READY') setRealtime(false)
+        if (event.state !== 'READY') {
+          setRealtime(false)
+          setActiveSync((current) => current === 'manual:realtime' ? null : current)
+        }
       }),
       JCVitalV8.addListener('jcvitalDeviceInfo', setInfo),
       JCVitalV8.addListener('jcvitalBattery', setBattery),
       JCVitalV8.addListener('jcvitalHeartRate', setHeartRate),
       JCVitalV8.addListener('jcvitalError', setLastError),
+      JCVitalV8.addListener('jcvitalWorkoutState', (session) => {
+        setWorkoutSession(session)
+        if (['IDLE', 'STOPPED', 'ERROR', 'DISCONNECTED'].includes(session.status)) {
+          setActiveSync((current) => current?.startsWith('workout:') ? null : current)
+        } else {
+          setActiveSync((current) => current ?? 'workout:capture')
+        }
+      }),
+      JCVitalV8.addListener('jcvitalWorkoutPacket', (packet) => {
+        setWorkoutPackets((current) => current.length && current[current.length - 1].sessionId === packet.sessionId
+          ? [...current, packet]
+          : [packet])
+      }),
+      JCVitalV8.addListener('jcvitalWorkoutHeartRate', setWorkoutHeartRateEvent),
+      JCVitalV8.addListener('jcvitalWorkoutError', setWorkoutError),
+      JCVitalV8.addListener('jcvitalWorkoutParseError', (error) => {
+        setWorkoutParseErrors((current) => [...current, typeof error === 'object' && error !== null ? error as Record<string, unknown> : { error }])
+      }),
     ]
     void JCVitalV8.isAvailable().then((result) => setPluginAvailable(result.available)).catch(() => setPluginAvailable(false))
     void JCVitalV8.getPermissionStatus().then(setPermission).catch((error) => setMessage(errorText(error)))
     void JCVitalV8.getConnectionState().then((result) => setState(result.state)).catch(() => undefined)
+    void JCVitalV8.getWorkoutCaptureStatus().then((session) => {
+      setWorkoutSession(session)
+      if (!['IDLE', 'STOPPED', 'ERROR', 'DISCONNECTED'].includes(session.status)) setActiveSync('workout:capture')
+    }).catch(() => undefined)
     return () => { handles.forEach((handle) => void handle.then((h) => h.remove())) }
   }, [])
+
+  useEffect(() => {
+    if (!workoutSession || !['RUNNING', 'PAUSED', 'STARTING', 'STOPPING'].includes(workoutSession.status)) return
+    const timer = window.setInterval(() => setWorkoutClock(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [workoutSession?.status, workoutSession?.sessionId])
 
   async function run(action: () => Promise<unknown>): Promise<void> {
     setBusy(true)
@@ -186,6 +234,55 @@ export function JCVitalV8Panel() {
     }
   }
 
+  async function startWorkout(): Promise<void> {
+    setWorkoutPackets([])
+    setWorkoutParseErrors([])
+    setWorkoutHeartRateEvent(null)
+    setWorkoutError(null)
+    setActiveSync('workout:capture')
+    setBusy(true)
+    setMessage('')
+    try {
+      setWorkoutSession(await JCVitalV8.startWorkoutCapture({ activityMode }))
+    } catch (error) {
+      setActiveSync(null)
+      setMessage(errorText(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function stopWorkout(): Promise<void> {
+    setActiveSync('workout:stopping')
+    setBusy(true)
+    setMessage('')
+    try {
+      setWorkoutSession(await JCVitalV8.stopWorkoutCapture())
+      setActiveSync(null)
+    } catch (error) {
+      setMessage(errorText(error))
+      try { setWorkoutSession(await JCVitalV8.getWorkoutCaptureStatus()) } catch { /* keep last state */ }
+      setActiveSync((current) => current === 'workout:stopping' ? 'workout:capture' : current)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function changeWorkoutState(action: 'pause' | 'resume'): Promise<void> {
+    setBusy(true)
+    setMessage('')
+    try {
+      const session = action === 'pause'
+        ? await JCVitalV8.pauseWorkoutCapture()
+        : await JCVitalV8.resumeWorkoutCapture()
+      setWorkoutSession(session)
+    } catch (error) {
+      setMessage(errorText(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function exportValidationReport(): Promise<void> {
     setExportStatus('EXPORTING')
     setExportLocation(null)
@@ -203,18 +300,18 @@ export function JCVitalV8Panel() {
       })
       const payload = buildPhase3AValidationReport({
         deviceInfo, historicalRuns, monitoringRun,
-        additionalFeedResults: phase3bFeedResults,
+        additionalFeedResults: { ...phase3bFeedResults, workoutLiveValidation },
       })
-      const filename = `jcvital-v8-phase3ab-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+      const filename = `jcvital-v8-phase3abc-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
       const json = JSON.stringify(payload, null, 2)
 
       if (Capacitor.isNativePlatform()) {
         const saved = await Filesystem.writeFile({ path: filename, data: json, directory: Directory.Cache, encoding: Encoding.UTF8 })
         await Share.share({
-          title: 'JCVital V8 Phase 3A/3B Validation',
+          title: 'JCVital V8 Phase 3A/3B/3C Validation',
           text: filename,
           files: [saved.uri],
-          dialogTitle: 'Save or share Phase 3A/3B validation JSON',
+          dialogTitle: 'Save or share Phase 3A/3B/3C validation JSON',
         })
         setExportLocation(`${filename} · ${saved.uri}`)
       } else {
@@ -258,11 +355,45 @@ export function JCVitalV8Panel() {
     workouts: typeof JCVitalV8.syncHistoricalWorkouts === 'function',
   }
   const phase3bDisabledReasons = {
-    activity: phase3bDisabledReason({ pluginAvailable, methodAvailable: phase3bMethods.activity, connectionState: state, activeSync }),
-    detailedActivity: phase3bDisabledReason({ pluginAvailable, methodAvailable: phase3bMethods.detailedActivity, connectionState: state, activeSync }),
-    sleep: phase3bDisabledReason({ pluginAvailable, methodAvailable: phase3bMethods.sleep, connectionState: state, activeSync }),
-    workouts: phase3bDisabledReason({ pluginAvailable, methodAvailable: phase3bMethods.workouts, connectionState: state, activeSync }),
+    activity: phase3bDisabledReason({ pluginAvailable, methodAvailable: phase3bMethods.activity, connectionState: state, activeSync: activeSync ?? (realtime ? 'manual HR measurement' : null) }),
+    detailedActivity: phase3bDisabledReason({ pluginAvailable, methodAvailable: phase3bMethods.detailedActivity, connectionState: state, activeSync: activeSync ?? (realtime ? 'manual HR measurement' : null) }),
+    sleep: phase3bDisabledReason({ pluginAvailable, methodAvailable: phase3bMethods.sleep, connectionState: state, activeSync: activeSync ?? (realtime ? 'manual HR measurement' : null) }),
+    workouts: phase3bDisabledReason({ pluginAvailable, methodAvailable: phase3bMethods.workouts, connectionState: state, activeSync: activeSync ?? (realtime ? 'manual HR measurement' : null) }),
   }
+  const workoutMethods = {
+    start: typeof JCVitalV8.startWorkoutCapture === 'function',
+    stop: typeof JCVitalV8.stopWorkoutCapture === 'function',
+    pause: typeof JCVitalV8.pauseWorkoutCapture === 'function',
+    resume: typeof JCVitalV8.resumeWorkoutCapture === 'function',
+  }
+  const workoutGate = {
+    pluginAvailable,
+    startMethodAvailable: workoutMethods.start,
+    stopMethodAvailable: workoutMethods.stop,
+    connectionState: state,
+    activeSync,
+    manualMeasurementActive: realtime,
+    workoutStatus: workoutSession?.status ?? 'IDLE' as const,
+  }
+  const workoutStartReason = workoutStartDisabledReason(workoutGate)
+  const workoutStopReason = workoutStopDisabledReason(workoutGate)
+  const workoutSessionForDiagnostics = workoutSession as LiveWorkoutSession | null
+  const workoutIsTerminal = workoutSession?.status === 'STOPPED' || workoutSession?.status === 'ERROR' || workoutSession?.status === 'DISCONNECTED'
+  const workoutDiagnostics = workoutSessionForDiagnostics
+    ? computeWorkoutCadenceDiagnostics(workoutSessionForDiagnostics, workoutPackets, workoutIsTerminal)
+    : null
+  const currentWorkoutPacket = workoutPackets.at(-1) ?? null
+  const currentWorkoutHr = [...workoutPackets].reverse().find((packet) => packet.heartRate !== null)?.heartRate ?? null
+  const workoutElapsedSeconds = workoutSession?.startedAt
+    ? Math.max(0, ((workoutSession.stoppedAt ? Date.parse(workoutSession.stoppedAt) : workoutClock) - Date.parse(workoutSession.startedAt)) / 1000)
+    : 0
+  const lastWorkoutPacketAgeSeconds = currentWorkoutPacket
+    ? Math.max(0, (workoutClock - Date.parse(currentWorkoutPacket.receivedAt)) / 1000)
+    : null
+  const workoutLiveValidation = buildWorkoutLiveValidation(workoutSessionForDiagnostics, workoutPackets, workoutParseErrors)
+  const otherActiveMeasurement = activeSync ?? (realtime ? 'manual HR measurement' : null)
+  const workoutStatus = workoutSession?.status ?? 'IDLE'
+  const workoutActive = ['STARTING', 'RUNNING', 'PAUSED', 'STOPPING'].includes(workoutStatus)
   return (
     <section className="wearables" aria-labelledby="jcvital-v8-title">
       <div className="wearables-heading"><h2 id="jcvital-v8-title">JCVital Pro V8</h2><strong>{state}</strong></div>
@@ -281,8 +412,17 @@ export function JCVitalV8Panel() {
       {linked && <div className="wearable-actions">
         <button type="button" disabled={busy || !ready} onClick={() => void run(async () => setInfo(await JCVitalV8.getDeviceInfo()))}>Device Info</button>
         <button type="button" disabled={busy || !ready} onClick={() => void run(async () => setBattery(await JCVitalV8.getBattery()))}>Battery</button>
-        <button type="button" disabled={busy || !ready || realtime} onClick={() => void run(async () => { await JCVitalV8.startRealtimeData({ measurementSeconds: 60 }); setRealtime(true) })}>Start Realtime</button>
-        <button type="button" disabled={busy || !ready || !realtime} onClick={() => void run(async () => { await JCVitalV8.stopRealtimeData(); setRealtime(false) })}>Stop Realtime</button>
+        <button type="button" disabled={busy || !ready || realtime || activeSync !== null} onClick={() => void run(async () => {
+          setActiveSync('manual:realtime')
+          try {
+            await JCVitalV8.startRealtimeData({ measurementSeconds: 60 })
+            setRealtime(true)
+          } catch (error) {
+            setActiveSync(null)
+            throw error
+          }
+        })}>Start Realtime</button>
+        <button type="button" disabled={busy || !ready || !realtime} onClick={() => void run(async () => { await JCVitalV8.stopRealtimeData(); setRealtime(false); setActiveSync(null) })}>Stop Realtime</button>
         <button type="button" className="secondary" disabled={busy} onClick={() => void run(() => JCVitalV8.disconnect())}>Disconnect</button>
       </div>}
       {info && <p>Device: {info.deviceName ?? info.advertisedName ?? '—'} · MAC {info.macAddress ?? info.deviceId} · Firmware {info.firmwareVersion ?? '—'} · ID {info.vendorDeviceId ?? '—'} · SDK {info.sdkVersion}{info.missingFields.length ? ` · missing: ${info.missingFields.join(', ')}` : ''}</p>}
@@ -290,11 +430,11 @@ export function JCVitalV8Panel() {
       {heartRate && <p>Heart rate: <strong>{heartRate.value} {heartRate.unit}</strong> · received {new Date(heartRate.receiptTimestamp).toLocaleTimeString()} · packet type {heartRate.vendorDataType}</p>}
       <h3>Data Sync</h3>
       <div className="wearable-actions">
-        <button type="button" disabled={busy || !ready} onClick={() => void runSync('heartRate', () => JCVitalV8.syncHistoricalHeartRate())}>Sync HR</button>
-        <button type="button" disabled={busy || !ready} onClick={() => void runSync('spo2', () => JCVitalV8.syncHistoricalSpo2())}>Sync SpO2</button>
-        <button type="button" disabled={busy || !ready} onClick={() => void runSync('temperature', () => JCVitalV8.syncHistoricalTemperature())}>Sync Temperature</button>
-        <button type="button" disabled={busy || !ready} onClick={() => void syncHrvAndPpi()}>Sync HRV/PPI</button>
-        <button type="button" disabled={busy || !ready} onClick={() => void syncMonitoringConfiguration()}>Sync Automatic Monitoring / Configuration</button>
+        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void runSync('heartRate', () => JCVitalV8.syncHistoricalHeartRate())}>Sync HR</button>
+        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void runSync('spo2', () => JCVitalV8.syncHistoricalSpo2())}>Sync SpO2</button>
+        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void runSync('temperature', () => JCVitalV8.syncHistoricalTemperature())}>Sync Temperature</button>
+        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void syncHrvAndPpi()}>Sync HRV/PPI</button>
+        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void syncMonitoringConfiguration()}>Sync Automatic Monitoring / Configuration</button>
         <div className="diagnostic-control">
           <button type="button" disabled={phase3bDisabledReasons.activity !== null} onClick={() => void runPhase3BSync('activity', () => JCVitalV8.syncHistoricalActivity())}>Sync Activity</button>
           {phase3bDisabledReasons.activity && <small>Disabled: {phase3bDisabledReasons.activity}</small>}
@@ -311,7 +451,7 @@ export function JCVitalV8Panel() {
           <button type="button" disabled={phase3bDisabledReasons.workouts !== null} onClick={() => void runPhase3BSync('workouts', () => JCVitalV8.syncHistoricalWorkouts())}>Sync Workouts</button>
           {phase3bDisabledReasons.workouts && <small>Disabled: {phase3bDisabledReasons.workouts}</small>}
         </div>
-        <button type="button" className="secondary" disabled={!Object.keys(historicalRuns).length && !monitoringRun && !Object.keys(phase3bRuns).length && !sleepRun.stages && !sleepRun.movement} onClick={() => void exportValidationReport()}>Export Phase 3A/3B Validation JSON</button>
+        <button type="button" className="secondary" disabled={!Object.keys(historicalRuns).length && !monitoringRun && !Object.keys(phase3bRuns).length && !sleepRun.stages && !sleepRun.movement && !workoutSession} onClick={() => void exportValidationReport()}>Export Phase 3A/3B/3C Validation JSON</button>
       </div>
       <div className="phase3b-bridge-status">
         <strong>Phase 3B bridge</strong>
@@ -355,15 +495,61 @@ export function JCVitalV8Panel() {
       </details>)}
       <h3>Raw</h3>
       <div className="wearable-actions">
-        <button type="button" disabled title="Phase 3D">Start PPG</button>
-        <button type="button" disabled title="Phase 3D">Stop PPG</button>
-        <button type="button" disabled title="Phase 3D">Start ECG</button>
-        <button type="button" disabled title="Phase 3D">Stop ECG</button>
+        <div className="diagnostic-control"><button type="button" disabled title="Phase 3D not implemented">Start PPG</button><small>Phase 3D not implemented</small></div>
+        <div className="diagnostic-control"><button type="button" disabled title="Phase 3D not implemented">Stop PPG</button><small>Phase 3D not implemented</small></div>
+        <div className="diagnostic-control"><button type="button" disabled title="Phase 3D not implemented">Start ECG</button><small>Phase 3D not implemented</small></div>
+        <div className="diagnostic-control"><button type="button" disabled title="Phase 3D not implemented">Stop ECG</button><small>Phase 3D not implemented</small></div>
       </div>
       <h3>Workout Test</h3>
       <div className="wearable-actions">
-        <button type="button" disabled title="Phase 3C">Start Workout Capture</button>
-        <button type="button" disabled title="Phase 3C">Stop Workout Capture</button>
+        <label className="workout-mode">Activity mode
+          <select value={activityMode} disabled={busy || workoutActive} onChange={(event) => setActivityMode(Number(event.target.value))}>
+            {['Run', 'Cycling', 'Badminton', 'Football', 'Tennis', 'Yoga', 'Breathing training', 'Dance', 'Basketball', 'Walk', 'Workout', 'Cricket', 'Hiking', 'Aerobics', 'Table tennis'].map((label, mode) => <option key={mode} value={mode}>{mode}: {label}</option>)}
+          </select>
+        </label>
+        <div className="diagnostic-control">
+          <button type="button" disabled={workoutStartReason !== null || busy} onClick={() => void startWorkout()}>Start Workout Capture</button>
+          {workoutStartReason && <small>Disabled: {workoutStartReason}</small>}
+        </div>
+        <div className="diagnostic-control">
+          <button type="button" disabled={workoutStopReason !== null || busy} onClick={() => void stopWorkout()}>Stop Workout Capture</button>
+          {workoutStopReason && <small>Disabled: {workoutStopReason}</small>}
+        </div>
+        <button type="button" disabled={busy || !workoutMethods.pause || workoutStatus !== 'RUNNING'} onClick={() => void changeWorkoutState('pause')}>Pause</button>
+        <button type="button" disabled={busy || !workoutMethods.resume || workoutStatus !== 'PAUSED'} onClick={() => void changeWorkoutState('resume')}>Resume</button>
+      </div>
+      <p>Target: 10:00 · manual stop</p>
+      <section className="workout-live-diagnostics" aria-label="Live workout diagnostics">
+        <strong>Status: {workoutStatus}</strong>
+        <span>Session ID: {workoutSession?.sessionId ?? '—'}</span>
+        <span>Elapsed wall time: {Math.floor(workoutElapsedSeconds / 60).toString().padStart(2, '0')}:{Math.floor(workoutElapsedSeconds % 60).toString().padStart(2, '0')}</span>
+        <span>Session packet count: {workoutSession?.packetCount ?? 0} · received here: {workoutPackets.length}</span>
+        <span>HR packets: {workoutDiagnostics?.hrPacketCount ?? 0}</span>
+        <span>Current HR: {currentWorkoutHr ?? '—'} bpm</span>
+        <span>Current steps: {currentWorkoutPacket?.steps ?? '—'} · calories: {currentWorkoutPacket?.calories ?? '—'}</span>
+        <span>ExerciseTime raw: {currentWorkoutPacket?.exerciseTimeRaw ?? '—'}</span>
+        <span>Last packet age: {lastWorkoutPacketAgeSeconds === null ? '—' : `${lastWorkoutPacketAgeSeconds.toFixed(1)} s`}</span>
+        <span>Heartbeat attempts/sent/skipped: {workoutSession?.heartbeatAttemptCount ?? 0}/{workoutSession?.heartbeatSentCount ?? 0}/{workoutSession?.heartbeatSkippedCount ?? 0}</span>
+          <span>App-supplied sendHeartPackage inputs: distance {workoutSession?.heartbeatInputs?.distanceKm ?? '—'} km · pace {workoutSession?.heartbeatInputs?.paceSeconds ?? '—'} s · signal {workoutSession?.heartbeatInputs?.rssiStrength ?? '—'} (vendor scale, not Android dBm)</span>
+          <span>Type 82 band-returned fields: heartRate, step, calories, ExerciseTime. Not returned: distance, pace, METS, temperature, SpO2, RSSI.</span>
+        <span>Packet interval median/P95: {workoutDiagnostics?.medianPacketIntervalMs?.toFixed(0) ?? '—'} / {workoutDiagnostics?.p95PacketIntervalMs?.toFixed(0) ?? '—'} ms</span>
+        <span>Packets 750–1250 ms: {workoutDiagnostics?.percentagePacketsBetween750And1250Ms?.toFixed(1) ?? '—'}%</span>
+        <span>HR-bearing interval median/P95: {workoutDiagnostics?.medianHrPacketIntervalMs?.toFixed(0) ?? '—'} / {workoutDiagnostics?.p95HrPacketIntervalMs?.toFixed(0) ?? '—'} ms</span>
+        <span>Nonzero HR observation interval median/P95: {workoutDiagnostics?.medianNonZeroHrIntervalMs?.toFixed(0) ?? '—'} / {workoutDiagnostics?.p95NonZeroHrIntervalMs?.toFixed(0) ?? '—'} ms</span>
+        <span>Zero HR: {workoutDiagnostics?.zeroHrCount ?? 0} · missing HR: {workoutDiagnostics?.missingHrCount ?? 0}</span>
+        <span>Unique nonzero HR values: {workoutDiagnostics?.uniqueHrValueCount ?? 0} · consecutive repeats: {workoutDiagnostics?.consecutiveRepeatedHrCount ?? 0} · longest repeated run: {workoutDiagnostics?.longestRepeatedHrRun ?? 0}</span>
+        <span>Classification: {workoutDiagnostics?.classification ?? 'PENDING'}</span>
+        {workoutHeartRateEvent && <span>Last dedicated HR event: {workoutHeartRateEvent.heartRate} bpm · seq {workoutHeartRateEvent.packetSequence}</span>}
+        {workoutError && <span role="alert">Workout error: {workoutError.message}</span>}
+      </section>
+      <div className="workout-packet-table-wrap">
+        <table className="workout-packet-table">
+          <thead><tr><th>Seq</th><th>Received</th><th>HR</th><th>Steps</th><th>Calories</th><th>ExerciseTime raw</th></tr></thead>
+          <tbody>{workoutPackets.slice(-10).map((packet) => <tr key={`${packet.sessionId}-${packet.packetSequence}`}>
+            <td>{packet.packetSequence}</td><td>{new Date(packet.receivedAt).toLocaleTimeString()}</td><td>{packet.heartRate ?? '—'}</td>
+            <td>{packet.steps ?? '—'}</td><td>{packet.calories ?? '—'}</td><td>{packet.exerciseTimeRaw ?? '—'}</td>
+          </tr>)}</tbody>
+        </table>
       </div>
       {message && <p className="error-message" role="alert">{message}</p>}
       {lastError && <p>Last native error: {lastError.code} — {lastError.message}</p>}

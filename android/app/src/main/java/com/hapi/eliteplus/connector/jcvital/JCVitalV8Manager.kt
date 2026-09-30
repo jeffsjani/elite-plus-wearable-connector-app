@@ -21,6 +21,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.jstyle.blesdkv8.Util.BleSDK
@@ -29,6 +30,7 @@ import com.jstyle.blesdkv8.constant.BleConst
 import com.jstyle.blesdkv8.constant.DeviceKey
 import com.jstyle.blesdkv8.model.AutoTestMode
 import com.jstyle.blesdkv8.model.AutoMode
+import com.jstyle.blesdkv8.model.ExerciseMode
 import java.util.TimeZone
 import java.util.UUID
 
@@ -48,7 +50,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
 
     private enum class InitStep { NONE, MTU, NOTIFICATIONS, HANDSHAKE }
 
-    private class Command(val name: String, val bytes: ByteArray)
+    private class Command(val name: String, val bytes: ByteArray, val onWriteComplete: ((Boolean) -> Unit)? = null)
 
     private class PendingRequest(
         val expected: MutableSet<String>,
@@ -82,11 +84,24 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         var timeout: Runnable? = null
     }
 
+    private class WorkoutCapture(
+        val session: JCVitalV8WorkoutSession,
+        val startCallback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit,
+    ) {
+        var stopCallback: ((Map<String, Any?>?, JCVitalV8Exception?) -> Unit)? = null
+        var startTimeout: Runnable? = null
+        var stopTimeout: Runnable? = null
+        var heartbeatRunnable: Runnable? = null
+        var nextHeartbeatUptime: Long = 0L
+        val parseErrors = mutableListOf<Map<String, Any?>>()
+    }
+
     private val appContext = context.applicationContext
     private val main = Handler(Looper.getMainLooper())
     private val bluetoothManager = appContext.getSystemService(BluetoothManager::class.java)
     private val registry = JCVitalV8DeviceRegistry()
     private val normalizer = JCVitalV8EventNormalizer()
+    private val workoutNormalizer = JCVitalV8WorkoutNormalizer()
     private val stateMachine = JCVitalV8ConnectionStateMachine { from, to, reason ->
         Log.i(TAG, "state $from -> $to${reason?.let { " ($it)" } ?: ""}")
         emit(
@@ -120,6 +135,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     private val pendingRequests = mutableListOf<PendingRequest>()
     private var historicalRequest: HistoricalRequest? = null
     private var monitoringRequest: MonitoringRequest? = null
+    private var workoutCapture: WorkoutCapture? = null
+    private var lastWorkoutSession: Map<String, Any?>? = null
 
     private val deviceInfo = LinkedHashMap<String, Any?>()
     private var lastBattery: Map<String, Any?>? = null
@@ -299,6 +316,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         stopScanInternal("scan stopped for disconnect")
         val hadLink = gatt != null
         Log.i(TAG, "disconnect requested (link=$hadLink)")
+        endWorkoutForLinkLoss("Disconnected by user")
         closeGatt()
         stateMachine.transition(JCVitalV8ConnectionState.DISCONNECTED, "user disconnect")
         failPendingWork(JCVitalV8Exception(JCVitalV8ErrorCode.CONNECTION_LOST, "Disconnected by user"))
@@ -324,6 +342,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED || status != BluetoothGatt.GATT_SUCCESS) {
                     val code = JCVitalV8Errors.forLinkDrop(state, status, userInitiated = false)
                     if (code == null) {
+                        endWorkoutForLinkLoss("V8 disconnected")
                         closeGatt()
                         stateMachine.transition(JCVitalV8ConnectionState.DISCONNECTED, "gatt disconnected")
                     } else {
@@ -402,7 +421,9 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                 val command = writeInFlight
                 clearWriteTimeout()
                 writeInFlight = null
-                if (status != BluetoothGatt.GATT_SUCCESS) {
+                val success = status == BluetoothGatt.GATT_SUCCESS
+                command?.onWriteComplete?.invoke(success)
+                if (!success) {
                     emitError(JCVitalV8ErrorCode.COMMAND_FAILED, "${command?.name ?: "command"} write failed (status=$status)")
                 }
                 pump()
@@ -476,6 +497,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     /** V8 docs: RealTimeStep streams HR only while SetDeviceMeasurementWithType(AutoHeartRate) is open (>30 s). */
     fun startRealtime(measurementSeconds: Long, callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
         if (!requireReady(callback)) return@onMain
+        val blocked = JCVitalV8WorkoutGuard.blockedReason(workoutCapture?.session, realtimeSessionId != null, historicalRequest != null, monitoringRequest != null)
+        if (blocked != null) return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, blocked))
         val seconds = measurementSeconds.coerceIn(MIN_MEASUREMENT_SECONDS, MAX_MEASUREMENT_SECONDS)
         val sessionId = UUID.randomUUID().toString()
         realtimeSessionId = sessionId
@@ -513,6 +536,118 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         "GetPPI", BleConst.GetPPIData, { mode -> BleSDK.GetPPI(mode, "") }, callback,
     )
 
+    fun startWorkoutCapture(activityMode: Int, callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
+        if (!requireReady(callback)) return@onMain
+        val blocked = JCVitalV8WorkoutGuard.blockedReason(
+            workoutCapture?.session,
+            realtimeSessionId != null,
+            historicalRequest != null,
+            monitoringRequest != null,
+        )
+        if (blocked != null) return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, blocked))
+        if (activityMode !in 0..14) {
+            return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, "Unsupported V8 activity mode $activityMode"))
+        }
+        val session = JCVitalV8WorkoutSession(
+            sessionId = UUID.randomUUID().toString(),
+            deviceId = connectedDeviceId,
+            firmwareVersion = deviceInfo["firmwareVersion"] as? String,
+            activityMode = activityMode,
+            activityType = JCVitalV8ActivityModes.canonicalType(activityMode),
+            startedAtMillis = System.currentTimeMillis(),
+        )
+        val capture = WorkoutCapture(session, callback)
+        workoutCapture = capture
+        emitWorkoutStatus(capture)
+        capture.startTimeout = Runnable {
+            if (workoutCapture !== capture || session.status != JCVitalV8WorkoutSession.STATUS_STARTING) return@Runnable
+            workoutCapture = null
+            session.markError(System.currentTimeMillis())
+            lastWorkoutSession = workoutSessionPayload(capture)
+            emitWorkoutStatus(capture)
+            emitWorkoutError(session.sessionId, "No EnterActivityMode start response")
+            callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, "No EnterActivityMode start response"))
+        }.also { main.postDelayed(it, COMMAND_TIMEOUT_MS) }
+        enqueue(
+            "EnterActivityMode(start,mode=$activityMode)",
+            BleSDK.EnterActivityMode(2, activityMode, ExerciseMode.Status_START),
+        )
+    }
+
+    fun pauseWorkoutCapture(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
+        val capture = workoutCapture
+        if (capture == null || capture.session.status != JCVitalV8WorkoutSession.STATUS_RUNNING) {
+            return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, "Workout capture is not running"))
+        }
+        try {
+            capture.session.markPaused()
+            cancelWorkoutHeartbeat(capture)
+            enqueue("EnterActivityMode(pause)", BleSDK.EnterActivityMode(2, capture.session.activityMode, ExerciseMode.Status_PAUSE))
+            emitWorkoutStatus(capture)
+            callback(workoutSessionPayload(capture), null)
+        } catch (error: Throwable) {
+            callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, error.message ?: "Could not pause workout"))
+        }
+    }
+
+    fun resumeWorkoutCapture(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
+        val capture = workoutCapture
+        if (capture == null || capture.session.status != JCVitalV8WorkoutSession.STATUS_PAUSED) {
+            return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, "Workout capture is not paused"))
+        }
+        try {
+            enqueue("EnterActivityMode(resume)", BleSDK.EnterActivityMode(2, capture.session.activityMode, ExerciseMode.Status_CONTUINE))
+            capture.session.markRunning()
+            scheduleWorkoutHeartbeat(capture)
+            emitWorkoutStatus(capture)
+            callback(workoutSessionPayload(capture), null)
+        } catch (error: Throwable) {
+            callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, error.message ?: "Could not resume workout"))
+        }
+    }
+
+    fun stopWorkoutCapture(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
+        val capture = workoutCapture
+            ?: return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, "No workout capture is active"))
+        if (capture.session.status != JCVitalV8WorkoutSession.STATUS_RUNNING && capture.session.status != JCVitalV8WorkoutSession.STATUS_PAUSED) {
+            return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, "Workout is not ready to stop (status=${capture.session.status})"))
+        }
+        cancelWorkoutHeartbeat(capture)
+        capture.session.markStopping()
+        capture.stopCallback = callback
+        emitWorkoutStatus(capture)
+        capture.stopTimeout = Runnable {
+            failWorkoutCapture(capture, JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, "No EnterActivityMode finish response"))
+        }.also { main.postDelayed(it, COMMAND_TIMEOUT_MS) }
+        enqueue("EnterActivityMode(finish)", BleSDK.EnterActivityMode(2, capture.session.activityMode, ExerciseMode.Status_FINISH)) { written ->
+            if (!written) failWorkoutCapture(capture, JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, "Workout finish command write failed"))
+        }
+    }
+
+    fun workoutCaptureStatus(): Map<String, Any?> = workoutCapture?.let(::workoutSessionPayload)
+        ?: lastWorkoutSession
+        ?: idleWorkoutPayload()
+
+    private fun idleWorkoutPayload(): Map<String, Any?> = linkedMapOf(
+        "sessionId" to null,
+        "deviceId" to connectedDeviceId,
+        "activityType" to null,
+        "vendorActivityMode" to null,
+        "startedAt" to null,
+        "stoppedAt" to null,
+        "status" to JCVitalV8WorkoutSession.STATUS_IDLE,
+        "packetCount" to 0,
+        "firstPacketAt" to null,
+        "lastPacketAt" to null,
+        "heartbeatAttemptCount" to 0,
+        "heartbeatSentCount" to 0,
+        "heartbeatSkippedCount" to 0,
+        "heartbeatIntervalMs" to JCVitalV8WorkoutSession.HEARTBEAT_INTERVAL_MS,
+        "firmwareVersion" to (deviceInfo["firmwareVersion"] as? String),
+        "sdkVersion" to JCVitalV8EventNormalizer.SDK_VERSION,
+        "parseErrors" to emptyList<Any>(),
+    )
+
     fun syncHistoricalActivity(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
         "GetTotalActivityDataWithMode", BleConst.GetTotalActivityData, { mode -> BleSDK.GetTotalActivityDataWithMode(mode, "") }, callback,
     )
@@ -535,8 +670,9 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
 
     fun requestMonitoringConfiguration(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
         if (!requireReady(callback)) return@onMain
-        if (historicalRequest != null || monitoringRequest != null) {
-            return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, "Another acquisition request is already running"))
+        val blocked = JCVitalV8WorkoutGuard.blockedReason(workoutCapture?.session, realtimeSessionId != null, historicalRequest != null, monitoringRequest != null)
+        if (blocked != null) {
+            return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, blocked))
         }
         val request = MonitoringRequest(callback)
         monitoringRequest = request
@@ -550,8 +686,9 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit,
     ) = onMain {
         if (!requireReady(callback)) return@onMain
-        if (historicalRequest != null || monitoringRequest != null) {
-            return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, "A historical sync is already running"))
+        val blocked = JCVitalV8WorkoutGuard.blockedReason(workoutCapture?.session, realtimeSessionId != null, historicalRequest != null, monitoringRequest != null)
+        if (blocked != null) {
+            return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, blocked))
         }
         val request = HistoricalRequest(UUID.randomUUID().toString(), name, dataType, command, System.currentTimeMillis(), callback)
         historicalRequest = request
@@ -559,8 +696,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         enqueue("$name(start)", command(HISTORY_MODE_START))
     }
 
-    private fun enqueue(name: String, bytes: ByteArray) {
-        commandQueue.addLast(Command(name, bytes))
+    private fun enqueue(name: String, bytes: ByteArray, onWriteComplete: ((Boolean) -> Unit)? = null) {
+        commandQueue.addLast(Command(name, bytes, onWriteComplete))
         pump()
     }
 
@@ -569,7 +706,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         val g = gatt
         val characteristic = writeCharacteristic
         if (g == null || characteristic == null) {
-            commandQueue.clear()
+            while (commandQueue.isNotEmpty()) commandQueue.removeFirst().onWriteComplete?.invoke(false)
             return
         }
         val command = commandQueue.removeFirstOrNull() ?: return
@@ -588,6 +725,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
             false
         }
         if (!accepted) {
+            command.onWriteComplete?.invoke(false)
             emitError(JCVitalV8ErrorCode.COMMAND_FAILED, "${command.name} write rejected")
             return pump()
         }
@@ -596,6 +734,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         writeTimeout = Runnable {
             if (writeInFlight !== command) return@Runnable
             writeInFlight = null
+            command.onWriteComplete?.invoke(false)
             emitError(JCVitalV8ErrorCode.COMMAND_FAILED, "${command.name} write not acknowledged")
             pump()
         }.also { main.postDelayed(it, WRITE_TIMEOUT_MS) }
@@ -659,9 +798,231 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                 else -> emit(event.name, event.payload)
             }
         }
+        handleWorkoutResponse(dataType, vendor)
+        handleWorkoutPacket(dataType, vendor)
         handleHistoricalResponse(dataType, vendor, events)
         handleMonitoringResponse(dataType, vendor)
         if (dataType != null) resolveResponse(dataType)
+    }
+
+    private fun handleWorkoutResponse(dataType: String?, vendor: Map<String?, Any?>) {
+        if (dataType != BleConst.EnterActivityMode) return
+        val capture = workoutCapture ?: return
+        val isStarting = capture.session.status == JCVitalV8WorkoutSession.STATUS_STARTING
+        val isStopping = capture.session.status == JCVitalV8WorkoutSession.STATUS_STOPPING
+        if (!isStarting && !isStopping) return
+        if (isStarting) {
+            capture.startTimeout?.let(main::removeCallbacks)
+            capture.startTimeout = null
+        }
+        @Suppress("UNCHECKED_CAST")
+        val data = JCVitalV8EventNormalizer.sanitize(vendor[DeviceKey.Data]) as? Map<String, Any?> ?: emptyMap()
+        val responseCode = data[DeviceKey.enterActivityModeSuccess]?.toString()?.toIntOrNull()
+        if (isStopping) {
+            if (responseCode == null || responseCode == 0) {
+                failWorkoutCapture(
+                    capture,
+                    JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, "V8 did not acknowledge workout finish"),
+                )
+            } else {
+                capture.stopTimeout?.let(main::removeCallbacks)
+                capture.stopTimeout = null
+                capture.session.stop(System.currentTimeMillis())
+                workoutCapture = null
+                val result = workoutSessionPayload(capture)
+                lastWorkoutSession = result
+                emit(JCVitalV8EventNormalizer.EVENT_WORKOUT_STATE, result)
+                capture.stopCallback?.invoke(result, null)
+                capture.stopCallback = null
+            }
+            return
+        }
+        if (responseCode == null) {
+            capture.session.markError(System.currentTimeMillis())
+            workoutCapture = null
+            lastWorkoutSession = workoutSessionPayload(capture)
+            val error = JCVitalV8Exception(JCVitalV8ErrorCode.RESPONSE_PARSE_FAILED, "EnterActivityMode response did not contain ${DeviceKey.enterActivityModeSuccess}")
+            capture.startCallback(null, error)
+            emitWorkoutError(capture.session.sessionId, error.message ?: "Workout start response malformed")
+            emitWorkoutStatus(capture)
+            return
+        }
+        if (responseCode == 0) {
+            capture.session.markError(System.currentTimeMillis())
+            workoutCapture = null
+            lastWorkoutSession = workoutSessionPayload(capture)
+            val error = JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, "V8 rejected the exercise start request")
+            capture.startCallback(null, error)
+            emitWorkoutError(capture.session.sessionId, error.message ?: "Workout start rejected")
+            emitWorkoutStatus(capture)
+            return
+        }
+        capture.session.markRunning()
+        scheduleWorkoutHeartbeat(capture)
+        val result = workoutSessionPayload(capture)
+        capture.startCallback(result, null)
+        emitWorkoutStatus(capture)
+    }
+
+    private fun handleWorkoutPacket(dataType: String?, vendor: Map<String?, Any?>) {
+        if (dataType != BleConst.SportData) return
+        val capture = workoutCapture ?: return
+        if (capture.session.status != JCVitalV8WorkoutSession.STATUS_RUNNING) return
+        val receivedAt = JCVitalV8Time.isoUtc(System.currentTimeMillis())
+        val sequence = capture.session.recordPacket(receivedAt)
+        val packet = try {
+            workoutNormalizer.normalize(
+                vendor,
+                JCVitalV8WorkoutNormalizer.Context(
+                    sessionId = capture.session.sessionId,
+                    deviceId = connectedDeviceId,
+                    firmwareVersion = deviceInfo["firmwareVersion"] as? String,
+                    packetSequence = sequence,
+                    receivedAt = receivedAt,
+                    activityMode = capture.session.activityMode,
+                ),
+            )
+        } catch (error: Throwable) {
+            val normalized = JCVitalV8Errors.fromThrowable(error, JCVitalV8ErrorCode.RESPONSE_PARSE_FAILED)
+            val parseError = linkedMapOf<String, Any?>(
+                "vendorDataType" to dataType,
+                "message" to (normalized.message ?: "Could not normalize workout packet"),
+                "receivedAt" to receivedAt,
+                "rawVendorPayload" to JCVitalV8EventNormalizer.sanitize(vendor),
+            )
+            capture.parseErrors += parseError
+            emit(JCVitalV8EventNormalizer.EVENT_WORKOUT_PARSE_ERROR, parseError)
+            emitWorkoutError(capture.session.sessionId, normalized.message ?: "Could not normalize workout packet")
+            return
+        }
+        emit(JCVitalV8EventNormalizer.EVENT_WORKOUT_PACKET, packet)
+        val heartRate = packet["heartRate"] as? Int
+        if (heartRate != null) {
+            emit(
+                JCVitalV8EventNormalizer.EVENT_WORKOUT_HEART_RATE,
+                linkedMapOf(
+                    "sessionId" to capture.session.sessionId,
+                    "heartRate" to heartRate,
+                    "receivedAt" to receivedAt,
+                    "packetSequence" to sequence,
+                    "vendorDataType" to dataType,
+                    "acquisitionMode" to "WORKOUT_REALTIME",
+                ),
+            )
+        }
+    }
+
+    private fun scheduleWorkoutHeartbeat(capture: WorkoutCapture) {
+        cancelWorkoutHeartbeat(capture)
+        capture.nextHeartbeatUptime = SystemClock.uptimeMillis() + JCVitalV8WorkoutSession.HEARTBEAT_INTERVAL_MS
+        val heartbeat = object : Runnable {
+            override fun run() {
+                if (workoutCapture !== capture || capture.session.status != JCVitalV8WorkoutSession.STATUS_RUNNING) return
+                capture.session.recordHeartbeatAttempt()
+                if (gatt != null && writeInFlight == null && commandQueue.isEmpty()) {
+                    // GPS distance, pace, and the vendor 0-6 signal scale are unavailable; zero is explicit, not inferred.
+                    enqueue("sendHeartPackage(1Hz)", BleSDK.sendHeartPackage(0f, 0, 0)) { written ->
+                        if (written) capture.session.recordHeartbeatSent() else capture.session.recordHeartbeatSkipped()
+                        emitWorkoutStatus(capture)
+                    }
+                } else {
+                    capture.session.recordHeartbeatSkipped()
+                }
+                capture.nextHeartbeatUptime += JCVitalV8WorkoutSession.HEARTBEAT_INTERVAL_MS
+                val now = SystemClock.uptimeMillis()
+                if (capture.nextHeartbeatUptime <= now) {
+                    val missed = ((now - capture.nextHeartbeatUptime) / JCVitalV8WorkoutSession.HEARTBEAT_INTERVAL_MS) + 1
+                    capture.session.recordHeartbeatAttempt(missed)
+                    capture.session.recordHeartbeatSkipped(missed)
+                    capture.nextHeartbeatUptime += missed * JCVitalV8WorkoutSession.HEARTBEAT_INTERVAL_MS
+                }
+                emitWorkoutStatus(capture)
+                main.postAtTime(this, capture.nextHeartbeatUptime)
+            }
+        }
+        capture.heartbeatRunnable = heartbeat
+        main.postAtTime(heartbeat, capture.nextHeartbeatUptime)
+    }
+
+    private fun cancelWorkoutHeartbeat(capture: WorkoutCapture) {
+        capture.heartbeatRunnable?.let(main::removeCallbacks)
+        capture.heartbeatRunnable = null
+    }
+
+    private fun workoutSessionPayload(capture: WorkoutCapture): Map<String, Any?> =
+        LinkedHashMap(capture.session.toMap()).apply {
+            put("parseErrors", capture.parseErrors.toList())
+            put("classification", "PENDING")
+        }
+
+    private fun emitWorkoutStatus(capture: WorkoutCapture) {
+        updateWorkoutSnapshot(capture)
+        emit(JCVitalV8EventNormalizer.EVENT_WORKOUT_STATE, workoutSessionPayload(capture))
+    }
+
+    private fun updateWorkoutSnapshot(capture: WorkoutCapture) {
+        if (workoutCapture !== capture && capture.session.status != JCVitalV8WorkoutSession.STATUS_RUNNING) {
+            lastWorkoutSession = workoutSessionPayload(capture)
+        }
+    }
+
+    private fun emitWorkoutError(sessionId: String, message: String) {
+        emit(JCVitalV8EventNormalizer.EVENT_WORKOUT_ERROR, linkedMapOf(
+            "sessionId" to sessionId,
+            "message" to message,
+            "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()),
+        ))
+    }
+
+    private fun endWorkoutForLinkLoss(reason: String) {
+        val capture = workoutCapture ?: return
+        val wasStarting = capture.session.status == JCVitalV8WorkoutSession.STATUS_STARTING
+        cancelWorkoutHeartbeat(capture)
+        capture.startTimeout?.let(main::removeCallbacks)
+        capture.stopTimeout?.let(main::removeCallbacks)
+        capture.session.stop(System.currentTimeMillis(), JCVitalV8WorkoutSession.STATUS_DISCONNECTED)
+        workoutCapture = null
+        val result = workoutSessionPayload(capture)
+        lastWorkoutSession = result
+        if (wasStarting) capture.startCallback(null, JCVitalV8Exception(JCVitalV8ErrorCode.CONNECTION_LOST, "Connection lost during workout start"))
+        capture.stopCallback?.invoke(null, JCVitalV8Exception(JCVitalV8ErrorCode.CONNECTION_LOST, reason))
+        capture.stopCallback = null
+        emitWorkoutError(capture.session.sessionId, reason)
+        emit(JCVitalV8EventNormalizer.EVENT_WORKOUT_STATE, result)
+    }
+
+    private fun endWorkoutForError(reason: String) {
+        val capture = workoutCapture ?: return
+        val wasStarting = capture.session.status == JCVitalV8WorkoutSession.STATUS_STARTING
+        cancelWorkoutHeartbeat(capture)
+        capture.startTimeout?.let(main::removeCallbacks)
+        capture.stopTimeout?.let(main::removeCallbacks)
+        capture.session.markError(System.currentTimeMillis())
+        workoutCapture = null
+        val result = workoutSessionPayload(capture)
+        lastWorkoutSession = result
+        if (wasStarting) capture.startCallback(null, JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, reason))
+        capture.stopCallback?.invoke(null, JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, reason))
+        capture.stopCallback = null
+        emitWorkoutError(capture.session.sessionId, reason)
+        emit(JCVitalV8EventNormalizer.EVENT_WORKOUT_STATE, result)
+    }
+
+    private fun failWorkoutCapture(capture: WorkoutCapture, error: JCVitalV8Exception) {
+        if (workoutCapture !== capture) return
+        val wasStarting = capture.session.status == JCVitalV8WorkoutSession.STATUS_STARTING
+        cancelWorkoutHeartbeat(capture)
+        capture.startTimeout?.let(main::removeCallbacks)
+        capture.stopTimeout?.let(main::removeCallbacks)
+        capture.session.markError(System.currentTimeMillis())
+        workoutCapture = null
+        val result = workoutSessionPayload(capture)
+        lastWorkoutSession = result
+        if (wasStarting) capture.startCallback(null, error)
+        capture.stopCallback?.invoke(null, error)
+        capture.stopCallback = null
+        emitWorkoutError(capture.session.sessionId, error.message ?: "Workout capture failed")
+        emit(JCVitalV8EventNormalizer.EVENT_WORKOUT_STATE, result)
     }
 
     private fun requestNextMonitorMode(request: MonitoringRequest) {
@@ -817,6 +1178,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     /** Tears down the link after an unexpected failure and moves to ERROR. */
     private fun fail(code: JCVitalV8ErrorCode, message: String) {
         Log.w(TAG, "$code: $message")
+        endWorkoutForError(message)
         closeGatt()
         emitError(code, message)
         // Leave INITIALIZING before completing pending work so the handshake callback cannot re-enter fail().
@@ -849,7 +1211,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         clearConnectTimeout()
         clearInitTimeout()
         clearWriteTimeout()
-        commandQueue.clear()
+        while (commandQueue.isNotEmpty()) commandQueue.removeFirst().onWriteComplete?.invoke(false)
+        writeInFlight?.onWriteComplete?.invoke(false)
         writeInFlight = null
         initStep = InitStep.NONE
         realtimeSessionId = null
@@ -879,6 +1242,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         } catch (_: IllegalArgumentException) {
         }
         stopScanInternal("released")
+        endWorkoutForLinkLoss("Plugin released")
         closeGatt()
         stateMachine.transition(JCVitalV8ConnectionState.DISCONNECTED, "released")
         failPendingWork(JCVitalV8Exception(JCVitalV8ErrorCode.CONNECTION_LOST, "Plugin released"))
