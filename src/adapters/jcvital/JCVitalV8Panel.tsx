@@ -13,6 +13,8 @@ import {
   type JCVitalV8LiveWorkoutSession,
   type JCVitalV8Observation,
   type JCVitalV8PermissionResult,
+  type JCVitalV8RawEcgErrorEvent,
+  type JCVitalV8RawEcgSession,
   type JCVitalV8WorkoutErrorEvent,
   type JCVitalV8WorkoutHeartRateEvent,
 } from './jcvitalV8Bridge'
@@ -32,6 +34,8 @@ import {
 } from './Phase3BValidation'
 import { phase3bDisabledReason } from './Phase3BBridgeStatus'
 import { workoutStartDisabledReason, workoutStopDisabledReason } from './WorkoutCaptureGuard'
+import { rawEcgStartDisabledReason, rawEcgStopDisabledReason } from './RawEcgCaptureGuard'
+import { buildRawEcgValidation, EMPTY_RAW_ECG_CHUNK_SUMMARY, includeRawEcgChunk, type RawEcgChunkSummary } from './RawEcgDiagnostics'
 import {
   buildWorkoutLiveValidation,
   computeWorkoutCadenceDiagnostics,
@@ -67,6 +71,11 @@ export function JCVitalV8Panel() {
   const [workoutError, setWorkoutError] = useState<JCVitalV8WorkoutErrorEvent | null>(null)
   const [workoutClock, setWorkoutClock] = useState(Date.now())
   const [activityMode, setActivityMode] = useState(0)
+  const [rawEcgSession, setRawEcgSession] = useState<JCVitalV8RawEcgSession | null>(null)
+  const [rawEcgChunks, setRawEcgChunks] = useState<RawEcgChunkSummary>(EMPTY_RAW_ECG_CHUNK_SUMMARY)
+  const [rawEcgParseErrors, setRawEcgParseErrors] = useState<Array<Record<string, unknown>>>([])
+  const [rawEcgError, setRawEcgError] = useState<JCVitalV8RawEcgErrorEvent | null>(null)
+  const [rawEcgClock, setRawEcgClock] = useState(Date.now())
   const [historicalRuns, setHistoricalRuns] = useState<Partial<Record<HistoricalFeedKey, HistoricalFeedRun>>>({})
   const [monitoringRun, setMonitoringRun] = useState<MonitoringFeedRun | undefined>()
   const [phase3bRuns, setPhase3bRuns] = useState<Partial<Record<Exclude<Phase3BFeedKey, 'sleep'>, HistoricalFeedRun>>>({})
@@ -107,6 +116,18 @@ export function JCVitalV8Panel() {
       JCVitalV8.addListener('jcvitalWorkoutParseError', (error) => {
         setWorkoutParseErrors((current) => [...current, typeof error === 'object' && error !== null ? error as Record<string, unknown> : { error }])
       }),
+      JCVitalV8.addListener('jcvitalRawEcgStatus', (session) => {
+        setRawEcgSession(session)
+        if (['STARTING', 'RUNNING', 'STOPPING'].includes(session.status)) setActiveSync((current) => current ?? 'raw-ecg')
+        else setActiveSync((current) => current?.startsWith('raw-ecg') ? null : current)
+      }),
+      JCVitalV8.addListener('jcvitalRawEcgChunk', (chunk) => {
+        setRawEcgChunks((current) => includeRawEcgChunk(current, chunk))
+      }),
+      JCVitalV8.addListener('jcvitalRawEcgError', (error) => {
+        setRawEcgError(error)
+        setRawEcgParseErrors((current) => [...current, error as unknown as Record<string, unknown>])
+      }),
     ]
     void JCVitalV8.isAvailable().then((result) => setPluginAvailable(result.available)).catch(() => setPluginAvailable(false))
     void JCVitalV8.getPermissionStatus().then(setPermission).catch((error) => setMessage(errorText(error)))
@@ -114,6 +135,10 @@ export function JCVitalV8Panel() {
     void JCVitalV8.getWorkoutCaptureStatus().then((session) => {
       setWorkoutSession(session)
       if (!['IDLE', 'STOPPED', 'ERROR', 'DISCONNECTED'].includes(session.status)) setActiveSync('workout:capture')
+    }).catch(() => undefined)
+    void JCVitalV8.getRawEcgStatus().then((session) => {
+      setRawEcgSession(session)
+      if (['STARTING', 'RUNNING', 'STOPPING'].includes(session.status)) setActiveSync((current) => current ?? 'raw-ecg')
     }).catch(() => undefined)
     return () => { handles.forEach((handle) => void handle.then((h) => h.remove())) }
   }, [])
@@ -123,6 +148,12 @@ export function JCVitalV8Panel() {
     const timer = window.setInterval(() => setWorkoutClock(Date.now()), 1000)
     return () => window.clearInterval(timer)
   }, [workoutSession?.status, workoutSession?.sessionId])
+
+  useEffect(() => {
+    if (!rawEcgSession || !['STARTING', 'RUNNING', 'STOPPING'].includes(rawEcgSession.status)) return
+    const timer = window.setInterval(() => setRawEcgClock(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [rawEcgSession?.status, rawEcgSession?.sessionId])
 
   async function run(action: () => Promise<unknown>): Promise<void> {
     setBusy(true)
@@ -283,6 +314,39 @@ export function JCVitalV8Panel() {
     }
   }
 
+  async function startRawEcg(): Promise<void> {
+    setRawEcgChunks(EMPTY_RAW_ECG_CHUNK_SUMMARY)
+    setRawEcgParseErrors([])
+    setRawEcgError(null)
+    setActiveSync('raw-ecg')
+    setBusy(true)
+    setMessage('')
+    try {
+      setRawEcgSession(await JCVitalV8.startRawEcg())
+    } catch (error) {
+      setActiveSync(null)
+      setMessage(errorText(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function stopRawEcg(): Promise<void> {
+    setActiveSync('raw-ecg:stopping')
+    setBusy(true)
+    setMessage('')
+    try {
+      setRawEcgSession(await JCVitalV8.stopRawEcg())
+      setActiveSync(null)
+    } catch (error) {
+      setMessage(errorText(error))
+      try { setRawEcgSession(await JCVitalV8.getRawEcgStatus()) } catch { /* keep last state */ }
+      setActiveSync((current) => current === 'raw-ecg:stopping' ? 'raw-ecg' : current)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function exportValidationReport(): Promise<void> {
     setExportStatus('EXPORTING')
     setExportLocation(null)
@@ -300,7 +364,11 @@ export function JCVitalV8Panel() {
       })
       const payload = buildPhase3AValidationReport({
         deviceInfo, historicalRuns, monitoringRun,
-        additionalFeedResults: { ...phase3bFeedResults, workoutLiveValidation },
+        additionalFeedResults: {
+          ...phase3bFeedResults,
+          workoutLiveValidation,
+          rawEcgValidation: buildRawEcgValidation(rawEcgSession, rawEcgChunks, rawEcgParseErrors),
+        },
       })
       const filename = `jcvital-v8-phase3abc-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
       const json = JSON.stringify(payload, null, 2)
@@ -391,6 +459,26 @@ export function JCVitalV8Panel() {
     ? Math.max(0, (workoutClock - Date.parse(currentWorkoutPacket.receivedAt)) / 1000)
     : null
   const workoutLiveValidation = buildWorkoutLiveValidation(workoutSessionForDiagnostics, workoutPackets, workoutParseErrors)
+  const rawEcgMethods = {
+     start: typeof JCVitalV8.startRawEcg === 'function',
+    stop: typeof JCVitalV8.stopRawEcg === 'function',
+  }
+  const rawEcgGate = {
+    pluginAvailable,
+    startMethodAvailable: rawEcgMethods.start,
+    stopMethodAvailable: rawEcgMethods.stop,
+    connectionState: state,
+    activeSync: activeSync ?? (realtime ? 'manual HR measurement' : null),
+    manualMeasurementActive: realtime,
+    workoutStatus: workoutSession?.status ?? 'IDLE' as const,
+    rawEcgStatus: rawEcgSession?.status ?? 'IDLE',
+  }
+  const rawEcgStartReason = rawEcgStartDisabledReason(rawEcgGate)
+  const rawEcgStopReason = rawEcgStopDisabledReason(rawEcgGate)
+  const rawEcgElapsedSeconds = rawEcgSession?.startedAt
+    ? Math.max(0, ((rawEcgSession.stoppedAt ? Date.parse(rawEcgSession.stoppedAt) : rawEcgClock) - Date.parse(rawEcgSession.startedAt)) / 1000)
+    : 0
+  const rawEcgValidation = buildRawEcgValidation(rawEcgSession, rawEcgChunks, rawEcgParseErrors)
   const otherActiveMeasurement = activeSync ?? (realtime ? 'manual HR measurement' : null)
   const workoutStatus = workoutSession?.status ?? 'IDLE'
   const workoutActive = ['STARTING', 'RUNNING', 'PAUSED', 'STOPPING'].includes(workoutStatus)
@@ -493,13 +581,43 @@ export function JCVitalV8Panel() {
         <strong>First 5</strong><pre>{JSON.stringify(diagnostics.firstFive, null, 2)}</pre>
         <strong>Last 5</strong><pre>{JSON.stringify(diagnostics.lastFive, null, 2)}</pre>
       </details>)}
-      <h3>Raw</h3>
+      <h3>Raw Capture</h3>
       <div className="wearable-actions">
-        <div className="diagnostic-control"><button type="button" disabled title="Phase 3D not implemented">Start PPG</button><small>Phase 3D not implemented</small></div>
-        <div className="diagnostic-control"><button type="button" disabled title="Phase 3D not implemented">Stop PPG</button><small>Phase 3D not implemented</small></div>
-        <div className="diagnostic-control"><button type="button" disabled title="Phase 3D not implemented">Start ECG</button><small>Phase 3D not implemented</small></div>
-        <div className="diagnostic-control"><button type="button" disabled title="Phase 3D not implemented">Stop ECG</button><small>Phase 3D not implemented</small></div>
+        <div className="diagnostic-control">
+          <button type="button" disabled title="Phase 3D-B PPG validation pending">Start PPG</button>
+          <small>Disabled: Phase 3D-B PPG validation pending</small>
+        </div>
+        <div className="diagnostic-control">
+          <button type="button" disabled title="Phase 3D-B PPG validation pending">Stop PPG</button>
+          <small>Disabled: Phase 3D-B PPG validation pending</small>
+        </div>
+        <div className="diagnostic-control">
+          <button type="button" disabled={rawEcgStartReason !== null || busy} title={rawEcgStartReason ?? 'Start raw ECG capture'} onClick={() => void startRawEcg()}>Start ECG</button>
+          {rawEcgStartReason && <small>Disabled: {rawEcgStartReason}</small>}
+        </div>
+        <div className="diagnostic-control">
+          <button type="button" disabled={rawEcgStopReason !== null || busy} title={rawEcgStopReason ?? 'Stop raw ECG capture'} onClick={() => void stopRawEcg()}>Stop ECG</button>
+          {rawEcgStopReason && <small>Disabled: {rawEcgStopReason}</small>}
+        </div>
       </div>
+      <section className="workout-live-diagnostics" aria-label="Raw ECG diagnostics">
+        <strong>Status: {rawEcgSession?.status ?? 'IDLE'}</strong>
+        <span>Session ID: {rawEcgSession?.sessionId ?? '—'}</span>
+        <span>Elapsed wall time: {Math.floor(rawEcgElapsedSeconds / 60).toString().padStart(2, '0')}:{Math.floor(rawEcgElapsedSeconds % 60).toString().padStart(2, '0')}</span>
+        <span>Packets: {rawEcgSession?.packetCount ?? 0} · samples: {rawEcgSession?.sampleCount ?? 0} · chunks: {rawEcgSession?.chunksEmitted ?? rawEcgChunks.chunkCount}</span>
+        <span>Last packet ID: {rawEcgSession?.lastPacketId ?? '—'} · missing: {rawEcgSession?.missingPacketCount ?? 0} · duplicates: {rawEcgSession?.duplicatePacketCount ?? 0} · out of order: {rawEcgSession?.outOfOrderPacketCount ?? 0}</span>
+        <span>Average samples/packet: {rawEcgSession?.averageSamplesPerPacket?.toFixed(1) ?? '—'} · raw min/max: {rawEcgSession?.minimumRawSample ?? rawEcgChunks.minRawSample ?? '—'} / {rawEcgSession?.maximumRawSample ?? rawEcgChunks.maxRawSample ?? '—'}</span>
+        <span>Bytes received: {rawEcgSession?.bytesReceived ?? rawEcgChunks.totalBytes} · buffered estimate: {rawEcgSession?.maxBufferedEstimateBytes ?? 0}/{rawEcgSession?.hardChunkBufferLimitBytes ?? '—'} bytes</span>
+        <span>Parse errors: {rawEcgSession?.parseErrorCount ?? rawEcgParseErrors.length} · stored packets/bytes: {rawEcgSession?.persistedPacketCount ?? 0}/{rawEcgSession?.persistedBytes ?? 0} · storage errors: {rawEcgSession?.storageErrorCount ?? 0}</span>
+        <span>Sample format: {rawEcgSession?.sampleFormat ?? 'UINT24_LE'} · unit: {rawEcgSession?.unit ?? 'UNKNOWN_VENDOR_UNIT'} · sample rate: {rawEcgSession?.sampleRateHz ?? 'unknown'}</span>
+        {rawEcgError && <span role="alert">Last raw ECG error: {rawEcgError.message}</span>}
+      </section>
+      <details className="jcvital-diagnostics">
+        <summary>Raw ECG chunk summaries · first {rawEcgChunks.firstThreeChunks.length}, last {rawEcgChunks.lastThreeChunks.length}</summary>
+        <strong>First chunks</strong><pre>{JSON.stringify(rawEcgChunks.firstThreeChunks, null, 2)}</pre>
+        <strong>Last chunks</strong><pre>{JSON.stringify(rawEcgChunks.lastThreeChunks, null, 2)}</pre>
+        <strong>Validation summary</strong><pre>{JSON.stringify(rawEcgValidation, null, 2)}</pre>
+      </details>
       <h3>Workout Test</h3>
       <div className="wearable-actions">
         <label className="workout-mode">Activity mode

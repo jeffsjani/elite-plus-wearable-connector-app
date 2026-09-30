@@ -182,6 +182,73 @@ export interface JCVitalV8WorkoutErrorEvent {
   receivedAt: string
 }
 
+export interface JCVitalV8RawEcgSession {
+  sessionId: string | null
+  deviceId: string | null
+  startedAt: string | null
+  stoppedAt: string | null
+  status: 'IDLE' | 'STARTING' | 'RUNNING' | 'STOPPING' | 'STOPPED' | 'ERROR' | 'DISCONNECTED'
+  packetCount: number
+  sampleCount: number
+  missingPacketCount: number
+  duplicatePacketCount: number
+  outOfOrderPacketCount: number
+  parseErrorCount: number
+  bytesReceived: number
+  chunksEmitted: number
+  droppedPacketCount: number
+  lastPacketId: number | null
+  averageSamplesPerPacket: number | null
+  minimumRawSample: number | null
+  maximumRawSample: number | null
+  maxBufferedEstimateBytes: number
+  hardChunkBufferLimitBytes: number
+  temporaryStorePath: string | null
+  persistedPacketCount: number
+  persistedBytes: number
+  storageErrorCount: number
+  sampleRateHz: null
+  sampleIntervalMs: null
+  sampleFormat: 'UINT24_LE_VENDOR_RAW'
+  unit: 'UNKNOWN_VENDOR_UNIT'
+  source?: WearableSource
+  parseErrors: Array<Record<string, unknown>>
+}
+
+export interface JCVitalV8RawEcgChunk {
+  signalType: 'ECG_RAW'
+  sessionId: string
+  deviceId: string | null
+  sequenceNumber: number
+  firstPacketId: number
+  lastPacketId: number
+  packetSequenceStart: number
+  packetSequenceEnd: number
+  packetIds: number[]
+  packetCount: number
+  receivedAtStart: string
+  receivedAtEnd: string
+  sampleRateHz: null
+  sampleIntervalMs: null
+  sampleFormat: 'UINT24_LE_VENDOR_RAW'
+  unit: 'UNKNOWN_VENDOR_UNIT'
+  samples: number[]
+  rawPacketBytes: number[][]
+  sampleCount: number
+  estimatedBytes: number
+  source: WearableSource
+  firmwareVersion: string | null
+  sdkVersion: string
+}
+
+export interface JCVitalV8RawEcgErrorEvent {
+  sessionId: string
+  message: string
+  receivedAt: string
+  byteCount?: number
+  rawPacketBytes?: number[]
+}
+
 export interface JCVitalV8LiveWorkoutSession {
   sessionId: string | null
   deviceId: string | null
@@ -267,6 +334,9 @@ export interface JCVitalV8Plugin {
   pauseWorkoutCapture(): Promise<JCVitalV8LiveWorkoutSession>
   resumeWorkoutCapture(): Promise<JCVitalV8LiveWorkoutSession>
   getWorkoutCaptureStatus(): Promise<JCVitalV8LiveWorkoutSession>
+  startRawEcg(): Promise<JCVitalV8RawEcgSession>
+  stopRawEcg(): Promise<JCVitalV8RawEcgSession>
+  getRawEcgStatus(): Promise<JCVitalV8RawEcgSession>
 
   addListener(event: 'jcvitalScanResult', listener: (device: JCVitalV8Device) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalConnectionState', listener: (event: JCVitalV8ConnectionStateEvent) => void): Promise<PluginListenerHandle>
@@ -282,6 +352,9 @@ export interface JCVitalV8Plugin {
   addListener(event: 'jcvitalWorkoutHeartRate', listener: (event: JCVitalV8WorkoutHeartRateEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalWorkoutError', listener: (event: JCVitalV8WorkoutErrorEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalWorkoutParseError', listener: (event: SerializableValue) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalRawEcgStatus', listener: (session: JCVitalV8RawEcgSession) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalRawEcgChunk', listener: (chunk: JCVitalV8RawEcgChunk) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalRawEcgError', listener: (error: JCVitalV8RawEcgErrorEvent) => void): Promise<PluginListenerHandle>
   removeAllListeners(): Promise<void>
 }
 

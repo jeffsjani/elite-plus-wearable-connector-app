@@ -96,6 +96,19 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         val parseErrors = mutableListOf<Map<String, Any?>>()
     }
 
+    private class RawEcgCapture(
+        val session: JCVitalV8RawEcgSession,
+        var startCallback: ((Map<String, Any?>?, JCVitalV8Exception?) -> Unit)?,
+        val packetStore: JCVitalV8RawEcgPacketStore,
+    ) {
+        var stopCallback: ((Map<String, Any?>?, JCVitalV8Exception?) -> Unit)? = null
+        var startTimeout: Runnable? = null
+        var stopTimeout: Runnable? = null
+        var controlWriteFailed = false
+        var storageErrorCount = 0
+        val parseErrors = mutableListOf<Map<String, Any?>>()
+    }
+
     private val appContext = context.applicationContext
     private val main = Handler(Looper.getMainLooper())
     private val bluetoothManager = appContext.getSystemService(BluetoothManager::class.java)
@@ -137,6 +150,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     private var monitoringRequest: MonitoringRequest? = null
     private var workoutCapture: WorkoutCapture? = null
     private var lastWorkoutSession: Map<String, Any?>? = null
+    private var rawEcgCapture: RawEcgCapture? = null
+    private var lastRawEcgSession: Map<String, Any?>? = null
 
     private val deviceInfo = LinkedHashMap<String, Any?>()
     private var lastBattery: Map<String, Any?>? = null
@@ -317,6 +332,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         val hadLink = gatt != null
         Log.i(TAG, "disconnect requested (link=$hadLink)")
         endWorkoutForLinkLoss("Disconnected by user")
+        endRawEcgForLinkLoss("Disconnected by user")
         closeGatt()
         stateMachine.transition(JCVitalV8ConnectionState.DISCONNECTED, "user disconnect")
         failPendingWork(JCVitalV8Exception(JCVitalV8ErrorCode.CONNECTION_LOST, "Disconnected by user"))
@@ -343,6 +359,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                     val code = JCVitalV8Errors.forLinkDrop(state, status, userInitiated = false)
                     if (code == null) {
                         endWorkoutForLinkLoss("V8 disconnected")
+                        endRawEcgForLinkLoss("V8 disconnected")
                         closeGatt()
                         stateMachine.transition(JCVitalV8ConnectionState.DISCONNECTED, "gatt disconnected")
                     } else {
@@ -497,7 +514,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     /** V8 docs: RealTimeStep streams HR only while SetDeviceMeasurementWithType(AutoHeartRate) is open (>30 s). */
     fun startRealtime(measurementSeconds: Long, callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
         if (!requireReady(callback)) return@onMain
-        val blocked = JCVitalV8WorkoutGuard.blockedReason(workoutCapture?.session, realtimeSessionId != null, historicalRequest != null, monitoringRequest != null)
+        val blocked = JCVitalV8WorkoutGuard.blockedReason(workoutCapture?.session, realtimeSessionId != null, historicalRequest != null, monitoringRequest != null, rawEcgCapture != null)
         if (blocked != null) return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, blocked))
         val seconds = measurementSeconds.coerceIn(MIN_MEASUREMENT_SECONDS, MAX_MEASUREMENT_SECONDS)
         val sessionId = UUID.randomUUID().toString()
@@ -543,6 +560,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
             realtimeSessionId != null,
             historicalRequest != null,
             monitoringRequest != null,
+            rawEcgCapture != null,
         )
         if (blocked != null) return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, blocked))
         if (activityMode !in 0..14) {
@@ -628,6 +646,137 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         ?: lastWorkoutSession
         ?: idleWorkoutPayload()
 
+    fun startRawEcg(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
+        if (!requireReady(callback)) return@onMain
+        val blocked = JCVitalV8WorkoutGuard.blockedReason(
+            workoutCapture?.session,
+            realtimeSessionId != null,
+            historicalRequest != null,
+            monitoringRequest != null,
+            rawEcgCapture != null,
+        )
+        if (blocked != null) return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, blocked))
+        val sessionId = UUID.randomUUID().toString()
+        val packetStore = try {
+            JCVitalV8RawEcgPacketStore.create(appContext.cacheDir, sessionId)
+        } catch (error: Throwable) {
+            return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, "Could not create ECG session store: ${error.message}"))
+        }
+        val session = JCVitalV8RawEcgSession(
+            sessionId = sessionId,
+            deviceId = connectedDeviceId,
+            firmwareVersion = deviceInfo["firmwareVersion"] as? String,
+            startedAt = JCVitalV8Time.isoUtc(System.currentTimeMillis()),
+            source = linkedMapOf(
+                "connector" to "JCVITAL_NATIVE",
+                "provider" to "JCVITAL",
+                "deviceModel" to "PRO_V8",
+                "deviceId" to connectedDeviceId,
+                "firmwareVersion" to deviceInfo["firmwareVersion"],
+                "sdkVersion" to JCVitalV8EventNormalizer.SDK_VERSION,
+            ),
+        )
+        session.start()
+        val capture = RawEcgCapture(session, callback, packetStore)
+        rawEcgCapture = capture
+        emitRawEcgStatus(capture)
+        capture.startTimeout = Runnable {
+            if (rawEcgCapture === capture && session.status == JCVitalV8RawEcgSession.STATUS_STARTING) {
+                failRawEcgCapture(capture, "ECG start command write acknowledgment timed out")
+            }
+        }.also { main.postDelayed(it, COMMAND_TIMEOUT_MS) }
+
+        enqueue(
+            "SetDeviceMeasurementWithType(ECG,50000,true)",
+            BleSDK.SetDeviceMeasurementWithType(AutoTestMode.ECG, ECG_DEMO_DURATION_ARGUMENT, true),
+        ) { written -> if (!written) capture.controlWriteFailed = true }
+        enqueue("setECGRealtimeDuringHRVEnabled(true)", BleSDK.setECGRealtimeDuringHRVEnabled(true)) { written ->
+            if (!written || capture.controlWriteFailed) {
+                failRawEcgCapture(capture, "ECG start command write failed")
+            } else if (rawEcgCapture === capture && session.status == JCVitalV8RawEcgSession.STATUS_STARTING) {
+                capture.startTimeout?.let(main::removeCallbacks)
+                capture.startTimeout = null
+                session.markRunning()
+                val result = rawEcgPayload(capture)
+                capture.startCallback?.invoke(result, null)
+                capture.startCallback = null
+                emitRawEcgStatus(capture)
+            }
+        }
+    }
+
+    fun stopRawEcg(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
+        val capture = rawEcgCapture
+            ?: return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, "No raw ECG session is active"))
+        if (capture.session.status != JCVitalV8RawEcgSession.STATUS_RUNNING) {
+            return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, "Raw ECG session is not running"))
+        }
+        sessionStopCommands(capture, callback)
+    }
+
+    private fun sessionStopCommands(capture: RawEcgCapture, callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) {
+        capture.session.markStopping()
+        capture.controlWriteFailed = false
+        capture.stopCallback = callback
+        emitRawEcgStatus(capture)
+        capture.stopTimeout = Runnable {
+            failRawEcgCapture(capture, "ECG stop command write acknowledgment timed out")
+        }.also { main.postDelayed(it, COMMAND_TIMEOUT_MS) }
+        enqueue(
+            "SetDeviceMeasurementWithType(ECG,0,false)",
+            BleSDK.SetDeviceMeasurementWithType(AutoTestMode.ECG, 0, false),
+        ) { written -> if (!written) capture.controlWriteFailed = true }
+        enqueue("setECGRealtimeDuringHRVEnabled(false)", BleSDK.setECGRealtimeDuringHRVEnabled(false)) { written ->
+            if (!written || capture.controlWriteFailed) {
+                failRawEcgCapture(capture, "ECG stop command write failed")
+            } else if (rawEcgCapture === capture && capture.session.status == JCVitalV8RawEcgSession.STATUS_STOPPING) {
+                capture.stopTimeout?.let(main::removeCallbacks)
+                capture.stopTimeout = null
+                flushRawEcg(capture, capture.session.stop(JCVitalV8Time.isoUtc(System.currentTimeMillis())))
+                closeRawEcgStore(capture)
+                rawEcgCapture = null
+                val result = rawEcgPayload(capture)
+                lastRawEcgSession = result
+                emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_STATUS, result)
+                capture.stopCallback?.invoke(result, null)
+                capture.stopCallback = null
+            }
+        }
+    }
+
+    fun rawEcgStatus(): Map<String, Any?> = rawEcgCapture?.let(::rawEcgPayload)
+        ?: lastRawEcgSession
+        ?: linkedMapOf(
+            "sessionId" to null,
+            "deviceId" to connectedDeviceId,
+            "status" to JCVitalV8RawEcgSession.STATUS_IDLE,
+            "packetCount" to 0,
+            "sampleCount" to 0,
+            "missingPacketCount" to 0,
+            "duplicatePacketCount" to 0,
+            "outOfOrderPacketCount" to 0,
+            "parseErrorCount" to 0,
+            "bytesReceived" to 0,
+            "chunksEmitted" to 0,
+            "sampleRateHz" to null,
+            "sampleIntervalMs" to null,
+            "sampleFormat" to JCVitalV8RawEcgSession.SAMPLE_FORMAT,
+            "unit" to JCVitalV8RawEcgSession.UNKNOWN_UNIT,
+            "temporaryStorePath" to null,
+            "persistedPacketCount" to 0,
+            "persistedBytes" to 0,
+            "storageErrorCount" to 0,
+            "parseErrors" to emptyList<Any>(),
+        )
+
+    private fun rawEcgPayload(capture: RawEcgCapture): Map<String, Any?> = LinkedHashMap(capture.session.toMap()).apply {
+        put("parseErrors", capture.parseErrors.toList())
+        put("temporaryStorePath", capture.packetStore.file.absolutePath)
+        put("persistedPacketCount", capture.packetStore.packetCount)
+        put("persistedBytes", capture.packetStore.byteCount)
+        put("storageErrorCount", capture.storageErrorCount)
+    }
+
     private fun idleWorkoutPayload(): Map<String, Any?> = linkedMapOf(
         "sessionId" to null,
         "deviceId" to connectedDeviceId,
@@ -670,7 +819,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
 
     fun requestMonitoringConfiguration(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
         if (!requireReady(callback)) return@onMain
-        val blocked = JCVitalV8WorkoutGuard.blockedReason(workoutCapture?.session, realtimeSessionId != null, historicalRequest != null, monitoringRequest != null)
+        val blocked = JCVitalV8WorkoutGuard.blockedReason(workoutCapture?.session, realtimeSessionId != null, historicalRequest != null, monitoringRequest != null, rawEcgCapture != null)
         if (blocked != null) {
             return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, blocked))
         }
@@ -686,7 +835,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit,
     ) = onMain {
         if (!requireReady(callback)) return@onMain
-        val blocked = JCVitalV8WorkoutGuard.blockedReason(workoutCapture?.session, realtimeSessionId != null, historicalRequest != null, monitoringRequest != null)
+        val blocked = JCVitalV8WorkoutGuard.blockedReason(workoutCapture?.session, realtimeSessionId != null, historicalRequest != null, monitoringRequest != null, rawEcgCapture != null)
         if (blocked != null) {
             return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, blocked))
         }
@@ -745,6 +894,11 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     private fun handleNotification(bytes: ByteArray) {
         if (bytes.isEmpty()) return
         val commandByte = String.format("0x%02X", bytes[0].toInt() and 0xFF)
+        if ((bytes[0].toInt() and 0xFF) == JCVitalV8RawEcgSession.ECG_COMMAND_BYTE &&
+            bytes.size > ECG_STREAM_MIN_NOTIFICATION_BYTES && rawEcgCapture != null
+        ) {
+            handleRawEcgNotification(bytes)
+        }
         val vendorMaps = mutableListOf<Map<String?, Any?>>()
         try {
             BleSDK.DataParsingWithData(bytes, object : DataListener2301 {
@@ -756,6 +910,21 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
             })
         } catch (t: Throwable) {
             Log.w(TAG, "SDK parse failed for $commandByte (${bytes.size} bytes, mtu=$negotiatedMtu): ${t.javaClass.simpleName}")
+            if ((bytes[0].toInt() and 0xFF) == JCVitalV8RawEcgSession.ECG_COMMAND_BYTE) {
+                rawEcgCapture?.let { capture ->
+                    capture.session.recordSdkParseError()
+                    val error = linkedMapOf<String, Any?>(
+                        "sessionId" to capture.session.sessionId,
+                        "vendorDataType" to BleConst.GetECG,
+                        "message" to "SDK parse failed (${t.javaClass.simpleName})",
+                        "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()),
+                        "rawPacketBytes" to bytes.map { it.toInt() and 0xFF },
+                    )
+                    capture.parseErrors += error
+                    emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_ERROR, error)
+                    emitRawEcgStatus(capture)
+                }
+            }
             emitError(JCVitalV8ErrorCode.RESPONSE_PARSE_FAILED, "SDK could not parse packet $commandByte (${bytes.size} bytes)")
             return
         }
@@ -786,6 +955,9 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
             return
         }
         for (event in events) {
+            if (event.name == JCVitalV8EventNormalizer.EVENT_RAW_VENDOR_DATA &&
+                dataType == BleConst.GetECG && rawEcgCapture != null
+            ) continue
             when (event.name) {
                 JCVitalV8EventNormalizer.EVENT_DEVICE_INFO -> {
                     deviceInfo.putAll(event.payload)
@@ -803,6 +975,124 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         handleHistoricalResponse(dataType, vendor, events)
         handleMonitoringResponse(dataType, vendor)
         if (dataType != null) resolveResponse(dataType)
+    }
+
+    private fun handleRawEcgNotification(notification: ByteArray) {
+        val capture = rawEcgCapture ?: return
+        val receivedAt = JCVitalV8Time.isoUtc(System.currentTimeMillis())
+        val result = capture.session.acceptNotification(notification, receivedAt)
+        result.parseError?.let { error ->
+            capture.parseErrors += error
+            emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_ERROR, error)
+        }
+        result.chunk?.let { flushRawEcg(capture, it) }
+        emitRawEcgStatus(capture)
+    }
+
+    private fun emitRawEcgStatus(capture: RawEcgCapture) {
+        val payload = rawEcgPayload(capture)
+        if (rawEcgCapture !== capture && capture.session.status != JCVitalV8RawEcgSession.STATUS_RUNNING) {
+            lastRawEcgSession = payload
+        }
+        emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_STATUS, payload)
+    }
+
+    private fun flushRawEcg(capture: RawEcgCapture, chunk: Map<String, Any?>?) {
+        if (chunk == null) return
+        try {
+            @Suppress("UNCHECKED_CAST")
+            capture.packetStore.appendPackets(chunk["rawPacketBytes"] as List<List<Int>>)
+        } catch (error: Throwable) {
+            capture.storageErrorCount++
+            capture.session.recordSdkParseError()
+            val storageError = linkedMapOf<String, Any?>(
+                "sessionId" to capture.session.sessionId,
+                "message" to "Could not persist raw ECG chunk: ${error.message}",
+                "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()),
+                "chunkSequence" to chunk["sequenceNumber"],
+            )
+            capture.parseErrors += storageError
+            emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_ERROR, storageError)
+        }
+        emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_CHUNK, chunk)
+    }
+
+    private fun closeRawEcgStore(capture: RawEcgCapture) {
+        try {
+            capture.packetStore.close()
+        } catch (error: Throwable) {
+            capture.storageErrorCount++
+            capture.session.recordSdkParseError()
+            capture.parseErrors += linkedMapOf(
+                "sessionId" to capture.session.sessionId,
+                "message" to "Could not close raw ECG store: ${error.message}",
+                "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()),
+            )
+        }
+    }
+
+    private fun failRawEcgCapture(capture: RawEcgCapture, message: String) {
+        if (rawEcgCapture !== capture) return
+        capture.startTimeout?.let(main::removeCallbacks)
+        capture.stopTimeout?.let(main::removeCallbacks)
+        val chunk = capture.session.fail(JCVitalV8Time.isoUtc(System.currentTimeMillis()))
+        flushRawEcg(capture, chunk)
+        closeRawEcgStore(capture)
+        BleSDK.SetDeviceMeasurementWithType(AutoTestMode.ECG, 0, false)
+        BleSDK.setECGRealtimeDuringHRVEnabled(false)
+        rawEcgCapture = null
+        val error = linkedMapOf<String, Any?>("sessionId" to capture.session.sessionId, "message" to message, "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()))
+        capture.parseErrors += error
+        emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_ERROR, error)
+        val result = rawEcgPayload(capture)
+        lastRawEcgSession = result
+        emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_STATUS, result)
+        capture.startCallback?.invoke(null, JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, message))
+        capture.startCallback = null
+        capture.stopCallback?.invoke(null, JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, message))
+        capture.stopCallback = null
+    }
+
+    private fun endRawEcgForLinkLoss(reason: String) {
+        val capture = rawEcgCapture ?: return
+        capture.startTimeout?.let(main::removeCallbacks)
+        capture.stopTimeout?.let(main::removeCallbacks)
+        BleSDK.SetDeviceMeasurementWithType(AutoTestMode.ECG, 0, false)
+        BleSDK.setECGRealtimeDuringHRVEnabled(false)
+        val chunk = capture.session.disconnect(JCVitalV8Time.isoUtc(System.currentTimeMillis()))
+        flushRawEcg(capture, chunk)
+        closeRawEcgStore(capture)
+        rawEcgCapture = null
+        val error = linkedMapOf<String, Any?>("sessionId" to capture.session.sessionId, "message" to reason, "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()))
+        emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_ERROR, error)
+        val result = rawEcgPayload(capture)
+        lastRawEcgSession = result
+        emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_STATUS, result)
+        capture.startCallback?.invoke(null, JCVitalV8Exception(JCVitalV8ErrorCode.CONNECTION_LOST, reason))
+        capture.startCallback = null
+        capture.stopCallback?.invoke(null, JCVitalV8Exception(JCVitalV8ErrorCode.CONNECTION_LOST, reason))
+        capture.stopCallback = null
+    }
+
+    private fun endRawEcgForError(reason: String) {
+        val capture = rawEcgCapture ?: return
+        capture.startTimeout?.let(main::removeCallbacks)
+        capture.stopTimeout?.let(main::removeCallbacks)
+        BleSDK.SetDeviceMeasurementWithType(AutoTestMode.ECG, 0, false)
+        BleSDK.setECGRealtimeDuringHRVEnabled(false)
+        flushRawEcg(capture, capture.session.fail(JCVitalV8Time.isoUtc(System.currentTimeMillis())))
+        closeRawEcgStore(capture)
+        rawEcgCapture = null
+        val error = linkedMapOf<String, Any?>("sessionId" to capture.session.sessionId, "message" to reason, "receivedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()))
+        capture.parseErrors += error
+        emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_ERROR, error)
+        val result = rawEcgPayload(capture)
+        lastRawEcgSession = result
+        emit(JCVitalV8EventNormalizer.EVENT_RAW_ECG_STATUS, result)
+        capture.startCallback?.invoke(null, JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, reason))
+        capture.startCallback = null
+        capture.stopCallback?.invoke(null, JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, reason))
+        capture.stopCallback = null
     }
 
     private fun handleWorkoutResponse(dataType: String?, vendor: Map<String?, Any?>) {
@@ -1179,6 +1469,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     private fun fail(code: JCVitalV8ErrorCode, message: String) {
         Log.w(TAG, "$code: $message")
         endWorkoutForError(message)
+        endRawEcgForError(message)
         closeGatt()
         emitError(code, message)
         // Leave INITIALIZING before completing pending work so the handshake callback cannot re-enter fail().
@@ -1243,6 +1534,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         }
         stopScanInternal("released")
         endWorkoutForLinkLoss("Plugin released")
+        endRawEcgForLinkLoss("Plugin released")
         closeGatt()
         stateMachine.transition(JCVitalV8ConnectionState.DISCONNECTED, "released")
         failPendingWork(JCVitalV8Exception(JCVitalV8ErrorCode.CONNECTION_LOST, "Plugin released"))
@@ -1328,6 +1620,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         private const val HISTORY_MODE_CONTINUE: Byte = 0x02
         private const val WRITE_TIMEOUT_MS = 3_000L
         private const val DEFAULT_ATT_MTU = 23
+        private const val ECG_STREAM_MIN_NOTIFICATION_BYTES = 17
+        private const val ECG_DEMO_DURATION_ARGUMENT = 50_000L
         // V8 reports MTUlength=244 in its SetDeviceTime response; 247 ATT MTU = 244-byte payload.
         private const val REQUESTED_MTU = 247
 

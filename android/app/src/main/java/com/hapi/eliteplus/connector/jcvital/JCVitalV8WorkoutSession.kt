@@ -128,12 +128,14 @@ object JCVitalV8WorkoutGuard {
         realtimeActive: Boolean,
         historicalSyncActive: Boolean,
         monitoringReadActive: Boolean,
+        rawEcgActive: Boolean = false,
     ): String? = when {
         workout != null && workout.status !in setOf(
             JCVitalV8WorkoutSession.STATUS_STOPPED,
             JCVitalV8WorkoutSession.STATUS_ERROR,
             JCVitalV8WorkoutSession.STATUS_DISCONNECTED,
         ) -> "Workout capture already active"
+        rawEcgActive -> "Raw ECG session already active"
         realtimeActive -> "Manual realtime measurement already active"
         historicalSyncActive -> "Historical sync already active"
         monitoringReadActive -> "Monitoring configuration request already active"
