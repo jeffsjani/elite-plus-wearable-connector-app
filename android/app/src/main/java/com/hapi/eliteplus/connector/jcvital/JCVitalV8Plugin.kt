@@ -172,6 +172,25 @@ class JCVitalV8Plugin : Plugin() {
     }
 
     @PluginMethod
+    fun startRawPpg(call: PluginCall) {
+        manager.startRawPpg { result, error ->
+            if (error != null) reject(call, error) else call.resolve(toJsObject(result!!))
+        }
+    }
+
+    @PluginMethod
+    fun stopRawPpg(call: PluginCall) {
+        manager.stopRawPpg { result, error ->
+            if (error != null) reject(call, error) else call.resolve(toJsObject(result!!))
+        }
+    }
+
+    @PluginMethod
+    fun getRawPpgStatus(call: PluginCall) {
+        call.resolve(toJsObject(manager.rawPpgStatus()))
+    }
+
+    @PluginMethod
     fun syncHistoricalHeartRate(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalHeartRate)
 
     @PluginMethod

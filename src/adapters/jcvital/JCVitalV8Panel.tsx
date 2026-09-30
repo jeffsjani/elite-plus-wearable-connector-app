@@ -15,6 +15,8 @@ import {
   type JCVitalV8PermissionResult,
   type JCVitalV8RawEcgErrorEvent,
   type JCVitalV8RawEcgSession,
+  type JCVitalV8RawPpgErrorEvent,
+  type JCVitalV8RawPpgSession,
   type JCVitalV8WorkoutErrorEvent,
   type JCVitalV8WorkoutHeartRateEvent,
 } from './jcvitalV8Bridge'
@@ -35,6 +37,8 @@ import {
 import { phase3bDisabledReason } from './Phase3BBridgeStatus'
 import { workoutStartDisabledReason, workoutStopDisabledReason } from './WorkoutCaptureGuard'
 import { rawEcgStartDisabledReason, rawEcgStopDisabledReason } from './RawEcgCaptureGuard'
+import { rawPpgStartDisabledReason, rawPpgStopDisabledReason } from './RawPpgCaptureGuard'
+import { buildRawPpgValidation, EMPTY_RAW_PPG_CHUNK_SUMMARY, includeRawPpgChunk, type RawPpgChunkSummary } from './RawPpgDiagnostics'
 import { buildRawEcgValidation, EMPTY_RAW_ECG_CHUNK_SUMMARY, includeRawEcgChunk, type RawEcgChunkSummary } from './RawEcgDiagnostics'
 import {
   buildWorkoutLiveValidation,
@@ -76,6 +80,11 @@ export function JCVitalV8Panel() {
   const [rawEcgParseErrors, setRawEcgParseErrors] = useState<Array<Record<string, unknown>>>([])
   const [rawEcgError, setRawEcgError] = useState<JCVitalV8RawEcgErrorEvent | null>(null)
   const [rawEcgClock, setRawEcgClock] = useState(Date.now())
+  const [rawPpgSession, setRawPpgSession] = useState<JCVitalV8RawPpgSession | null>(null)
+  const [rawPpgChunks, setRawPpgChunks] = useState<RawPpgChunkSummary>(EMPTY_RAW_PPG_CHUNK_SUMMARY)
+  const [rawPpgParseErrors, setRawPpgParseErrors] = useState<Array<Record<string, unknown>>>([])
+  const [rawPpgError, setRawPpgError] = useState<JCVitalV8RawPpgErrorEvent | null>(null)
+  const [rawPpgClock, setRawPpgClock] = useState(Date.now())
   const [historicalRuns, setHistoricalRuns] = useState<Partial<Record<HistoricalFeedKey, HistoricalFeedRun>>>({})
   const [monitoringRun, setMonitoringRun] = useState<MonitoringFeedRun | undefined>()
   const [phase3bRuns, setPhase3bRuns] = useState<Partial<Record<Exclude<Phase3BFeedKey, 'sleep'>, HistoricalFeedRun>>>({})
@@ -128,6 +137,18 @@ export function JCVitalV8Panel() {
         setRawEcgError(error)
         setRawEcgParseErrors((current) => [...current, error as unknown as Record<string, unknown>])
       }),
+      JCVitalV8.addListener('jcvitalRawPpgStatus', (session) => {
+        setRawPpgSession(session)
+        if (['STARTING', 'RUNNING', 'STOPPING'].includes(session.status)) setActiveSync((current) => current ?? 'raw-ppg')
+        else setActiveSync((current) => current?.startsWith('raw-ppg') ? null : current)
+      }),
+      JCVitalV8.addListener('jcvitalRawPpgChunk', (chunk) => {
+        setRawPpgChunks((current) => includeRawPpgChunk(current, chunk))
+      }),
+      JCVitalV8.addListener('jcvitalRawPpgError', (error) => {
+        setRawPpgError(error)
+        setRawPpgParseErrors((current) => [...current, error as unknown as Record<string, unknown>])
+      }),
     ]
     void JCVitalV8.isAvailable().then((result) => setPluginAvailable(result.available)).catch(() => setPluginAvailable(false))
     void JCVitalV8.getPermissionStatus().then(setPermission).catch((error) => setMessage(errorText(error)))
@@ -139,6 +160,10 @@ export function JCVitalV8Panel() {
     void JCVitalV8.getRawEcgStatus().then((session) => {
       setRawEcgSession(session)
       if (['STARTING', 'RUNNING', 'STOPPING'].includes(session.status)) setActiveSync((current) => current ?? 'raw-ecg')
+    }).catch(() => undefined)
+    void JCVitalV8.getRawPpgStatus().then((session) => {
+      setRawPpgSession(session)
+      if (['STARTING', 'RUNNING', 'STOPPING'].includes(session.status)) setActiveSync((current) => current ?? 'raw-ppg')
     }).catch(() => undefined)
     return () => { handles.forEach((handle) => void handle.then((h) => h.remove())) }
   }, [])
@@ -154,6 +179,12 @@ export function JCVitalV8Panel() {
     const timer = window.setInterval(() => setRawEcgClock(Date.now()), 1000)
     return () => window.clearInterval(timer)
   }, [rawEcgSession?.status, rawEcgSession?.sessionId])
+
+  useEffect(() => {
+    if (!rawPpgSession || !['STARTING', 'RUNNING', 'STOPPING'].includes(rawPpgSession.status)) return
+    const timer = window.setInterval(() => setRawPpgClock(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [rawPpgSession?.status, rawPpgSession?.sessionId])
 
   async function run(action: () => Promise<unknown>): Promise<void> {
     setBusy(true)
@@ -347,6 +378,39 @@ export function JCVitalV8Panel() {
     }
   }
 
+  async function startRawPpg(): Promise<void> {
+    setRawPpgChunks(EMPTY_RAW_PPG_CHUNK_SUMMARY)
+    setRawPpgParseErrors([])
+    setRawPpgError(null)
+    setActiveSync('raw-ppg')
+    setBusy(true)
+    setMessage('')
+    try {
+      setRawPpgSession(await JCVitalV8.startRawPpg())
+    } catch (error) {
+      setActiveSync(null)
+      setMessage(errorText(error))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function stopRawPpg(): Promise<void> {
+    setActiveSync('raw-ppg:stopping')
+    setBusy(true)
+    setMessage('')
+    try {
+      setRawPpgSession(await JCVitalV8.stopRawPpg())
+      setActiveSync(null)
+    } catch (error) {
+      setMessage(errorText(error))
+      try { setRawPpgSession(await JCVitalV8.getRawPpgStatus()) } catch { /* keep last state */ }
+      setActiveSync((current) => current === 'raw-ppg:stopping' ? 'raw-ppg' : current)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function exportValidationReport(): Promise<void> {
     setExportStatus('EXPORTING')
     setExportLocation(null)
@@ -369,6 +433,7 @@ export function JCVitalV8Panel() {
           workoutLiveValidation,
           ecgStartDiagnostics: rawEcgSession?.ecgStartDiagnostics ?? null,
           rawEcgValidation: buildRawEcgValidation(rawEcgSession, rawEcgChunks, rawEcgParseErrors),
+          rawPpgValidation: buildRawPpgValidation(rawPpgSession, rawPpgChunks, rawPpgParseErrors),
         },
       })
       const filename = `jcvital-v8-phase3abc-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
@@ -480,6 +545,23 @@ export function JCVitalV8Panel() {
     ? Math.max(0, ((rawEcgSession.stoppedAt ? Date.parse(rawEcgSession.stoppedAt) : rawEcgClock) - Date.parse(rawEcgSession.startedAt)) / 1000)
     : 0
   const rawEcgValidation = buildRawEcgValidation(rawEcgSession, rawEcgChunks, rawEcgParseErrors)
+  const rawPpgGate = {
+    pluginAvailable,
+    startMethodAvailable: typeof JCVitalV8.startRawPpg === 'function',
+    stopMethodAvailable: typeof JCVitalV8.stopRawPpg === 'function',
+    connectionState: state,
+    activeSync,
+    manualMeasurementActive: realtime,
+    workoutStatus: workoutSession?.status ?? 'IDLE',
+    rawEcgStatus: rawEcgSession?.status ?? 'IDLE',
+    rawPpgStatus: rawPpgSession?.status ?? 'IDLE',
+  }
+  const rawPpgStartReason = rawPpgStartDisabledReason(rawPpgGate)
+  const rawPpgStopReason = rawPpgStopDisabledReason(rawPpgGate)
+  const rawPpgElapsedSeconds = rawPpgSession?.startedAt
+    ? Math.max(0, ((rawPpgSession.stoppedAt ? Date.parse(rawPpgSession.stoppedAt) : rawPpgClock) - Date.parse(rawPpgSession.startedAt)) / 1000)
+    : 0
+  const rawPpgValidation = buildRawPpgValidation(rawPpgSession, rawPpgChunks, rawPpgParseErrors)
   const otherActiveMeasurement = activeSync ?? (realtime ? 'manual HR measurement' : null)
   const workoutStatus = workoutSession?.status ?? 'IDLE'
   const workoutActive = ['STARTING', 'RUNNING', 'PAUSED', 'STOPPING'].includes(workoutStatus)
@@ -585,12 +667,12 @@ export function JCVitalV8Panel() {
       <h3>Raw Capture</h3>
       <div className="wearable-actions">
         <div className="diagnostic-control">
-          <button type="button" disabled title="Phase 3D-B PPG validation pending">Start PPG</button>
-          <small>Disabled: Phase 3D-B PPG validation pending</small>
+          <button type="button" disabled={busy || rawPpgStartReason !== null} title={rawPpgStartReason ?? 'Start PPG Workflow Capture'} onClick={() => void startRawPpg()}>Start PPG</button>
+          {rawPpgStartReason && <small>Disabled: {rawPpgStartReason}</small>}
         </div>
         <div className="diagnostic-control">
-          <button type="button" disabled title="Phase 3D-B PPG validation pending">Stop PPG</button>
-          <small>Disabled: Phase 3D-B PPG validation pending</small>
+          <button type="button" disabled={busy || rawPpgStopReason !== null} title={rawPpgStopReason ?? 'Stop PPG Workflow Capture'} onClick={() => void stopRawPpg()}>Stop PPG</button>
+          {rawPpgStopReason && <small>Disabled: {rawPpgStopReason}</small>}
         </div>
         <div className="diagnostic-control">
           <button type="button" disabled={rawEcgStartReason !== null || busy} title={rawEcgStartReason ?? 'Start raw ECG capture'} onClick={() => void startRawEcg()}>Start ECG</button>
@@ -601,6 +683,23 @@ export function JCVitalV8Panel() {
           {rawEcgStopReason && <small>Disabled: {rawEcgStopReason}</small>}
         </div>
       </div>
+      <section className="workout-live-diagnostics" aria-label="PPG workflow capture diagnostics">
+        <strong>PPG Workflow Capture · {rawPpgSession?.status ?? 'IDLE'}</strong>
+        <span>Session ID: {rawPpgSession?.sessionId ?? '—'}</span>
+        <span>Elapsed time: {Math.floor(rawPpgElapsedSeconds / 60).toString().padStart(2, '0')}:{Math.floor(rawPpgElapsedSeconds % 60).toString().padStart(2, '0')}</span>
+        <span>Packets: {rawPpgSession?.packetCount ?? 0} · chunks: {rawPpgSession?.chunkCount ?? rawPpgChunks.chunkCount} · bytes: {rawPpgSession?.bytesReceived ?? rawPpgChunks.totalBytes}</span>
+        <span>Notification lengths: 153={rawPpgSession?.notificationLengthCounts['153'] ?? 0} · 203={rawPpgSession?.notificationLengthCounts['203'] ?? 0} · unsupported={rawPpgSession?.notificationLengthCounts.other ?? 0}</span>
+        <span>First packet: {rawPpgSession?.firstPacketAt ?? '—'} · last packet: {rawPpgSession?.lastPacketAt ?? '—'}</span>
+        <span>Type-119 callbacks: {rawPpgSession?.vendorDataType119Count ?? rawPpgChunks.vendorDataType119Count} · decoded values: {rawPpgSession?.decodedSampleCount ?? rawPpgChunks.decodedSampleCount}</span>
+        <span>153-byte decoded values: {rawPpgSession?.rawSampleDiagnostics['153']?.decodedSampleCount ?? 0} · min/max: {rawPpgSession?.rawSampleDiagnostics['153']?.minimumRawDecodedValue ?? '—'} / {rawPpgSession?.rawSampleDiagnostics['153']?.maximumRawDecodedValue ?? '—'}</span>
+        <span>203-byte decoded values: {rawPpgSession?.rawSampleDiagnostics['203']?.decodedSampleCount ?? 0} · min/max: {rawPpgSession?.rawSampleDiagnostics['203']?.minimumRawDecodedValue ?? '—'} / {rawPpgSession?.rawSampleDiagnostics['203']?.maximumRawDecodedValue ?? '—'}</span>
+        <span>Decoded raw min/max: {rawPpgSession?.minimumRawDecodedValue ?? '—'} / {rawPpgSession?.maximumRawDecodedValue ?? '—'} · parse errors: {rawPpgSession?.parseErrorCount ?? rawPpgParseErrors.length}</span>
+        {rawPpgError && <span role="alert">Last PPG workflow error: {rawPpgError.message}</span>}
+      </section>
+      <details className="jcvital-diagnostics">
+        <summary>PPG workflow validation · first {rawPpgChunks.firstThreeChunks.length}, last {rawPpgChunks.lastThreeChunks.length}</summary>
+        <strong>Validation summary</strong><pre>{JSON.stringify(rawPpgValidation, null, 2)}</pre>
+      </details>
       <section className="workout-live-diagnostics" aria-label="Raw ECG diagnostics">
         <strong>Status: {rawEcgSession?.status ?? 'IDLE'}</strong>
         <span>Session ID: {rawEcgSession?.sessionId ?? '—'}</span>

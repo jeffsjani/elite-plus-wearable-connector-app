@@ -298,6 +298,82 @@ export interface JCVitalV8RawEcgErrorEvent {
 
 export interface JCVitalV8LiveWorkoutSession {
   sessionId: string | null
+export interface JCVitalV8RawPpgSession {
+  sessionId: string | null
+  deviceId: string | null
+  startedAt: string | null
+  stoppedAt: string | null
+  status: 'IDLE' | 'STARTING' | 'RUNNING' | 'STOPPING' | 'STOPPED' | 'ERROR' | 'DISCONNECTED'
+  signalType: 'PPG_WORKFLOW_RAW_VENDOR'
+  packetCount: number
+  chunkCount: number
+  bytesReceived: number
+  bufferHighWaterMark: number
+  parseErrorCount: number
+  notificationLengthCounts: Record<'153' | '203' | 'other', number>
+  notificationLengthsExactCounts: Record<string, number>
+  vendorDataType119Count: number
+  firstPacketAt: string | null
+  lastPacketAt: string | null
+  decodedSampleCount: number
+  minimumRawDecodedValue: number | null
+  maximumRawDecodedValue: number | null
+  sampleRateHz: null
+  sampleIntervalMs: null
+  unit: 'UNKNOWN_VENDOR_UNIT'
+  sampleFormat: 'UNKNOWN_VENDOR_LAYOUT'
+  rawSampleDiagnostics: Record<string, {
+    packetCount: number
+    decodedSampleCount: number
+    minimumRawDecodedValue: number | null
+    maximumRawDecodedValue: number | null
+  }>
+  decodedFieldNames: string[]
+  vendorDerivedFields: Array<Record<string, unknown>>
+  temporaryStorePath: string | null
+  persistedPacketCount: number
+  persistedBytes: number
+  storageErrorCount: number
+  source?: WearableSource
+  parseErrors: Array<Record<string, unknown>>
+}
+
+export interface JCVitalV8RawPpgChunk {
+  signalType: 'PPG_WORKFLOW_RAW_VENDOR'
+  sessionId: string
+  sequenceNumber: number
+  receivedAtStart: string
+  receivedAtEnd: string
+  sampleRateHz: null
+  sampleIntervalMs: null
+  unit: 'UNKNOWN_VENDOR_UNIT'
+  packets: Array<{
+    sessionId: string
+    sequenceNumber: number
+    receivedAt: string
+    notificationLength: number
+    vendorCommandByte: number
+    originalBytes: number[]
+    vendorDataType119: boolean
+    vendorParserOutput: Array<Record<string, unknown>>
+    decodedSampleCount: number
+  }>
+  packetCount: number
+  bytesReceived: number
+  decodedSampleCount: number
+  vendorDataType119Count: number
+  decodedFieldNames: string[]
+  vendorDerivedFields: Array<Record<string, unknown>>
+  estimatedBytes: number
+}
+
+export interface JCVitalV8RawPpgErrorEvent {
+  sessionId: string
+  message: string
+  receivedAt: string
+  parseErrorCount: number
+}
+
   deviceId: string | null
   activityType: string | null
   vendorActivityMode: number | null
@@ -386,6 +462,9 @@ export interface JCVitalV8Plugin {
   getRawEcgStatus(): Promise<JCVitalV8RawEcgSession>
 
   addListener(event: 'jcvitalScanResult', listener: (device: JCVitalV8Device) => void): Promise<PluginListenerHandle>
+  startRawPpg(): Promise<JCVitalV8RawPpgSession>
+  stopRawPpg(): Promise<JCVitalV8RawPpgSession>
+  getRawPpgStatus(): Promise<JCVitalV8RawPpgSession>
   addListener(event: 'jcvitalConnectionState', listener: (event: JCVitalV8ConnectionStateEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalDeviceInfo', listener: (info: JCVitalV8DeviceInfo) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalBattery', listener: (battery: JCVitalV8Battery) => void): Promise<PluginListenerHandle>
@@ -404,5 +483,8 @@ export interface JCVitalV8Plugin {
   addListener(event: 'jcvitalRawEcgError', listener: (error: JCVitalV8RawEcgErrorEvent) => void): Promise<PluginListenerHandle>
   removeAllListeners(): Promise<void>
 }
+  addListener(event: 'jcvitalRawPpgStatus', listener: (session: JCVitalV8RawPpgSession) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalRawPpgChunk', listener: (chunk: JCVitalV8RawPpgChunk) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalRawPpgError', listener: (error: JCVitalV8RawPpgErrorEvent) => void): Promise<PluginListenerHandle>
 
 export const JCVitalV8 = registerPlugin<JCVitalV8Plugin>('JCVitalV8')
