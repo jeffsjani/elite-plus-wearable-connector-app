@@ -2,6 +2,13 @@
 
 ## Status
 
+**Update (V8 native SDK phase 1):** the vendor SDK is now in
+`vendor/jcvital/android/sdk/` and a native Android bridge exists:
+`android/app/src/main/java/com/hapi/eliteplus/connector/jcvital/` (Capacitor
+plugin `JCVitalV8`, TS contract `jcvitalV8Bridge.ts`). It covers scan, connect,
+device info, battery, and realtime heart rate only. The `EliteJCVital`
+contract in `jcvitalBridge.ts` below is still unimplemented natively.
+
 Architecture and TypeScript-side implementation only. **No native Android
 bridge exists yet.** See "Blockers" below before extending this adapter.
 

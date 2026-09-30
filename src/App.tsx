@@ -23,6 +23,7 @@ import type { QueueStats } from './services/storage/ObservationQueueStore'
 import { RookConnectionsPanel } from './services/rook/RookConnectionsPanel'
 import { AppleHealthPanel } from './adapters/apple-health/AppleHealthPanel'
 import { HealthConnectPanel } from './adapters/health-connect/HealthConnectPanel'
+import { JCVitalV8Panel } from './adapters/jcvital/JCVitalV8Panel'
 
 const appVersion = '0.0.0'
 
@@ -330,6 +331,7 @@ function App() {
         <RookConnectionsPanel key={user.id} />
         {getPlatform() === 'ios' && <AppleHealthPanel key={`apple-${user.id}`} ownerUserId={user.id} />}
         {getPlatform() === 'android' && <HealthConnectPanel key={`health-${user.id}`} ownerUserId={user.id} />}
+        {getPlatform() === 'android' && <JCVitalV8Panel key={`jcvital-${user.id}`} />}
         {queueStats && <div className="queue-panel"><h2>Sync Queue</h2><div className="queue-stats"><span>Pending: <strong>{queueStats.pending}</strong></span><span>Retrying: <strong>{queueStats.retrying}</strong></span><span>Failed: <strong>{queueStats.failed}</strong></span></div><p>Oldest pending: {queueStats.oldestPendingAgeMs === null ? 'None' : `${Math.round(queueStats.oldestPendingAgeMs / 60000)} minutes`}</p><p>Last successful sync: {queueStats.lastSuccessfulUploadAt ?? 'Not available'}</p>{queueStats.warnings.length > 0 && <p className="warning-message">Queue diagnostics: {queueStats.warnings.join(', ')}</p>}<button type="button" onClick={() => void syncNow()} disabled={isBusy}>Sync Now</button></div>}
         {testResult && <div className="result-panel"><h2>Connector Connection Test</h2><p>Accepted: {testResult.accepted}</p><p>Duplicate: {testResult.duplicate}</p><p>Rejected: {testResult.rejected}</p><p>Server: Connected</p><p>Timestamp: {testResult.serverTimestamp}</p></div>}
         {import.meta.env.DEV && <aside className="diagnostics"><h2>Development diagnostics</h2><button type="button" onClick={() => void runDuplicateTest()} disabled={isBusy || !lastTestObservation}>Resubmit Last Observation</button><button type="button" onClick={() => void runQueueBatchTest()} disabled={isBusy || !registration}>Run 100 Queue Test</button><button type="button" onClick={() => void runQueueDuplicateRetryTest()} disabled={isBusy || !lastQueueObservations.length}>Retry Last 100 Queue Test</button><button type="button" onClick={() => void runBatchTest()} disabled={isBusy || !registration}>Run 500 Observation Test</button>{queueTestResult && <p>100 queue test: accepted {queueTestResult.accepted}; duplicate {queueTestResult.duplicate}; rejected {queueTestResult.rejected}</p>}{queueDuplicateResult && <p>100 queue retry: accepted {queueDuplicateResult.accepted}; duplicate {queueDuplicateResult.duplicate}; rejected {queueDuplicateResult.rejected}</p>}{batchResult && <p>500 test: first accepted {batchResult.accepted}; repeat duplicates {batchResult.duplicate}; rejected {batchResult.rejected}</p>}</aside>}

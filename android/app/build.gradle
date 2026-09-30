@@ -38,6 +38,8 @@ dependencies {
     implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
     implementation project(':capacitor-android')
     implementation 'androidx.health.connect:connect-client:1.1.0'
+    // JCVital Pro V8 native SDK (vendor/jcvital/android/sdk/v8sdk2.0.jar). Never add v8_v2.aar alongside it: same classes.
+    implementation(files("libs/v8sdk2.0.jar"))
     testImplementation "junit:junit:$junitVersion"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
