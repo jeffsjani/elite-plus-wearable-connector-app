@@ -1,5 +1,18 @@
 # JCVital V8 adapter (Build 7A)
 
+## JCVital Pro V8 physical validation
+
+Tested 2026-09-30:
+
+- scan PASS
+- connect PASS
+- READY handshake PASS
+- device info PASS
+- battery PASS
+- live HR PASS
+- disconnect PASS
+- reconnect PASS
+
 ## Status
 
 **Update (V8 native SDK phase 1):** the vendor SDK is now in
