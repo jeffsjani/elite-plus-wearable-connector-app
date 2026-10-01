@@ -118,9 +118,9 @@ export class WebQueueStore implements ObservationQueueStore {
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt)).slice(0, limit)
   }
 
-  private async updateWhere(predicate: (record: QueueRecord) => boolean, update: (record: QueueRecord) => void): Promise<void> {
+  private async updateWhere(predicate: (record: QueueRecord) => boolean, update: (record: QueueRecord) => void): Promise<number> {
     await this.initialize()
-    const records = await this.all('')
+    let changed = 0
     const transaction = this.database!.transaction(storeName, 'readwrite')
     const queue = transaction.objectStore(storeName)
     const request = queue.openCursor()
@@ -128,11 +128,11 @@ export class WebQueueStore implements ObservationQueueStore {
       const cursor = request.result
       if (!cursor) return
       const record = cursor.value as QueueRecord
-      if (predicate(record)) { update(record); cursor.update(record) }
+      if (predicate(record)) { update(record); cursor.update(record); changed++ }
       cursor.continue()
     }
     await transactionDone(transaction)
-    void records
+    return changed
   }
 
   async markInFlight(queueIds: string[], batchId: string): Promise<void> {
@@ -158,9 +158,13 @@ export class WebQueueStore implements ObservationQueueStore {
     await this.updateWhere((record) => set.has(record.queueId), (record) => { record.state = 'FAILED_PERMANENT'; record.lastErrorCode = error.code; record.lastErrorMessage = error.message; record.updatedAt = timestamp })
   }
 
-  async releaseStaleInFlight(ownerUserId: string, staleBefore: string): Promise<void> {
+  async releaseStaleInFlight(ownerUserId: string, staleBefore: string): Promise<number> {
     const timestamp = nowIso()
-    await this.updateWhere((record) => record.ownerUserId === ownerUserId && record.state === 'IN_FLIGHT' && record.updatedAt < staleBefore, (record) => { record.state = 'RETRY_WAIT'; record.nextAttemptAt = timestamp; record.updatedAt = timestamp; record.lastErrorCode = 'STALE_IN_FLIGHT'; record.lastErrorMessage = 'Recovered after an interrupted upload.' })
+    return this.updateWhere((record) => record.ownerUserId === ownerUserId && record.state === 'IN_FLIGHT' && record.updatedAt < staleBefore, (record) => { record.state = 'RETRY_WAIT'; record.nextAttemptAt = timestamp; record.updatedAt = timestamp; record.lastErrorCode = 'STALE_IN_FLIGHT'; record.lastErrorMessage = 'Recovered after an interrupted upload.' })
+  }
+
+  async countStaleInFlight(ownerUserId: string, staleBefore: string): Promise<number> {
+    return (await this.all(ownerUserId)).filter((record) => record.state === 'IN_FLIGHT' && record.updatedAt < staleBefore).length
   }
 
   async getQueueStats(ownerUserId: string, now = new Date()): Promise<QueueStats> {

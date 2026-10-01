@@ -108,7 +108,8 @@ export class ObservationQueue {
   async markAcknowledged(observationIds: string[]): Promise<void> { await this.store.markAcknowledged(observationIds, this.requireOwner()) }
   async markRetry(queueIds: string[], error: QueueErrorMetadata, nextAttemptAt: string): Promise<void> { await this.store.markRetry(queueIds, error, nextAttemptAt) }
   async markPermanentFailure(queueIds: string[], error: QueueErrorMetadata): Promise<void> { await this.store.markPermanentFailure(queueIds, error) }
-  async releaseStaleInFlight(staleBefore: string): Promise<void> { const owner = await this.ready(); await this.store.releaseStaleInFlight(owner, staleBefore) }
+  async releaseStaleInFlight(staleBefore: string): Promise<number> { const owner = await this.ready(); return this.store.releaseStaleInFlight(owner, staleBefore) }
+  async countStaleInFlight(staleBefore: string): Promise<number> { const owner = await this.ready(); return this.store.countStaleInFlight(owner, staleBefore) }
   async getQueueStats(): Promise<QueueStats> {
     const owner = await this.ready()
     return this.guard('QUEUE_READ_FAILED', () => this.store.getQueueStats(owner))

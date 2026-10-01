@@ -102,6 +102,7 @@ export type ConnectorErrorCode =
   | 'INVALID_RESPONSE'
   | 'BATCH_REJECTED'
   | 'SERVER_ERROR'
+  | 'TIMEOUT'
 
 export class ConnectorServiceError extends Error {
   readonly code: ConnectorErrorCode

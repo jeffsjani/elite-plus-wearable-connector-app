@@ -54,9 +54,20 @@ export function mapBase44Error(error: unknown): ConnectorServiceError {
   return new ConnectorServiceError('SERVER_ERROR', 'Connector service request failed.')
 }
 
+export interface InvokeOptions {
+  signal?: AbortSignal
+  /** Called as soon as HTTP headers arrive, before the body is read. */
+  onHttpResponse?: (status: number) => void
+}
+
+function abortedError(): ConnectorServiceError {
+  return new ConnectorServiceError('TIMEOUT', 'Connector service request timed out.')
+}
+
 export async function invokeConnectorFunction<T>(
   functionName: string,
   payload: object,
+  options: InvokeOptions = {},
 ): Promise<T> {
   const token = getAccessToken()
 
@@ -78,16 +89,20 @@ export async function invokeConnectorFunction<T>(
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(payload),
+      signal: options.signal,
     })
   } catch {
+    if (options.signal?.aborted) throw abortedError()
     throw new ConnectorServiceError('NETWORK_ERROR', 'Unable to reach the connector service.')
   }
 
+  options.onHttpResponse?.(response.status)
   let responseBody: unknown
 
   try {
     responseBody = await response.json()
   } catch {
+    if (options.signal?.aborted) throw new ConnectorServiceError('TIMEOUT', 'Connector service response body timed out.', response.status)
     throw new ConnectorServiceError(
       response.ok ? 'INVALID_RESPONSE' : getErrorCode(response.status),
       'Connector service returned an invalid response.',

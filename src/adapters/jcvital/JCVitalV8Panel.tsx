@@ -55,7 +55,7 @@ import {
 } from './WorkoutHrDelivery'
 import { WORKOUT_HR_E2E_TEST_DURATION_MS, WorkoutHrDeliveryView, type QueueSelfTestOutcome } from './WorkoutHrDeliveryView'
 import { observationQueue, type QueueDiagnostics } from '../../services/sync/ObservationQueue'
-import { observationBatchManager } from '../../services/sync/ObservationBatchManager'
+import { observationBatchManager, type DeliveryDiagnostics } from '../../services/sync/ObservationBatchManager'
 import { connectorIdentityService } from '../../services/base44/ConnectorIdentityService'
 import { jcvitalDeviceIdentityService } from '../../services/storage/JCVitalDeviceIdentityService'
 import type { QueueStats } from '../../services/storage/ObservationQueueStore'
@@ -215,6 +215,9 @@ export function JCVitalV8Panel() {
   const [queueReadError, setQueueReadError] = useState<string | null>(null)
   const [queueSelfTest, setQueueSelfTest] = useState<QueueSelfTestOutcome | null>(null)
   const [deliveryClock, setDeliveryClock] = useState(Date.now())
+  const [deliveryDiagnostics, setDeliveryDiagnostics] = useState<DeliveryDiagnostics>(() => observationBatchManager.getDeliveryDiagnostics())
+  const [staleSendingCount, setStaleSendingCount] = useState<number | null>(null)
+  const [staleRetryResult, setStaleRetryResult] = useState<string | null>(null)
   const [hrTestEndsAt, setHrTestEndsAt] = useState<number | null>(null)
   const hrTestTimerRef = useRef<number | null>(null)
 
@@ -244,6 +247,8 @@ export function JCVitalV8Panel() {
   useEffect(() => {
     const refresh = () => {
       setDeliveryClock(Date.now())
+      setDeliveryDiagnostics(observationBatchManager.getDeliveryDiagnostics())
+      void observationBatchManager.getStaleSendingCount().then(setStaleSendingCount, () => setStaleSendingCount(null))
       void observationQueue.getQueueStats().then(
         (stats) => { setDeliveryQueueStats(stats); setQueueReadError(null) },
         (error) => { setDeliveryQueueStats(null); setQueueReadError(errorText(error)) },
@@ -671,7 +676,7 @@ export function JCVitalV8Panel() {
           ecgStartDiagnostics: rawEcgSession?.ecgStartDiagnostics ?? null,
           rawEcgValidation: buildRawEcgValidation(rawEcgSession, rawEcgChunks, rawEcgParseErrors),
           rawPpgValidation: buildRawPpgValidation(rawPpgSession, rawPpgChunks, rawPpgParseErrors, rawPpgUiDiagnostics, rawPpgRenderErrors),
-          workoutHrDelivery: hrDeliverySnapshot ? { ...hrDeliverySnapshot, queueStats: deliveryQueueStats, queueDiagnostics, queueReadError, queueSelfTest } : null,
+          workoutHrDelivery: hrDeliverySnapshot ? { ...hrDeliverySnapshot, queueStats: deliveryQueueStats, queueDiagnostics, queueReadError, queueSelfTest, deliveryDiagnostics: observationBatchManager.getDeliveryDiagnostics(), staleSendingCount } : null,
         },
       })
       const filename = `jcvital-v8-phase3abc-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
@@ -1012,6 +1017,13 @@ export function JCVitalV8Panel() {
         onFlush={() => void hrDeliveryRef.current?.flush('MANUAL')}
         onReplay={() => void hrDeliveryRef.current?.replay()}
         onTestQueue={() => void testQueue()}
+        deliveryDiagnostics={deliveryDiagnostics}
+        staleSendingCount={staleSendingCount}
+        staleRetryResult={staleRetryResult}
+        onRetryStaleSending={() => void observationBatchManager.retryStaleSending().then(
+          (released) => setStaleRetryResult(`${new Date().toISOString()}: released ${released} stale SENDING observation(s) to RETRYING`),
+          (error) => setStaleRetryResult(`${new Date().toISOString()}: failed — ${errorText(error)}`),
+        )}
         queueDiagnostics={queueDiagnostics}
         queueHealth={deliveryQueueHealth}
         queueReadError={queueReadError}

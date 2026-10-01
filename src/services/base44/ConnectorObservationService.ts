@@ -1,4 +1,4 @@
-import { invokeConnectorFunction } from './Base44Client'
+import { invokeConnectorFunction, type InvokeOptions } from './Base44Client'
 import type {
   ConnectorObservationsRequest,
   ConnectorObservationsResponse,
@@ -8,10 +8,12 @@ import { ConnectorServiceError } from './base44Types'
 class ConnectorObservationService {
   async submitObservations(
     request: ConnectorObservationsRequest,
+    options: InvokeOptions = {},
   ): Promise<ConnectorObservationsResponse> {
     const response = await invokeConnectorFunction<ConnectorObservationsResponse>(
       'nativeConnectorObservations',
       request,
+      options,
     )
 
     if (!response.success) {

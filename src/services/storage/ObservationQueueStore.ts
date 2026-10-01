@@ -70,7 +70,8 @@ export interface ObservationQueueStore {
   markAcknowledged(observationIds: string[], ownerUserId: string): Promise<void>
   markRetry(queueIds: string[], error: QueueErrorMetadata, nextAttemptAt: string): Promise<void>
   markPermanentFailure(queueIds: string[], error: QueueErrorMetadata): Promise<void>
-  releaseStaleInFlight(ownerUserId: string, staleBefore: string): Promise<void>
+  releaseStaleInFlight(ownerUserId: string, staleBefore: string): Promise<number>
+  countStaleInFlight(ownerUserId: string, staleBefore: string): Promise<number>
   getQueueStats(ownerUserId: string, now?: Date): Promise<QueueStats>
   getOldestPendingAge(ownerUserId: string, now?: Date): Promise<number | null>
   purgeAcknowledged(ownerUserId: string): Promise<number>

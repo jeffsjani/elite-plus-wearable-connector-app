@@ -1,4 +1,5 @@
 import type { QueueStats } from '../../services/storage/ObservationQueueStore'
+import type { BatchDiagnostics, DeliveryDiagnostics } from '../../services/sync/ObservationBatchManager'
 import type { QueueDiagnostics, QueueSelfTestResult } from '../../services/sync/ObservationQueue'
 import type { QueueHealth, WorkoutHrDeliverySnapshot } from './WorkoutHrDelivery'
 
@@ -25,12 +26,30 @@ interface WorkoutHrDeliveryViewProps {
   onTestQueue: () => void
   onFlush: () => void
   onReplay: () => void
+  deliveryDiagnostics: DeliveryDiagnostics
+  staleSendingCount: number | null
+  staleRetryResult: string | null
+  onRetryStaleSending: () => void
+}
+
+function backendResult(batch: BatchDiagnostics): string {
+  if (!batch.backendResponseReceived) return batch.httpStatus !== null ? `HTTP ${batch.httpStatus} headers only — no body` : 'no backend response'
+  return `success ${String(batch.responseSuccess)} · accepted ${batch.responseAccepted ?? '—'} · duplicate ${batch.responseDuplicate ?? '—'} · rejected ${batch.responseRejected ?? '—'} · errors ${batch.responseErrorCount ?? '—'}`
+}
+
+function deliveryTimedOut(diagnostics: DeliveryDiagnostics): boolean {
+  if (diagnostics.activeBatch && diagnostics.activeBatch.elapsedMs > diagnostics.requestTimeoutMs) return true
+  return !diagnostics.activeBatch && diagnostics.lastBatch?.timedOut === true && diagnostics.lastBatch.phase === 'RETRYING'
 }
 
 export function WorkoutHrDeliveryView({
   snapshot, queueStats, queueDiagnostics, queueHealth, queueReadError, selfTest, connectorRegistered, bleDeviceLocalOnly, online,
   e2eTestEndsAt, now, startTestDisabledReason, busy, onToggleEnabled, onStartTest, onTestQueue, onFlush, onReplay,
+  deliveryDiagnostics, staleSendingCount, staleRetryResult, onRetryStaleSending,
 }: WorkoutHrDeliveryViewProps) {
+  const active = deliveryDiagnostics.activeBatch
+  const last = deliveryDiagnostics.lastBatch
+  const batch = active ?? last
   const pendingObservations = (queueStats?.pending ?? 0) + (queueStats?.retrying ?? 0)
   const pendingBatches = Math.ceil(pendingObservations / 100) + (queueStats?.inFlight ? 1 : 0)
   const remainingSeconds = e2eTestEndsAt === null ? null : Math.max(0, Math.ceil((e2eTestEndsAt - now) / 1000))
@@ -66,7 +85,25 @@ export function WorkoutHrDeliveryView({
       </div>
       <button type="button" className="secondary" disabled={busy} onClick={onFlush}>Flush Now</button>
       <button type="button" className="secondary" disabled={busy || snapshot.delivered === 0} onClick={onReplay}>Replay Delivered (idempotency)</button>
+      <div className="diagnostic-control">
+        <button type="button" className="secondary" disabled={busy || !staleSendingCount} onClick={onRetryStaleSending}>Retry Stale Sending</button>
+        <small>Diagnostic only: moves SENDING rows older than {deliveryDiagnostics.staleSendingMs / 1000}s back to RETRYING with the same observation IDs.</small>
+      </div>
     </div>
+    <section className="workout-live-diagnostics" aria-label="Active delivery batch">
+      <strong>Delivery batch · {active ? `SENDING (${active.phase})` : last ? `last: ${last.phase}` : 'idle'}</strong>
+      {deliveryTimedOut(deliveryDiagnostics) && <span role="alert"><strong>DELIVERY TIMED OUT — RETRY SCHEDULED</strong>{last?.nextAttemptAt ? ` (next attempt ${last.nextAttemptAt})` : ''}</span>}
+      <span>Active batch ID: {active?.batchId ?? '—'} · size: {active?.observationCount ?? '—'} · attempt: {active?.attemptNumber ?? '—'} · time in SENDING: {active ? `${Math.round(active.elapsedMs / 1000)}s` : '—'} (timeout {deliveryDiagnostics.requestTimeoutMs / 1000}s)</span>
+      <span>Stale SENDING (&gt; {deliveryDiagnostics.staleSendingMs / 1000}s): {staleSendingCount ?? '—'}{deliveryDiagnostics.lastStaleRecovery ? ` · last recovery ${deliveryDiagnostics.lastStaleRecovery.trigger} ${deliveryDiagnostics.lastStaleRecovery.at}: released ${deliveryDiagnostics.lastStaleRecovery.released}` : ''}</span>
+      {staleRetryResult && <span>Retry Stale Sending: {staleRetryResult}</span>}
+      {batch && <>
+        <span>{active ? 'Active' : 'Last'} batch {batch.batchId} · {batch.observationCount} obs · attempt {batch.attemptNumber} · started {batch.startedAt}</span>
+        <span>Request: started {batch.requestStartedAt ?? '—'} · completed {batch.requestCompletedAt ?? '—'} · duration {batch.requestDurationMs !== null ? `${batch.requestDurationMs} ms` : '—'} · elapsed {batch.elapsedMs} ms</span>
+        <span>Last HTTP status: {batch.httpStatus ?? '—'} · last backend result: {backendResult(batch)}</span>
+        <span>Last delivery error: {batch.lastErrorCode ? `${batch.lastErrorCode}: ${batch.lastErrorMessage}` : 'none'}{batch.nextAttemptAt ? ` · next attempt ${batch.nextAttemptAt}` : ''}</span>
+      </>}
+      {deliveryDiagnostics.retryScheduledAt && <span>Automatic retry scheduled: {deliveryDiagnostics.retryScheduledAt}</span>}
+    </section>
     <section className="workout-live-diagnostics" aria-label="Connector delivery diagnostics">
       <strong>Connector delivery{remainingSeconds !== null ? ` · test auto-stop in ${remainingSeconds}s` : ''}</strong>
       <span>Queue (all sources) · pending: {queueStats?.pending ?? '—'} · sending: {queueStats?.inFlight ?? '—'} · retrying: {queueStats?.retrying ?? '—'} · failed: {queueStats?.failed ?? '—'} · pending batches: {queueStats ? pendingBatches : '—'}</span>
