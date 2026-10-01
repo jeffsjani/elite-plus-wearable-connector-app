@@ -27,6 +27,16 @@ internal data class RawSignalChunk(
         "estimatedBytes" to estimatedBytes,
     )
 }
+    internal data class RawPpgChunkFlush(
+        val liveSummary: Map<String, Any?>,
+        val rawPackets: List<ByteArray>,
+        val exportSample: Map<String, Any?>,
+    )
+
+    internal data class RawPpgNotificationCapture(
+        val sequenceNumber: Long?,
+        val completedChunk: RawPpgChunkFlush?,
+    )
 
 internal class RawPpgSession(
     val sessionId: String,
@@ -41,6 +51,8 @@ internal class RawPpgSession(
         val originalBytes: ByteArray,
         val parserOutputs: MutableList<Map<String, Any?>> = mutableListOf(),
         var decodedSampleCount: Int = 0,
+        var minimumRawDecodedValue: Int? = null,
+        var maximumRawDecodedValue: Int? = null,
         var estimatedBytes: Int = 0,
     )
 
@@ -87,6 +99,7 @@ internal class RawPpgSession(
 
     val parseErrors = mutableListOf<Map<String, Any?>>()
     private val notificationLengthCounts = linkedMapOf<Int, Long>()
+    private var overflowNotificationLengthCount = 0L
     private val decodedFieldNames = linkedSetOf<String>()
     private val vendorDerivedFields = linkedMapOf<String, Any?>()
     private val layoutDiagnostics = linkedMapOf(
@@ -97,6 +110,8 @@ internal class RawPpgSession(
     private var bufferedEstimatedBytes = 0
     private var bufferedWireBytes = 0
     private var nextPacketSequence = 0L
+    private var parseErrorCountAtLastChunk = 0L
+    private var vendorType119CountAtLastChunk = 0L
 
     fun start() {
         check(status == STATUS_IDLE) { "Raw PPG session has already started" }
@@ -113,15 +128,15 @@ internal class RawPpgSession(
         status = STATUS_STOPPING
     }
 
-    fun captureNotification(notification: ByteArray, receivedAt: String): Long? {
+    fun captureNotification(notification: ByteArray, receivedAt: String): RawPpgNotificationCapture? {
         if (status !in ACTIVE_STATUSES || notification.isEmpty()) return null
         val estimatedBytes = notification.size * RAW_PACKET_MULTIPLIER + PACKET_OVERHEAD_BYTES
-        if (bufferedPackets.isNotEmpty() && (bufferedPackets.size >= MAX_CHUNK_PACKETS || bufferedEstimatedBytes + estimatedBytes > MAX_CHUNK_ESTIMATED_BYTES)) {
-            flushChunk()
-        }
+        val completedChunk = if (bufferedPackets.isNotEmpty() &&
+            (bufferedPackets.size >= MAX_CHUNK_PACKETS || bufferedEstimatedBytes + estimatedBytes > MAX_CHUNK_ESTIMATED_BYTES)
+        ) flushChunk() else null
         if (estimatedBytes > MAX_CHUNK_ESTIMATED_BYTES) {
             recordParseError("PPG notification exceeds bounded chunk capacity", receivedAt, notification.size)
-            return null
+            return RawPpgNotificationCapture(null, completedChunk)
         }
         val packet = Packet(nextPacketSequence++, receivedAt, notification.copyOf(), estimatedBytes = estimatedBytes)
         bufferedPackets.add(packet)
@@ -130,10 +145,16 @@ internal class RawPpgSession(
         bufferHighWaterMark = maxOf(bufferHighWaterMark, bufferedEstimatedBytes)
         packetCount++
         bytesReceived += notification.size
-        notificationLengthCounts[notification.size] = (notificationLengthCounts[notification.size] ?: 0L) + 1L
+        if (notification.size == LENGTH_153 || notification.size == LENGTH_203 ||
+            notificationLengthCounts.containsKey(notification.size) || notificationLengthCounts.size < MAX_EXACT_NOTIFICATION_LENGTHS
+        ) {
+            notificationLengthCounts[notification.size] = (notificationLengthCounts[notification.size] ?: 0L) + 1L
+        } else {
+            overflowNotificationLengthCount++
+        }
         if (firstPacketAt == null) firstPacketAt = receivedAt
         lastPacketAt = receivedAt
-        return packet.sequenceNumber
+        return RawPpgNotificationCapture(packet.sequenceNumber, completedChunk)
     }
 
     fun recordParserOutput(
@@ -147,18 +168,21 @@ internal class RawPpgSession(
         val fields = sanitizeFields(rawFields)
         val output = linkedMapOf<String, Any?>("dataType" to dataType, "dataEnd" to dataEnd)
         if (fields.isNotEmpty()) output["fields"] = fields
-        packet.parserOutputs.add(output)
-        packet.estimatedBytes += fields.toString().length * 2
-        bufferedEstimatedBytes += fields.toString().length * 2
+        val outputBytes = fields.toString().length * 2
+        if (packet.parserOutputs.size < MAX_PARSER_OUTPUTS_PER_PACKET && bufferedEstimatedBytes + outputBytes <= MAX_CHUNK_ESTIMATED_BYTES) {
+            packet.parserOutputs.add(output)
+            packet.estimatedBytes += outputBytes
+            bufferedEstimatedBytes += outputBytes
+        }
         bufferHighWaterMark = maxOf(bufferHighWaterMark, bufferedEstimatedBytes)
 
-        fields.keys.forEach(decodedFieldNames::add)
+        fields.keys.take(MAX_DECODED_FIELD_NAMES).forEach { if (decodedFieldNames.size < MAX_DECODED_FIELD_NAMES) decodedFieldNames.add(it) }
         fields.forEach { (name, value) ->
             if (name in VENDOR_DERIVED_FIELD_NAMES) {
                 vendorDerivedFields[name] = linkedMapOf(
                     "semanticType" to "VENDOR_DERIVED_BIOMARKER",
                     "fieldName" to name,
-                    "value" to value,
+                    "value" to boundDiagnosticValue(value),
                 )
             }
         }
@@ -171,6 +195,8 @@ internal class RawPpgSession(
                 decodedSampleCount += values.size
                 minimumRawDecodedValue = values.minOrNull()?.let { current -> minimumRawDecodedValue?.let { minOf(it, current) } ?: current }
                 maximumRawDecodedValue = values.maxOrNull()?.let { current -> maximumRawDecodedValue?.let { maxOf(it, current) } ?: current }
+                packet.minimumRawDecodedValue = values.minOrNull()?.let { current -> packet.minimumRawDecodedValue?.let { minOf(it, current) } ?: current }
+                packet.maximumRawDecodedValue = values.maxOrNull()?.let { current -> packet.maximumRawDecodedValue?.let { maxOf(it, current) } ?: current }
                 val layout = layoutDiagnostics[packet.originalBytes.size]
                 if (layout != null) {
                     layout.packetCount++
@@ -188,7 +214,7 @@ internal class RawPpgSession(
         }
     }
 
-    fun completeNotification(sequenceNumber: Long): Map<String, Any?>? {
+    fun completeNotification(sequenceNumber: Long): RawPpgChunkFlush? {
         val packet = bufferedPackets.firstOrNull { it.sequenceNumber == sequenceNumber } ?: return null
         if (bufferedPackets.size >= MAX_CHUNK_PACKETS || bufferedWireBytes >= FLUSH_WIRE_BYTES || bufferedEstimatedBytes >= MAX_CHUNK_ESTIMATED_BYTES) {
             return flushChunk()
@@ -199,6 +225,7 @@ internal class RawPpgSession(
 
     fun recordParseError(message: String, receivedAt: String, notificationLength: Int? = null) {
         parseErrorCount++
+        if (parseErrors.size >= MAX_PARSE_ERROR_SAMPLES) return
         parseErrors.add(
             linkedMapOf(
                 "message" to message,
@@ -208,9 +235,9 @@ internal class RawPpgSession(
         )
     }
 
-    fun flush(): Map<String, Any?>? = flushChunk()
+    fun flush(): RawPpgChunkFlush? = flushChunk()
 
-    fun stop(stoppedAt: String): Map<String, Any?>? {
+    fun stop(stoppedAt: String): RawPpgChunkFlush? {
         if (status == STATUS_STOPPED || status == STATUS_ERROR || status == STATUS_DISCONNECTED) return null
         check(status == STATUS_STOPPING) { "Raw PPG session must be stopping before it can stop" }
         val chunk = flushChunk()
@@ -219,7 +246,7 @@ internal class RawPpgSession(
         return chunk
     }
 
-    fun fail(stoppedAt: String): Map<String, Any?>? {
+    fun fail(stoppedAt: String): RawPpgChunkFlush? {
         if (status in TERMINAL_STATUSES) return null
         val chunk = flushChunk()
         status = STATUS_ERROR
@@ -227,7 +254,7 @@ internal class RawPpgSession(
         return chunk
     }
 
-    fun disconnect(stoppedAt: String): Map<String, Any?>? {
+    fun disconnect(stoppedAt: String): RawPpgChunkFlush? {
         if (status in TERMINAL_STATUSES) return null
         val chunk = flushChunk()
         status = STATUS_DISCONNECTED
@@ -248,7 +275,7 @@ internal class RawPpgSession(
         "bufferHighWaterMark" to bufferHighWaterMark,
         "parseErrorCount" to parseErrorCount,
         "notificationLengthCounts" to categorizedNotificationLengthCounts(),
-        "notificationLengthsExactCounts" to notificationLengthCounts.mapKeys { it.key.toString() },
+        "notificationLengthsExactCounts" to notificationLengthCounts.entries.take(MAX_EXACT_NOTIFICATION_LENGTHS).associate { it.key.toString() to it.value },
         "vendorDataType119Count" to vendorDataType119Count,
         "firstPacketAt" to firstPacketAt,
         "lastPacketAt" to lastPacketAt,
@@ -260,30 +287,25 @@ internal class RawPpgSession(
         "unit" to UNKNOWN_UNIT,
         "sampleFormat" to "UNKNOWN_VENDOR_LAYOUT",
         "rawSampleDiagnostics" to layoutDiagnostics.mapKeys { it.key.toString() }.mapValues { it.value.toMap() },
-        "decodedFieldNames" to decodedFieldNames.toList(),
+        "decodedFieldNames" to decodedFieldNames.take(MAX_DECODED_FIELD_NAMES),
         "vendorDerivedFields" to vendorDerivedFields.values.toList(),
         "temporaryStorePath" to null,
         "persistedPacketCount" to 0,
         "persistedBytes" to 0,
         "storageErrorCount" to 0,
         "source" to source,
-        "parseErrors" to parseErrors.toList(),
+        "parseErrors" to parseErrors.take(MAX_PARSE_ERROR_SAMPLES),
     )
 
     private fun categorizedNotificationLengthCounts(): Map<String, Long> = linkedMapOf(
         LENGTH_153.toString() to (notificationLengthCounts[LENGTH_153] ?: 0L),
         LENGTH_203.toString() to (notificationLengthCounts[LENGTH_203] ?: 0L),
-        "other" to notificationLengthCounts.filterKeys { it != LENGTH_153 && it != LENGTH_203 }.values.sum(),
+        "other" to (notificationLengthCounts.filterKeys { it != LENGTH_153 && it != LENGTH_203 }.values.sum() + overflowNotificationLengthCount),
     )
 
-    private fun flushChunk(): Map<String, Any?>? {
+    private fun flushChunk(): RawPpgChunkFlush? {
         if (bufferedPackets.isEmpty()) return null
-        val chunk = RawSignalChunk(
-            sessionId = sessionId,
-            sequenceNumber = chunkCount,
-            receivedAtStart = bufferedPackets.first().receivedAt,
-            receivedAtEnd = bufferedPackets.last().receivedAt,
-            packets = bufferedPackets.map { packet ->
+        val packetSummaries = bufferedPackets.map { packet ->
                 linkedMapOf(
                     "sessionId" to sessionId,
                     "sequenceNumber" to packet.sequenceNumber,
@@ -295,12 +317,44 @@ internal class RawPpgSession(
                     "vendorParserOutput" to packet.parserOutputs.toList(),
                     "decodedSampleCount" to packet.decodedSampleCount,
                 )
-            },
-            packetCount = bufferedPackets.size,
-            bytesReceived = bufferedWireBytes,
-            decodedSampleCount = bufferedPackets.sumOf { it.decodedSampleCount },
-            estimatedBytes = bufferedEstimatedBytes,
-        ).toMap()
+            }
+        val lengthCounts = linkedMapOf(
+            LENGTH_153.toString() to bufferedPackets.count { it.originalBytes.size == LENGTH_153 },
+            LENGTH_203.toString() to bufferedPackets.count { it.originalBytes.size == LENGTH_203 },
+            "other" to bufferedPackets.count { it.originalBytes.size != LENGTH_153 && it.originalBytes.size != LENGTH_203 },
+        )
+        fun layoutSummary(length: Int): Map<String, Any?> {
+            val packets = bufferedPackets.filter { it.originalBytes.size == length }
+            return linkedMapOf(
+                "packetCount" to packets.size,
+                "decodedSampleCount" to packets.sumOf { it.decodedSampleCount },
+                "minimumRawDecodedValue" to packets.mapNotNull { it.minimumRawDecodedValue }.minOrNull(),
+                "maximumRawDecodedValue" to packets.mapNotNull { it.maximumRawDecodedValue }.maxOrNull(),
+            )
+        }
+        val sequenceStart = bufferedPackets.first().sequenceNumber
+        val sequenceEnd = bufferedPackets.last().sequenceNumber
+        val parseErrorsInChunk = parseErrorCount - parseErrorCountAtLastChunk
+        parseErrorCountAtLastChunk = parseErrorCount
+        val vendorType119InChunk = vendorDataType119Count - vendorType119CountAtLastChunk
+        vendorType119CountAtLastChunk = vendorDataType119Count
+        val summary = linkedMapOf<String, Any?>(
+            "sessionId" to sessionId,
+            "sequenceStart" to sequenceStart,
+            "sequenceEnd" to sequenceEnd,
+            "packetCount" to bufferedPackets.size,
+            "chunkCount" to 1,
+            "wireBytes" to bufferedWireBytes,
+            "firstReceivedAt" to bufferedPackets.first().receivedAt,
+            "lastReceivedAt" to bufferedPackets.last().receivedAt,
+            "notificationLengthCounts" to lengthCounts,
+            "vendorType119Count" to vendorType119InChunk,
+            "decoded153Summary" to layoutSummary(LENGTH_153),
+            "decoded203Summary" to layoutSummary(LENGTH_203),
+            "parseErrorCount" to parseErrorsInChunk,
+        )
+        val exportSample = LinkedHashMap(summary).apply { put("packets", packetSummaries) }
+        val chunk = RawPpgChunkFlush(summary, bufferedPackets.map { it.originalBytes.copyOf() }, exportSample)
         chunkCount++
         bufferedPackets.clear()
         bufferedEstimatedBytes = 0
@@ -312,6 +366,17 @@ internal class RawPpgSession(
         if (rawFields == null) return emptyMap()
         @Suppress("UNCHECKED_CAST")
         return JCVitalV8EventNormalizer.sanitize(rawFields) as? Map<String, Any?> ?: emptyMap()
+    }
+
+    private fun boundDiagnosticValue(value: Any?, depth: Int = 0): Any? = when (value) {
+        null, is Number, is Boolean -> value
+        is String -> value.take(MAX_DIAGNOSTIC_STRING_LENGTH)
+        is Map<*, *> -> if (depth >= MAX_DIAGNOSTIC_DEPTH) value.toString().take(MAX_DIAGNOSTIC_STRING_LENGTH) else
+            value.entries.take(MAX_DIAGNOSTIC_COLLECTION_ITEMS).associate { (key, item) ->
+                key.toString().take(MAX_DIAGNOSTIC_STRING_LENGTH) to boundDiagnosticValue(item, depth + 1)
+            }
+        is Iterable<*> -> value.take(MAX_DIAGNOSTIC_COLLECTION_ITEMS).map { boundDiagnosticValue(it, depth + 1) }
+        else -> value.toString().take(MAX_DIAGNOSTIC_STRING_LENGTH)
     }
 
     private fun parseVendorPpgValues(raw: Any?): List<Int> = when (raw) {
@@ -338,6 +403,13 @@ internal class RawPpgSession(
         const val MAX_CHUNK_ESTIMATED_BYTES = 64 * 1024
         const val MAX_CHUNK_PACKETS = 16
         const val FLUSH_WIRE_BYTES = 8 * 1024
+        private const val MAX_PARSE_ERROR_SAMPLES = 50
+        private const val MAX_EXACT_NOTIFICATION_LENGTHS = 32
+        private const val MAX_DECODED_FIELD_NAMES = 32
+        private const val MAX_PARSER_OUTPUTS_PER_PACKET = 8
+        private const val MAX_DIAGNOSTIC_COLLECTION_ITEMS = 32
+        private const val MAX_DIAGNOSTIC_DEPTH = 2
+        private const val MAX_DIAGNOSTIC_STRING_LENGTH = 256
         private const val RAW_PACKET_MULTIPLIER = 2
         private const val PACKET_OVERHEAD_BYTES = 128
         private const val FIELD_PPG = "PPG"

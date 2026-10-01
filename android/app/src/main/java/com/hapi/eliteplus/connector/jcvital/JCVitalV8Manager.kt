@@ -23,6 +23,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import org.json.JSONObject
 import androidx.core.content.ContextCompat
 import com.jstyle.blesdkv8.Util.BleSDK
 import com.jstyle.blesdkv8.callback.DataListener2301
@@ -256,9 +257,6 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         }
     }
 
-    private val appContext = context.applicationContext
-    private val main = Handler(Looper.getMainLooper())
-    private val bluetoothManager = appContext.getSystemService(BluetoothManager::class.java)
     private class RawPpgCapture(
         val session: RawPpgSession,
         var startCallback: ((Map<String, Any?>?, JCVitalV8Exception?) -> Unit)?,
@@ -267,9 +265,20 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         var stopCallback: ((Map<String, Any?>?, JCVitalV8Exception?) -> Unit)? = null
         var startTimeout: Runnable? = null
         var stopTimeout: Runnable? = null
+        var maxDurationTimeout: Runnable? = null
+        var uiUpdateTimeout: Runnable? = null
+        var pendingChunkSummary: Map<String, Any?>? = null
+        var ppgChunkEventsSentToJs = 0L
+        var ppgUiSummaryEventDropped = 0L
+        var ppgLastEventPayloadBytes = 0
+        var ppgMaxEventPayloadBytes = 0
+        var storageFailureHandling = false
         var storageErrorCount = 0
     }
 
+    private val appContext = context.applicationContext
+    private val main = Handler(Looper.getMainLooper())
+    private val bluetoothManager = appContext.getSystemService(BluetoothManager::class.java)
     private val registry = JCVitalV8DeviceRegistry()
     private val normalizer = JCVitalV8EventNormalizer()
     private val workoutNormalizer = JCVitalV8WorkoutNormalizer()
@@ -310,11 +319,11 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     private var lastWorkoutSession: Map<String, Any?>? = null
     private var rawEcgCapture: RawEcgCapture? = null
     private var lastRawEcgSession: Map<String, Any?>? = null
+    private var rawPpgCapture: RawPpgCapture? = null
+    private var lastRawPpgSession: Map<String, Any?>? = null
 
     private val deviceInfo = LinkedHashMap<String, Any?>()
     private var lastBattery: Map<String, Any?>? = null
-    private var rawPpgCapture: RawPpgCapture? = null
-    private var lastRawPpgSession: Map<String, Any?>? = null
     private var realtimeSessionId: String? = null
 
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
@@ -493,10 +502,10 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         Log.i(TAG, "disconnect requested (link=$hadLink)")
         endWorkoutForLinkLoss("Disconnected by user")
         endRawEcgForLinkLoss("Disconnected by user")
+        endRawPpgForLinkLoss("Disconnected by user")
         closeGatt()
         stateMachine.transition(JCVitalV8ConnectionState.DISCONNECTED, "user disconnect")
         failPendingWork(JCVitalV8Exception(JCVitalV8ErrorCode.CONNECTION_LOST, "Disconnected by user"))
-        endRawPpgForLinkLoss("Disconnected by user")
         callback()
     }
 
@@ -521,10 +530,10 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                     if (code == null) {
                         endWorkoutForLinkLoss("V8 disconnected")
                         endRawEcgForLinkLoss("V8 disconnected")
+                        endRawPpgForLinkLoss("V8 disconnected")
                         closeGatt()
                         stateMachine.transition(JCVitalV8ConnectionState.DISCONNECTED, "gatt disconnected")
                     } else {
-                        endRawPpgForLinkLoss("V8 disconnected")
                         fail(code, "GATT link dropped (status=$status)")
                     }
                 }
@@ -808,9 +817,6 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         ?: lastWorkoutSession
         ?: idleWorkoutPayload()
 
-    fun startRawEcg(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
-        if (!requireReady(callback)) return@onMain
-        val blocked = JCVitalV8WorkoutGuard.blockedReason(
     fun startRawPpg(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
         if (!requireReady(callback)) return@onMain
         val blocked = rawPpgStartBlockedReason()
@@ -855,6 +861,11 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                 capture.startCallback?.invoke(result, null)
                 capture.startCallback = null
                 emitRawPpgStatus(capture)
+                capture.maxDurationTimeout = Runnable {
+                    if (rawPpgCapture === capture && session.status == RawPpgSession.STATUS_RUNNING) {
+                        stopRawPpg { _, error -> error?.let { Log.e(TAG, "20-second PPG safe-test stop failed: ${it.message}") } }
+                    }
+                }.also { main.postDelayed(it, RAW_PPG_SAFE_TEST_DURATION_MS) }
             }
         }
     }
@@ -882,6 +893,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         }
         capture.session.markStopping()
         capture.stopCallback = callback
+        capture.maxDurationTimeout?.let(main::removeCallbacks)
+        capture.maxDurationTimeout = null
         emitRawPpgStatus(capture)
         capture.stopTimeout = Runnable { failRawPpgCapture(capture, "PPG mode-3/mode-5 stop write acknowledgment timed out") }
             .also { main.postDelayed(it, COMMAND_TIMEOUT_MS * 2) }
@@ -902,7 +915,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         }
     }
 
-    fun rawPpgStatus(): Map<String, Any?> = rawPpgCapture?.let(::rawPpgPayload)
+    fun rawPpgStatus(): Map<String, Any?> = rawPpgCapture?.let { rawPpgPayload(it) }
         ?: lastRawPpgSession
         ?: linkedMapOf(
             "sessionId" to null,
@@ -933,37 +946,145 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
             "persistedPacketCount" to 0,
             "persistedBytes" to 0,
             "storageErrorCount" to 0,
+            "ppgNativePacketCount" to 0,
+            "ppgNativeChunkCount" to 0,
+            "ppgChunkEventsSentToJs" to 0,
+            "ppgUiSummaryEventDropped" to 0,
+            "ppgLastEventPayloadBytes" to 0,
+            "ppgMaxEventPayloadBytes" to 0,
             "parseErrors" to emptyList<Any>(),
         )
 
-    private fun rawPpgPayload(capture: RawPpgCapture): Map<String, Any?> = LinkedHashMap(capture.session.toMap()).apply {
-        put("temporaryStorePath", capture.packetStore.file.absolutePath)
-        put("persistedPacketCount", capture.packetStore.packetCount)
-        put("persistedBytes", capture.packetStore.byteCount)
-        put("storageErrorCount", capture.storageErrorCount)
-    }
+    private fun rawPpgPayload(capture: RawPpgCapture, includeChunkSamples: Boolean = false): Map<String, Any?> =
+        LinkedHashMap(capture.session.toMap()).apply {
+            put("temporaryStorePath", capture.packetStore.file.absolutePath)
+            put("persistedPacketCount", capture.packetStore.packetCount)
+            put("persistedBytes", capture.packetStore.byteCount)
+            put("storageErrorCount", capture.storageErrorCount)
+            put("ppgNativePacketCount", capture.session.packetCount)
+            put("ppgNativeChunkCount", capture.session.chunkCount)
+            put("ppgChunkEventsSentToJs", capture.ppgChunkEventsSentToJs)
+            put("ppgUiSummaryEventDropped", capture.ppgUiSummaryEventDropped)
+            put("ppgLastEventPayloadBytes", capture.ppgLastEventPayloadBytes)
+            put("ppgMaxEventPayloadBytes", capture.ppgMaxEventPayloadBytes)
+            if (includeChunkSamples) {
+                put("first3Chunks", capture.packetStore.firstThreeChunks())
+                put("last3Chunks", capture.packetStore.lastThreeChunks())
+            }
+        }
 
     private fun emitRawPpgStatus(capture: RawPpgCapture) {
         val payload = rawPpgPayload(capture)
-        if (rawPpgCapture !== capture) lastRawPpgSession = payload
-        emit(JCVitalV8EventNormalizer.EVENT_RAW_PPG_STATUS, payload)
+        emitRawPpgBridgeEvent(capture, JCVitalV8EventNormalizer.EVENT_RAW_PPG_STATUS, payload)
     }
 
-    private fun flushRawPpg(capture: RawPpgCapture, chunk: Map<String, Any?>?) {
+    private fun flushRawPpg(capture: RawPpgCapture, chunk: RawPpgChunkFlush?) {
         if (chunk == null) return
         try {
-            @Suppress("UNCHECKED_CAST")
-            val packets = chunk["packets"] as List<Map<String, Any?>>
-            capture.packetStore.appendPackets(packets.map { packet ->
-                @Suppress("UNCHECKED_CAST")
-                packet["originalBytes"] as List<Int>
-            })
+            capture.packetStore.appendChunk(chunk.rawPackets, chunk.exportSample)
         } catch (error: Throwable) {
             capture.storageErrorCount++
-            capture.session.recordParseError("Could not persist raw PPG chunk: ${error.message}", JCVitalV8Time.isoUtc(System.currentTimeMillis()))
-            emitRawPpgError(capture, "Could not persist raw PPG chunk: ${error.message}")
+            val message = "RAW_CAPTURE_LOSS: Could not persist raw PPG chunk: ${error.message}"
+            capture.session.recordParseError(message, JCVitalV8Time.isoUtc(System.currentTimeMillis()))
+            emitRawPpgError(capture, message)
+            if (!capture.storageFailureHandling && rawPpgCapture === capture) {
+                capture.storageFailureHandling = true
+                endRawPpgForError(message)
+            }
+            return
         }
-        emit(JCVitalV8EventNormalizer.EVENT_RAW_PPG_CHUNK, chunk)
+        val pending = capture.pendingChunkSummary
+        if (pending != null) capture.ppgUiSummaryEventDropped++
+        capture.pendingChunkSummary = mergeRawPpgChunkSummaries(pending, chunk.liveSummary)
+        queueRawPpgUiUpdate(capture)
+    }
+
+    private fun queueRawPpgUiUpdate(capture: RawPpgCapture) {
+        if (capture.uiUpdateTimeout != null) return
+        capture.uiUpdateTimeout = Runnable {
+            capture.uiUpdateTimeout = null
+            if (rawPpgCapture !== capture) return@Runnable
+            val chunk = capture.pendingChunkSummary
+            capture.pendingChunkSummary = null
+            if (chunk != null) {
+                capture.ppgChunkEventsSentToJs++
+                emitRawPpgBridgeEvent(capture, JCVitalV8EventNormalizer.EVENT_RAW_PPG_CHUNK, chunk)
+            }
+            emitRawPpgStatus(capture)
+        }.also { main.postDelayed(it, RAW_PPG_UI_UPDATE_INTERVAL_MS) }
+    }
+
+    private fun flushPendingRawPpgChunkSummary(capture: RawPpgCapture) {
+        capture.uiUpdateTimeout?.let(main::removeCallbacks)
+        capture.uiUpdateTimeout = null
+        capture.pendingChunkSummary?.let { summary ->
+            capture.ppgChunkEventsSentToJs++
+            emitRawPpgBridgeEvent(capture, JCVitalV8EventNormalizer.EVENT_RAW_PPG_CHUNK, summary)
+            capture.pendingChunkSummary = null
+        }
+    }
+
+    private fun mergeRawPpgChunkSummaries(
+        first: Map<String, Any?>?,
+        next: Map<String, Any?>,
+    ): Map<String, Any?> {
+        if (first == null) return next
+        fun count(summary: Map<String, Any?>, field: String) = (summary[field] as? Number)?.toLong() ?: 0L
+        fun nested(summary: Map<String, Any?>, field: String): Map<String, Any?> = summary[field] as? Map<String, Any?> ?: emptyMap()
+        fun mergeLayout(field: String): Map<String, Any?> {
+            val left = nested(first, field)
+            val right = nested(next, field)
+            val leftMin = (left["minimumRawDecodedValue"] as? Number)?.toInt()
+            val rightMin = (right["minimumRawDecodedValue"] as? Number)?.toInt()
+            val leftMax = (left["maximumRawDecodedValue"] as? Number)?.toInt()
+            val rightMax = (right["maximumRawDecodedValue"] as? Number)?.toInt()
+            return linkedMapOf(
+                "packetCount" to (count(left, "packetCount") + count(right, "packetCount")),
+                "decodedSampleCount" to (count(left, "decodedSampleCount") + count(right, "decodedSampleCount")),
+                "minimumRawDecodedValue" to listOfNotNull(leftMin, rightMin).minOrNull(),
+                "maximumRawDecodedValue" to listOfNotNull(leftMax, rightMax).maxOrNull(),
+            )
+        }
+        val leftLengths = nested(first, "notificationLengthCounts")
+        val rightLengths = nested(next, "notificationLengthCounts")
+        val leftStart = count(first, "sequenceStart")
+        val rightEnd = count(next, "sequenceEnd")
+        return linkedMapOf(
+            "sessionId" to next["sessionId"],
+            "sequenceStart" to minOf(leftStart, count(next, "sequenceStart")),
+            "sequenceEnd" to maxOf(count(first, "sequenceEnd"), rightEnd),
+            "packetCount" to (count(first, "packetCount") + count(next, "packetCount")),
+            "chunkCount" to (count(first, "chunkCount") + count(next, "chunkCount")),
+            "wireBytes" to (count(first, "wireBytes") + count(next, "wireBytes")),
+            "firstReceivedAt" to first["firstReceivedAt"],
+            "lastReceivedAt" to next["lastReceivedAt"],
+            "notificationLengthCounts" to linkedMapOf(
+                "153" to (count(leftLengths, "153") + count(rightLengths, "153")),
+                "203" to (count(leftLengths, "203") + count(rightLengths, "203")),
+                "other" to (count(leftLengths, "other") + count(rightLengths, "other")),
+            ),
+            "vendorType119Count" to (count(first, "vendorType119Count") + count(next, "vendorType119Count")),
+            "decoded153Summary" to mergeLayout("decoded153Summary"),
+            "decoded203Summary" to mergeLayout("decoded203Summary"),
+            "parseErrorCount" to (count(first, "parseErrorCount") + count(next, "parseErrorCount")),
+        )
+    }
+
+    private fun emitRawPpgBridgeEvent(capture: RawPpgCapture, event: String, payload: Map<String, Any?>) {
+        val mutablePayload = payload as? MutableMap<String, Any?>
+        var payloadBytes = JSONObject(payload).toString().toByteArray(Charsets.UTF_8).size
+        repeat(3) {
+            capture.ppgLastEventPayloadBytes = payloadBytes
+            capture.ppgMaxEventPayloadBytes = maxOf(capture.ppgMaxEventPayloadBytes, payloadBytes)
+            if (event == JCVitalV8EventNormalizer.EVENT_RAW_PPG_STATUS) {
+                mutablePayload?.apply {
+                    put("ppgLastEventPayloadBytes", capture.ppgLastEventPayloadBytes)
+                    put("ppgMaxEventPayloadBytes", capture.ppgMaxEventPayloadBytes)
+                }
+                payloadBytes = JSONObject(payload).toString().toByteArray(Charsets.UTF_8).size
+            }
+        }
+        emit(event, payload)
     }
 
     private fun closeRawPpgStore(capture: RawPpgCapture) {
@@ -981,12 +1102,15 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
             RawPpgSession.STATUS_DISCONNECTED -> capture.session.disconnect(JCVitalV8Time.isoUtc(System.currentTimeMillis()))
             else -> capture.session.fail(JCVitalV8Time.isoUtc(System.currentTimeMillis()))
         })
+        capture.maxDurationTimeout?.let(main::removeCallbacks)
+        capture.maxDurationTimeout = null
+        flushPendingRawPpgChunkSummary(capture)
         closeRawPpgStore(capture)
         rawPpgCapture = null
         reason?.let { emitRawPpgError(capture, it) }
-        val result = rawPpgPayload(capture)
+        emitRawPpgStatus(capture)
+        val result = rawPpgPayload(capture, includeChunkSamples = true)
         lastRawPpgSession = result
-        emit(JCVitalV8EventNormalizer.EVENT_RAW_PPG_STATUS, result)
         capture.startCallback?.invoke(if (finalStatus == RawPpgSession.STATUS_STOPPED) result else null, if (finalStatus == RawPpgSession.STATUS_STOPPED) null else JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, reason ?: finalStatus))
         capture.startCallback = null
         capture.stopCallback?.invoke(if (finalStatus == RawPpgSession.STATUS_STOPPED) result else null, if (finalStatus == RawPpgSession.STATUS_STOPPED) null else JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, reason ?: finalStatus))
@@ -997,6 +1121,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         if (rawPpgCapture !== capture) return
         capture.startTimeout?.let(main::removeCallbacks)
         capture.stopTimeout?.let(main::removeCallbacks)
+        capture.maxDurationTimeout?.let(main::removeCallbacks)
+        capture.uiUpdateTimeout?.let(main::removeCallbacks)
         finishRawPpgCapture(capture, RawPpgSession.STATUS_ERROR, message)
     }
 
@@ -1004,14 +1130,16 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         val capture = rawPpgCapture ?: return
         capture.startTimeout?.let(main::removeCallbacks)
         capture.stopTimeout?.let(main::removeCallbacks)
+        capture.maxDurationTimeout?.let(main::removeCallbacks)
         BleSDK.ppgWithMode(5, 0)
         flushRawPpg(capture, capture.session.disconnect(JCVitalV8Time.isoUtc(System.currentTimeMillis())))
+        flushPendingRawPpgChunkSummary(capture)
         closeRawPpgStore(capture)
         rawPpgCapture = null
         emitRawPpgError(capture, reason)
-        val result = rawPpgPayload(capture)
+        emitRawPpgStatus(capture)
+        val result = rawPpgPayload(capture, includeChunkSamples = true)
         lastRawPpgSession = result
-        emit(JCVitalV8EventNormalizer.EVENT_RAW_PPG_STATUS, result)
         capture.startCallback?.invoke(null, JCVitalV8Exception(JCVitalV8ErrorCode.CONNECTION_LOST, reason))
         capture.startCallback = null
         capture.stopCallback?.invoke(null, JCVitalV8Exception(JCVitalV8ErrorCode.CONNECTION_LOST, reason))
@@ -1022,14 +1150,17 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         val capture = rawPpgCapture ?: return
         capture.startTimeout?.let(main::removeCallbacks)
         capture.stopTimeout?.let(main::removeCallbacks)
+        capture.maxDurationTimeout?.let(main::removeCallbacks)
+        capture.uiUpdateTimeout?.let(main::removeCallbacks)
         BleSDK.ppgWithMode(5, 0)
         flushRawPpg(capture, capture.session.fail(JCVitalV8Time.isoUtc(System.currentTimeMillis())))
+        flushPendingRawPpgChunkSummary(capture)
         closeRawPpgStore(capture)
         rawPpgCapture = null
         emitRawPpgError(capture, reason)
-        val result = rawPpgPayload(capture)
+        emitRawPpgStatus(capture)
+        val result = rawPpgPayload(capture, includeChunkSamples = true)
         lastRawPpgSession = result
-        emit(JCVitalV8EventNormalizer.EVENT_RAW_PPG_STATUS, result)
         val error = JCVitalV8Exception(JCVitalV8ErrorCode.COMMAND_FAILED, reason)
         capture.startCallback?.invoke(null, error)
         capture.startCallback = null
@@ -1038,7 +1169,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     }
 
     private fun emitRawPpgError(capture: RawPpgCapture, message: String) {
-        emit(
+        emitRawPpgBridgeEvent(
+            capture,
             JCVitalV8EventNormalizer.EVENT_RAW_PPG_ERROR,
             linkedMapOf(
                 "sessionId" to capture.session.sessionId,
@@ -1049,6 +1181,9 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         )
     }
 
+    fun startRawEcg(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = onMain {
+        if (!requireReady(callback)) return@onMain
+        val blocked = JCVitalV8WorkoutGuard.blockedReason(
             workoutCapture?.session,
             realtimeSessionId != null,
             historicalRequest != null,
@@ -1332,17 +1467,17 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
             notificationReceivedAtMillis,
         )
         val ppgCapture = rawPpgCapture
-        val ppgSequenceNumber = if (
+        val ppgNotificationCapture = if (
             bytes[0] == DeviceConst.CMD_Get_Bloodsugar || bytes[0] == DeviceConst.Bloodsugar_data
         ) {
             ppgCapture?.session?.captureNotification(bytes, notificationReceivedAt)
         } else {
             null
         }
-            bytes,
-            notificationReceivedAt,
-            notificationReceivedAtMillis,
-        )
+        ppgNotificationCapture?.completedChunk?.let { completedChunk ->
+            ppgCapture?.let { flushRawPpg(it, completedChunk) }
+        }
+        val ppgSequenceNumber = ppgNotificationCapture?.sequenceNumber
         val commandByte = String.format("0x%02X", bytes[0].toInt() and 0xFF)
         if ((bytes[0].toInt() and 0xFF) == JCVitalV8RawEcgSession.ECG_COMMAND_BYTE &&
             bytes.size > ECG_STREAM_MIN_NOTIFICATION_BYTES && rawEcgCapture != null
@@ -1373,17 +1508,17 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                 }
             })
         } catch (t: Throwable) {
+            if (ppgCapture != null && ppgSequenceNumber != null) {
+                ppgCapture.session.recordParseError("SDK parse failed (${t.javaClass.simpleName})", notificationReceivedAt, bytes.size)
+                flushRawPpg(ppgCapture, ppgCapture.session.completeNotification(ppgSequenceNumber))
+                queueRawPpgUiUpdate(ppgCapture)
+            }
             if (notificationTrace != null && capture != null) {
                 capture.notificationDiagnostics.finishNotification(notificationTrace, bytes)
                 emitRawEcgStatus(capture)
             }
             Log.w(TAG, "SDK parse failed for $commandByte (${bytes.size} bytes, mtu=$negotiatedMtu): ${t.javaClass.simpleName}")
             if ((bytes[0].toInt() and 0xFF) == JCVitalV8RawEcgSession.ECG_COMMAND_BYTE) {
-            if (ppgCapture != null && ppgSequenceNumber != null) {
-                ppgCapture.session.recordParseError("SDK parse failed (${t.javaClass.simpleName})", notificationReceivedAt, bytes.size)
-                flushRawPpg(ppgCapture, ppgCapture.session.completeNotification(ppgSequenceNumber))
-                emitRawPpgStatus(ppgCapture)
-            }
                 rawEcgCapture?.let { capture ->
                     capture.session.recordSdkParseError()
                     val error = linkedMapOf<String, Any?>(
@@ -1403,24 +1538,18 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         }
         if (vendorMaps.isEmpty()) {
             Log.d(TAG, "<- $commandByte not handled by SDK")
+            if (ppgCapture != null && ppgSequenceNumber != null) {
+                flushRawPpg(ppgCapture, ppgCapture.session.completeNotification(ppgSequenceNumber))
+                queueRawPpgUiUpdate(ppgCapture)
+            }
             if (notificationTrace != null && capture != null) {
                 capture.notificationDiagnostics.finishNotification(notificationTrace, bytes)
                 emitRawEcgStatus(capture)
             }
             return
         }
-            if (ppgCapture != null && ppgSequenceNumber != null) {
-                flushRawPpg(ppgCapture, ppgCapture.session.completeNotification(ppgSequenceNumber))
-                emitRawPpgStatus(ppgCapture)
-            }
         vendorMaps.forEach { vendor ->
             val dataType = vendor[DeviceKey.DataType]?.toString()
-            if (dataType == BleConst.GetECG && rawEcgCapture != null) {
-                val fields = vendor[DeviceKey.Data] as? Map<*, *> ?: emptyMap<Any?, Any?>()
-                val sampleValues = fields[DeviceKey.arrayEcgRawData]?.toString()
-                    ?.split(',')
-                    ?.mapNotNull { token -> token.trim().toIntOrNull() }
-                    ?: emptyList()
             if (ppgCapture != null && ppgSequenceNumber != null) {
                 val fields = vendor[DeviceKey.Data] as? Map<*, *>
                 ppgCapture.session.recordParserOutput(
@@ -1431,9 +1560,19 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                     notificationReceivedAt,
                 )
             }
+            if (dataType == BleConst.GetECG && rawEcgCapture != null) {
+                val fields = vendor[DeviceKey.Data] as? Map<*, *> ?: emptyMap<Any?, Any?>()
+                val sampleValues = fields[DeviceKey.arrayEcgRawData]?.toString()
+                    ?.split(',')
+                    ?.mapNotNull { token -> token.trim().toIntOrNull() }
+                    ?: emptyList()
                 rawEcgCapture?.noteType64(fields[DeviceKey.packetID]?.toString()?.toIntOrNull(), sampleValues, JCVitalV8Time.isoUtc(System.currentTimeMillis()))
             }
             routeVendorData(vendor)
+        }
+        if (ppgCapture != null && ppgSequenceNumber != null) {
+            flushRawPpg(ppgCapture, ppgCapture.session.completeNotification(ppgSequenceNumber))
+            queueRawPpgUiUpdate(ppgCapture)
         }
         if (notificationTrace != null && capture != null) {
             capture.notificationDiagnostics.finishNotification(notificationTrace, bytes)
@@ -1441,10 +1580,6 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         }
     }
 
-        if (ppgCapture != null && ppgSequenceNumber != null) {
-            flushRawPpg(ppgCapture, ppgCapture.session.completeNotification(ppgSequenceNumber))
-            emitRawPpgStatus(ppgCapture)
-        }
     private fun routeVendorData(vendor: Map<String?, Any?>) {
         val dataType = vendor[DeviceKey.DataType]?.toString()
         if (rawEcgCapture != null && dataType != null) {
@@ -1996,10 +2131,10 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         Log.w(TAG, "$code: $message")
         endWorkoutForError(message)
         endRawEcgForError(message)
+        endRawPpgForError(message)
         closeGatt()
         emitError(code, message)
         // Leave INITIALIZING before completing pending work so the handshake callback cannot re-enter fail().
-        endRawPpgForError(message)
         stateMachine.transition(JCVitalV8ConnectionState.ERROR, code.name)
         failPendingWork(JCVitalV8Exception(code, message))
     }
@@ -2062,10 +2197,10 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         stopScanInternal("released")
         endWorkoutForLinkLoss("Plugin released")
         endRawEcgForLinkLoss("Plugin released")
+        endRawPpgForLinkLoss("Plugin released")
         closeGatt()
         stateMachine.transition(JCVitalV8ConnectionState.DISCONNECTED, "released")
         failPendingWork(JCVitalV8Exception(JCVitalV8ErrorCode.CONNECTION_LOST, "Plugin released"))
-        endRawPpgForLinkLoss("Plugin released")
     }
 
     private fun requireUsable() {
@@ -2142,6 +2277,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         private const val CONNECT_TIMEOUT_MS = 20_000L
         private const val INIT_TIMEOUT_MS = 10_000L
         private const val COMMAND_TIMEOUT_MS = 8_000L
+        private const val RAW_PPG_UI_UPDATE_INTERVAL_MS = 750L
+        private const val RAW_PPG_SAFE_TEST_DURATION_MS = 20_000L
         private const val HISTORY_TIMEOUT_MS = 15_000L
         private const val HISTORY_PAGE_PACKETS = 50
         private const val HISTORY_MODE_START: Byte = 0x00
