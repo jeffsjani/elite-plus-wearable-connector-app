@@ -221,6 +221,7 @@ export interface JCVitalV8RawEcgStartDiagnostics {
   diagnosticState: string
   diagnosticClassification: string
   firstNotificationClassification: 'MEASUREMENT_COMMAND_RESPONSE' | 'REALTIME_FLAG_RESPONSE' | 'RAW_ECG_0X07' | 'VENDOR_STATUS' | 'UNKNOWN_NOTIFICATION' | null
+  secondNotificationClassification: 'MEASUREMENT_COMMAND_RESPONSE' | 'REALTIME_FLAG_RESPONSE' | 'RAW_ECG_0X07' | 'VENDOR_STATUS' | 'UNKNOWN_NOTIFICATION' | null
   measurementStartCommand: {
     queuedAt: string | null
     writeAckAt: string | null
@@ -231,10 +232,11 @@ export interface JCVitalV8RawEcgStartDiagnostics {
   }
   firstNotificationAfterStartAt: string | null
   vendorDataTypesSeenAfterEcgStart: Array<Record<string, unknown>>
-  rawCommand07NotificationCount: number
+  anyCommand07NotificationCount: number
+  ecgWaveformCandidate07Count: number
   firstCommand07NotificationAt: string | null
   lastCommand07NotificationAt: string | null
-  rawNotificationSamples: Array<Record<string, unknown>>
+  command07NotificationSamples: Array<Record<string, unknown>>
   type64CallbackCount: number
   firstType64CallbackAt: string | null
   lastType64CallbackAt: string | null

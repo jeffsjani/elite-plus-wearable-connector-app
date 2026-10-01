@@ -119,8 +119,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         val notificationDiagnostics = JCVitalV8RawEcgNotificationDiagnostics(System.currentTimeMillis())
         var firstCommand07NotificationAt: String? = null
         var lastCommand07NotificationAt: String? = null
-        var rawCommand07NotificationCount = 0
-        var rawCommand07SampleList = mutableListOf<Map<String, Any?>>()
+        var command07NotificationSamples = mutableListOf<Map<String, Any?>>()
         var firstType64CallbackAt: String? = null
         var lastType64CallbackAt: String? = null
         var type64CallbackCount = 0
@@ -156,16 +155,19 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
             if (diagnosticState == "START_COMMANDS_QUEUED") diagnosticState = "START_COMMANDS_WRITING"
         }
 
-        fun noteFirstNotificationAt(receivedAt: String) {
+        fun noteFirstNotificationAt(receivedAt: String, notification: ByteArray) {
             if (firstNotificationAfterStartAt == null) firstNotificationAfterStartAt = receivedAt
+            if ((notification.firstOrNull()?.toInt()?.and(0xFF)) == JCVitalV8RawEcgSession.ECG_COMMAND_BYTE) {
+                noteCommand07Notification(notification, receivedAt)
+            }
         }
 
-        fun noteRawCommand07(notification: ByteArray, receivedAt: String) {
-            rawCommand07NotificationCount += 1
+        fun noteCommand07Notification(notification: ByteArray, receivedAt: String) {
+            val isWaveformCandidate = notificationDiagnostics.noteCommand07Notification(notification)
             if (firstCommand07NotificationAt == null) firstCommand07NotificationAt = receivedAt
             lastCommand07NotificationAt = receivedAt
-            if (rawCommand07SampleList.size < 5) {
-                rawCommand07SampleList.add(
+            if (command07NotificationSamples.size < 5) {
+                command07NotificationSamples.add(
                     linkedMapOf(
                         "receivedAt" to receivedAt,
                         "notificationLength" to notification.size,
@@ -173,7 +175,9 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                     ),
                 )
             }
-            if (diagnosticState == "WAITING_FOR_DEVICE" || diagnosticState == "START_COMMANDS_WRITING") diagnosticState = "RECEIVING_RAW"
+            if (isWaveformCandidate && (diagnosticState == "WAITING_FOR_DEVICE" || diagnosticState == "START_COMMANDS_WRITING")) {
+                diagnosticState = "RECEIVING_RAW"
+            }
         }
 
         fun recordVendorType(dataType: String, receivedAt: String) {
@@ -211,8 +215,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
 
         fun snapshotDiagnostics(): Map<String, Any?> {
             val classification = diagnosticClassification ?: when {
-                rawCommand07NotificationCount == 0 && type64CallbackCount == 0 -> "NO_DEVICE_DATA"
-                rawCommand07NotificationCount > 0 && type64CallbackCount == 0 -> "RAW_NOTIFICATION_NO_TYPE64"
+                notificationDiagnostics.ecgWaveformCandidate07Count == 0 && type64CallbackCount == 0 -> "NO_DEVICE_DATA"
+                notificationDiagnostics.ecgWaveformCandidate07Count > 0 && type64CallbackCount == 0 -> "RAW_NOTIFICATION_NO_TYPE64"
                 type64CallbackCount > 0 && type64SampleList.all { (it["sampleCount"] as? Number)?.toInt() == 0 } -> "TYPE64_NO_SAMPLES"
                 else -> "RAW_ECG_RECEIVED"
             }
@@ -229,12 +233,14 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
                 ),
                 "firstNotificationAfterStartAt" to firstNotificationAfterStartAt,
                 "firstNotificationClassification" to notificationDiagnostics.firstNotificationClassification,
+                "secondNotificationClassification" to notificationDiagnostics.secondNotificationClassification,
                 "genericNotificationsAfterStart" to notificationDiagnostics.genericNotificationsAfterStart,
                 "vendorDataTypesSeenAfterEcgStart" to vendorDataTypesSeenAfterEcgStart.values.toList(),
-                "rawCommand07NotificationCount" to rawCommand07NotificationCount,
+                "anyCommand07NotificationCount" to notificationDiagnostics.anyCommand07NotificationCount,
+                "ecgWaveformCandidate07Count" to notificationDiagnostics.ecgWaveformCandidate07Count,
                 "firstCommand07NotificationAt" to firstCommand07NotificationAt,
                 "lastCommand07NotificationAt" to lastCommand07NotificationAt,
-                "rawNotificationSamples" to rawCommand07SampleList,
+                "command07NotificationSamples" to command07NotificationSamples,
                 "type64CallbackCount" to type64CallbackCount,
                 "firstType64CallbackAt" to firstType64CallbackAt,
                 "lastType64CallbackAt" to lastType64CallbackAt,
@@ -1081,7 +1087,7 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
             }
         }.also { main.postDelayed(it, COMMAND_TIMEOUT_MS) }
         capture.noDataTimeout = Runnable {
-            if (rawEcgCapture === capture && capture.rawCommand07NotificationCount == 0 && capture.type64CallbackCount == 0) {
+            if (rawEcgCapture === capture && capture.notificationDiagnostics.ecgWaveformCandidate07Count == 0 && capture.type64CallbackCount == 0) {
                 capture.ecgNoDataAfter10s = true
                 capture.diagnosticState = "NO_DATA_AFTER_10S"
                 emitRawEcgStatus(capture)
@@ -1319,8 +1325,12 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         val notificationReceivedAtMillis = System.currentTimeMillis()
         val notificationReceivedAt = JCVitalV8Time.isoUtc(notificationReceivedAtMillis)
         val capture = rawEcgCapture
-        capture?.noteFirstNotificationAt(notificationReceivedAt)
+        capture?.noteFirstNotificationAt(notificationReceivedAt, bytes)
         val notificationTrace = capture?.notificationDiagnostics?.captureNotification(
+            bytes,
+            notificationReceivedAt,
+            notificationReceivedAtMillis,
+        )
         val ppgCapture = rawPpgCapture
         val ppgSequenceNumber = if (
             bytes[0] == DeviceConst.CMD_Get_Bloodsugar || bytes[0] == DeviceConst.Bloodsugar_data
@@ -1493,9 +1503,6 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     private fun handleRawEcgNotification(notification: ByteArray) {
         val capture = rawEcgCapture ?: return
         val receivedAt = JCVitalV8Time.isoUtc(System.currentTimeMillis())
-        if ((notification[0].toInt() and 0xFF) == JCVitalV8RawEcgSession.ECG_COMMAND_BYTE) {
-            capture.noteRawCommand07(notification, receivedAt)
-        }
         val result = capture.session.acceptNotification(notification, receivedAt)
         result.parseError?.let { error ->
             capture.parseErrors.add(error)

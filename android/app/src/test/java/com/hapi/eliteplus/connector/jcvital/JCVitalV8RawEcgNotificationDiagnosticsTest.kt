@@ -33,6 +33,17 @@ class JCVitalV8RawEcgNotificationDiagnosticsTest {
     }
 
     @Test
+    fun countsShortCommand07AcknowledgmentWithoutCallingItAWaveformCandidate() {
+        val trace = JCVitalV8RawEcgNotificationDiagnostics(0L)
+
+        assertFalse(trace.noteCommand07Notification(byteArrayOf(0x07, 0x00, 0x01) + ByteArray(12) + byteArrayOf(0x08)))
+        assertTrue(trace.noteCommand07Notification(ByteArray(17).apply { this[0] = 0x07 }))
+
+        assertEquals(2, trace.anyCommand07NotificationCount)
+        assertEquals(1, trace.ecgWaveformCandidate07Count)
+    }
+
+    @Test
     fun recordsOnlyParserMetadataAndClassifiesSupportedNotificationBytes() {
         val trace = JCVitalV8RawEcgNotificationDiagnostics(0L)
         val command = byteArrayOf(DeviceConst.MeasurementWithType, 0x04, 0x01)
@@ -43,7 +54,7 @@ class JCVitalV8RawEcgNotificationDiagnosticsTest {
         val capture = trace.captureNotification(response, "measurement-response", 700L)!!
         trace.recordParserResult(capture, "74", true)
         trace.recordParserResult(capture, "66", false)
-        trace.finishNotification(capture, command)
+        trace.finishNotification(capture, response)
 
         assertEquals("MULTIPLE_RESULTS", capture.payload["sdkParserResult"])
         assertEquals(2, capture.payload["parserResultCount"])
@@ -55,13 +66,26 @@ class JCVitalV8RawEcgNotificationDiagnosticsTest {
     }
 
     @Test
-    fun classifiesRealtimeFlagResponseOnlyWhenItMatchesTheGeneratedCommand() {
+    fun classifiesShortAcknowledgedCommand07AsRealtimeFlagResponse() {
         val trace = JCVitalV8RawEcgNotificationDiagnostics(0L)
-        val command = byteArrayOf(0x07, 0x01, 0x22)
+        val command = ByteArray(16).apply {
+            this[0] = DeviceConst.PPG
+            this[1] = 1
+            this[15] = 8
+        }
         trace.recordRealtimeFlagCommand(command)
-        val capture = trace.captureNotification(command.copyOf(), "realtime-response", 1L)!!
-        trace.finishNotification(capture, command)
-        assertEquals("REALTIME_FLAG_RESPONSE", trace.firstNotificationClassification)
+        trace.recordRealtimeFlagCommandAck(100L)
+        val response = ByteArray(16).apply {
+            this[0] = DeviceConst.PPG
+            this[2] = 1
+            this[15] = 8
+        }
+        val first = trace.captureNotification(byteArrayOf(0x55), "preceding", 99L)!!
+        trace.finishNotification(first, byteArrayOf(0x55))
+        val capture = trace.captureNotification(response, "realtime-response", 101L)!!
+        trace.finishNotification(capture, response)
+        assertEquals("UNKNOWN_NOTIFICATION", trace.firstNotificationClassification)
+        assertEquals("REALTIME_FLAG_RESPONSE", trace.secondNotificationClassification)
     }
 
     @Test
@@ -78,6 +102,12 @@ class JCVitalV8RawEcgNotificationDiagnosticsTest {
         rawTrace.finishNotification(rawCapture, rawPacket)
         assertEquals("RAW_ECG_0X07", rawTrace.firstNotificationClassification)
         assertTrue(rawCapture.payload["fullBytesHex"] is String)
+
+        val controlTrace = JCVitalV8RawEcgNotificationDiagnostics(0L)
+        val control = byteArrayOf(0x07, 0x00, 0x01) + ByteArray(12) + byteArrayOf(0x08)
+        val controlCapture = controlTrace.captureNotification(control, "short-control", 1L)!!
+        controlTrace.finishNotification(controlCapture, control)
+        assertEquals("UNKNOWN_NOTIFICATION", controlTrace.firstNotificationClassification)
 
         val oversized = rawTrace.captureNotification(ByteArray(65), "oversized", 2L)!!
         assertFalse(oversized.payload.containsKey("fullBytesHex"))

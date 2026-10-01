@@ -14,7 +14,13 @@ internal class JCVitalV8RawEcgNotificationDiagnostics(
     }
 
     val genericNotificationsAfterStart = mutableListOf<MutableMap<String, Any?>>()
+    var anyCommand07NotificationCount = 0
+        private set
+    var ecgWaveformCandidate07Count = 0
+        private set
     var firstNotificationClassification: String? = null
+        private set
+    var secondNotificationClassification: String? = null
         private set
 
     private var measurementCommandBytes: ByteArray? = null
@@ -36,6 +42,14 @@ internal class JCVitalV8RawEcgNotificationDiagnostics(
 
     fun recordRealtimeFlagCommandAck(atMillis: Long) {
         realtimeFlagCommandAckAtMillis = atMillis
+    }
+
+    fun noteCommand07Notification(bytes: ByteArray): Boolean {
+        if (bytes.firstOrNull()?.toInt()?.and(0xFF) != (DeviceConst.PPG.toInt() and 0xFF)) return false
+        anyCommand07NotificationCount += 1
+        val isWaveformCandidate = bytes.size > ECG_STREAM_MIN_NOTIFICATION_BYTES
+        if (isWaveformCandidate) ecgWaveformCandidate07Count += 1
+        return isWaveformCandidate
     }
 
     fun captureNotification(bytes: ByteArray, receivedAt: String, receivedAtEpochMillis: Long): CapturedNotification? {
@@ -79,20 +93,41 @@ internal class JCVitalV8RawEcgNotificationDiagnostics(
     }
 
     fun finishNotification(capture: CapturedNotification, bytes: ByteArray) {
-        if (genericNotificationsAfterStart.firstOrNull() !== capture.payload || firstNotificationClassification != null) return
+        if (genericNotificationsAfterStart.getOrNull(0) === capture.payload && firstNotificationClassification == null) {
+            firstNotificationClassification = classifyNotification(capture, bytes)
+        } else if (genericNotificationsAfterStart.getOrNull(1) === capture.payload && secondNotificationClassification == null) {
+            secondNotificationClassification = classifyNotification(capture, bytes)
+        }
+    }
+
+    private fun classifyNotification(capture: CapturedNotification, bytes: ByteArray): String {
         val commandByte = bytes.firstOrNull()?.toInt()?.and(0xFF)
         val secondByte = bytes.getOrNull(1)?.toInt()?.and(0xFF)
-        firstNotificationClassification = when {
+        return when {
             commandByte == (DeviceConst.MeasurementWithType.toInt() and 0xFF) &&
+                bytes.size == measurementCommandBytes?.size &&
                 secondByte == measurementCommandBytes?.getOrNull(1)?.toInt()?.and(0xFF) -> "MEASUREMENT_COMMAND_RESPONSE"
-            realtimeFlagCommandBytes.contentEqualsBytes(bytes) -> "REALTIME_FLAG_RESPONSE"
+            isRealtimeFlagResponse(bytes, capture) -> "REALTIME_FLAG_RESPONSE"
             commandByte == JCVitalV8RawEcgSession.ECG_COMMAND_BYTE && bytes.size > ECG_STREAM_MIN_NOTIFICATION_BYTES -> "RAW_ECG_0X07"
             capture.parserDataTypes.any { it == BleConst.GetEcgPpgStatus || it == BleConst.EcgppGstatus } -> "VENDOR_STATUS"
             else -> "UNKNOWN_NOTIFICATION"
         }
     }
 
-    private fun ByteArray?.contentEqualsBytes(other: ByteArray): Boolean = this != null && this.contentEquals(other)
+    private fun isRealtimeFlagResponse(bytes: ByteArray, capture: CapturedNotification): Boolean {
+        val request = realtimeFlagCommandBytes ?: return false
+        return capture.payload["afterRealtimeFlagCommandAck"] == true &&
+            request.size == REALTIME_FLAG_COMMAND_LENGTH &&
+            request[0] == DeviceConst.PPG && request[1] == REALTIME_FLAG_ENABLE_VALUE &&
+            bytes.size == REALTIME_FLAG_COMMAND_LENGTH &&
+            bytes[0] == DeviceConst.PPG && bytes[1] == 0.toByte() && bytes[2] == REALTIME_FLAG_RESPONSE_MARKER &&
+            hasValidChecksum(bytes)
+    }
+
+    private fun hasValidChecksum(bytes: ByteArray): Boolean {
+        val checksum = bytes.dropLast(1).sumOf { it.toInt() and 0xFF } and 0xFF
+        return bytes.lastOrNull()?.toInt()?.and(0xFF) == checksum
+    }
 
     private fun ByteArray.toHex(): String = joinToString("") { "%02X".format(it.toInt() and 0xFF) }
 
@@ -101,6 +136,9 @@ internal class JCVitalV8RawEcgNotificationDiagnostics(
         const val MAX_NOTIFICATIONS = 10
         const val MAX_FULL_HEX_BYTES = 64
         const val MAX_PARSER_RESULTS_PER_NOTIFICATION = 10
+        private const val REALTIME_FLAG_COMMAND_LENGTH = 16
+        private const val REALTIME_FLAG_ENABLE_VALUE = 0x01.toByte()
+        private const val REALTIME_FLAG_RESPONSE_MARKER = 0x01.toByte()
         private const val ECG_STREAM_MIN_NOTIFICATION_BYTES = 16
     }
 }
