@@ -974,14 +974,15 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         }
 
     private fun emitRawPpgStatus(capture: RawPpgCapture) {
-        val payload = rawPpgPayload(capture)
+        // Terminal status carries the bounded first/last chunk summaries so a late status event cannot erase them.
+        val payload = rawPpgPayload(capture, includeChunkSamples = rawPpgCapture !== capture)
         emitRawPpgBridgeEvent(capture, JCVitalV8EventNormalizer.EVENT_RAW_PPG_STATUS, payload)
     }
 
     private fun flushRawPpg(capture: RawPpgCapture, chunk: RawPpgChunkFlush?) {
         if (chunk == null) return
         try {
-            capture.packetStore.appendChunk(chunk.rawPackets, chunk.exportSample)
+            capture.packetStore.appendChunk(chunk.rawPackets, chunk.liveSummary)
         } catch (error: Throwable) {
             capture.storageErrorCount++
             val message = "RAW_CAPTURE_LOSS: Could not persist raw PPG chunk: ${error.message}"

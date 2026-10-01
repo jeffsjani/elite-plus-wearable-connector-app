@@ -245,6 +245,23 @@ SDK source. Do not treat that constant alone as an acquisition method.
   field is documented for this PPG workflow. Keep those fields null until
   measured on hardware.
 
+### Phase 3D-B PPG workflow hardware validation
+
+- `PPG_WORKFLOW_RAW_VENDOR`: `CONFIRMED_HARDWARE` on PRO_V8 firmware 0.0.8.8.
+- `203_BYTE_LAYOUT`: `CONFIRMED_HARDWARE`. Observed physical data packets were
+  203 bytes; each yields 50 vendor-decoded values.
+- 153-byte parser support: implemented but NOT physically observed.
+- Sample rate: UNKNOWN (`sampleRateHz` stays null). Unit:
+  `UNKNOWN_VENDOR_UNIT`. Not calibrated PPG and not measured glucose.
+- Physical run (~20.6 s): 20 packets in 2 chunks, 3,686 bytes (18 x 203-byte,
+  2 x 16-byte), 18 vendor type-119 callbacks, 900 decoded values, raw range
+  3,510–16,593, 0 parse/storage/render errors, 0 dropped UI summaries.
+- Spool integrity: 3,686 raw bytes + 88 framing/header bytes (8-byte magic +
+  4-byte length prefix per packet) = 3,774 persisted bytes; 20 persisted packets.
+- Exports carry bounded first/last three chunk summaries only (sequence range,
+  packet count, wire bytes, length counts, timestamps, layout and type-119
+  counts); raw packet bytes stay in the native spool.
+
 ### ECG Android stream
 
 - Start: `BleSDK.SetDeviceMeasurementWithType(AutoTestMode.ECG, duration, true)`

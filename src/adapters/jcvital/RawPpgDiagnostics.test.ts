@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PpgDiagnosticErrorBoundary, RawPpgDiagnosticsView } from './JCVitalV8Panel'
 import type { JCVitalV8RawPpgChunk, JCVitalV8RawPpgSession } from './jcvitalV8Bridge'
-import { buildRawPpgValidation, createRawPpgUiCoalescer, EMPTY_RAW_PPG_CHUNK_SUMMARY, includeRawPpgChunk } from './RawPpgDiagnostics'
+import { buildRawPpgValidation, createRawPpgUiCoalescer, EMPTY_RAW_PPG_CHUNK_SUMMARY, includeRawPpgChunk, mergeRawPpgSession } from './RawPpgDiagnostics'
 import { rawPpgStartDisabledReason, rawPpgStopDisabledReason, type RawPpgCaptureGate } from './RawPpgCaptureGuard'
 
 function chunk(sequenceStart: number, packetCount = 1): JCVitalV8RawPpgChunk {
@@ -135,10 +135,32 @@ describe('raw PPG workflow diagnostics', () => {
     } as unknown as JCVitalV8RawPpgSession
     const report = buildRawPpgValidation(session, EMPTY_RAW_PPG_CHUNK_SUMMARY, [])
     expect(report).toMatchObject({ packetCount: 1, chunkCount: 1, bytesReceived: 153, vendorDataType119Count: 1 })
-    expect(report).toHaveProperty('first3Chunks.0.packets.0.originalBytes', [1, 2, 3])
+    expect(report).toHaveProperty('first3Chunks.0.sequenceStart', 0)
+    expect(report).toHaveProperty('first3Chunks.0.vendorType119Count', 1)
+    expect(report).not.toHaveProperty('first3Chunks.0.packets')
+    expect(report).not.toHaveProperty('last3Chunks.0.packets')
     expect(report).toHaveProperty('rawSampleDiagnostics.153.decodedSampleCount', 50)
     expect(report).not.toHaveProperty('glucose')
     expect(report).not.toHaveProperty('mgDl')
+  })
+
+  it('keeps final chunk summaries when a later status for the same session omits them', () => {
+    const final = { sessionId: 'ppg-1', status: 'STOPPED', first3Chunks: [chunk(0), chunk(1)], last3Chunks: [chunk(0), chunk(1)] } as unknown as JCVitalV8RawPpgSession
+    const lateStatus = { sessionId: 'ppg-1', status: 'STOPPED' } as unknown as JCVitalV8RawPpgSession
+    const merged = mergeRawPpgSession(final, lateStatus)
+    expect(merged.first3Chunks?.map((item) => item.sequenceStart)).toEqual([0, 1])
+    expect(merged.last3Chunks?.map((item) => item.sequenceStart)).toEqual([0, 1])
+    const nextSession = mergeRawPpgSession(final, { ...lateStatus, sessionId: 'ppg-2' })
+    expect(nextSession.first3Chunks).toBeUndefined()
+  })
+
+  it('reports frontend chunk and UI update counters in the export', () => {
+    const report = buildRawPpgValidation(
+      { sessionId: 'ppg-1', status: 'STOPPED', ppgChunkEventsSentToJs: 2 } as unknown as JCVitalV8RawPpgSession,
+      EMPTY_RAW_PPG_CHUNK_SUMMARY, [],
+      { chunkEventsReceivedByJs: 2, uiUpdateCount: 3, lastEventPayloadBytes: 0, maxEventPayloadBytes: 0 },
+    )
+    expect(report).toMatchObject({ ppgChunkEventsSentToJs: 2, ppgChunkEventsReceivedByJs: 2, ppgUiUpdateCount: 3 })
   })
 
   it('enables capture only when the V8 is ready and other workflows are idle', () => {

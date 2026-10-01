@@ -38,7 +38,7 @@ import { phase3bDisabledReason } from './Phase3BBridgeStatus'
 import { workoutStartDisabledReason, workoutStopDisabledReason } from './WorkoutCaptureGuard'
 import { rawEcgStartDisabledReason, rawEcgStopDisabledReason } from './RawEcgCaptureGuard'
 import { rawPpgStartDisabledReason, rawPpgStopDisabledReason } from './RawPpgCaptureGuard'
-import { buildRawPpgValidation, createRawPpgUiCoalescer, EMPTY_RAW_PPG_CHUNK_SUMMARY, includeRawPpgChunk, type RawPpgChunkSummary, type RawPpgUiUpdate } from './RawPpgDiagnostics'
+import { buildRawPpgValidation, createRawPpgUiCoalescer, EMPTY_RAW_PPG_CHUNK_SUMMARY, includeRawPpgChunk, mergeRawPpgSession, type RawPpgChunkSummary, type RawPpgUiUpdate } from './RawPpgDiagnostics'
 import { buildRawEcgValidation, EMPTY_RAW_ECG_CHUNK_SUMMARY, includeRawEcgChunk, type RawEcgChunkSummary } from './RawEcgDiagnostics'
 import {
   buildWorkoutLiveValidation,
@@ -198,7 +198,8 @@ export function JCVitalV8Panel() {
   useEffect(() => {
     const ppgCoalescer = createRawPpgUiCoalescer((update) => {
       if (update.status) {
-        setRawPpgSession(update.status)
+        const status = update.status
+        setRawPpgSession((current) => mergeRawPpgSession(current, status))
         if (['STARTING', 'RUNNING', 'STOPPING'].includes(update.status.status)) setActiveSync((current) => current ?? 'raw-ppg')
         else setActiveSync((current) => current?.startsWith('raw-ppg') ? null : current)
       }
@@ -281,7 +282,7 @@ export function JCVitalV8Panel() {
       if (['STARTING', 'RUNNING', 'STOPPING'].includes(session.status)) setActiveSync((current) => current ?? 'raw-ecg')
     }).catch(() => undefined)
     void JCVitalV8.getRawPpgStatus().then((session) => {
-      setRawPpgSession(session)
+      setRawPpgSession((current) => mergeRawPpgSession(current, session))
       if (['STARTING', 'RUNNING', 'STOPPING'].includes(session.status)) setActiveSync((current) => current ?? 'raw-ppg')
     }).catch(() => undefined)
     return () => {
@@ -525,11 +526,15 @@ export function JCVitalV8Panel() {
     setBusy(true)
     setMessage('')
     try {
-      setRawPpgSession(await JCVitalV8.stopRawPpg())
+      const session = await JCVitalV8.stopRawPpg()
+      setRawPpgSession((current) => mergeRawPpgSession(current, session))
       setActiveSync(null)
     } catch (error) {
       setMessage(errorText(error))
-      try { setRawPpgSession(await JCVitalV8.getRawPpgStatus()) } catch { /* keep last state */ }
+      try {
+        const session = await JCVitalV8.getRawPpgStatus()
+        setRawPpgSession((current) => mergeRawPpgSession(current, session))
+      } catch { /* keep last state */ }
       setActiveSync((current) => current === 'raw-ppg:stopping' ? 'raw-ppg' : current)
     } finally {
       setBusy(false)
@@ -558,7 +563,7 @@ export function JCVitalV8Panel() {
           workoutLiveValidation,
           ecgStartDiagnostics: rawEcgSession?.ecgStartDiagnostics ?? null,
           rawEcgValidation: buildRawEcgValidation(rawEcgSession, rawEcgChunks, rawEcgParseErrors),
-          rawPpgValidation: buildRawPpgValidation(rawPpgSession, rawPpgChunks, rawPpgParseErrors),
+          rawPpgValidation: buildRawPpgValidation(rawPpgSession, rawPpgChunks, rawPpgParseErrors, rawPpgUiDiagnostics, rawPpgRenderErrors),
         },
       })
       const filename = `jcvital-v8-phase3abc-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`

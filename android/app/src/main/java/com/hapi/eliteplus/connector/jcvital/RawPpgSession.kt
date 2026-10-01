@@ -30,7 +30,6 @@ internal data class RawSignalChunk(
     internal data class RawPpgChunkFlush(
         val liveSummary: Map<String, Any?>,
         val rawPackets: List<ByteArray>,
-        val exportSample: Map<String, Any?>,
     )
 
     internal data class RawPpgNotificationCapture(
@@ -305,19 +304,6 @@ internal class RawPpgSession(
 
     private fun flushChunk(): RawPpgChunkFlush? {
         if (bufferedPackets.isEmpty()) return null
-        val packetSummaries = bufferedPackets.map { packet ->
-                linkedMapOf(
-                    "sessionId" to sessionId,
-                    "sequenceNumber" to packet.sequenceNumber,
-                    "receivedAt" to packet.receivedAt,
-                    "notificationLength" to packet.originalBytes.size,
-                    "vendorCommandByte" to (packet.originalBytes[0].toInt() and 0xFF),
-                    "originalBytes" to packet.originalBytes.map { it.toInt() and 0xFF },
-                    "vendorDataType119" to (packet.parserOutputs.any { it["dataType"] == VENDOR_DATA_TYPE_119 }),
-                    "vendorParserOutput" to packet.parserOutputs.toList(),
-                    "decodedSampleCount" to packet.decodedSampleCount,
-                )
-            }
         val lengthCounts = linkedMapOf(
             LENGTH_153.toString() to bufferedPackets.count { it.originalBytes.size == LENGTH_153 },
             LENGTH_203.toString() to bufferedPackets.count { it.originalBytes.size == LENGTH_203 },
@@ -353,8 +339,7 @@ internal class RawPpgSession(
             "decoded203Summary" to layoutSummary(LENGTH_203),
             "parseErrorCount" to parseErrorsInChunk,
         )
-        val exportSample = LinkedHashMap(summary).apply { put("packets", packetSummaries) }
-        val chunk = RawPpgChunkFlush(summary, bufferedPackets.map { it.originalBytes.copyOf() }, exportSample)
+        val chunk = RawPpgChunkFlush(summary, bufferedPackets.map { it.originalBytes.copyOf() })
         chunkCount++
         bufferedPackets.clear()
         bufferedEstimatedBytes = 0

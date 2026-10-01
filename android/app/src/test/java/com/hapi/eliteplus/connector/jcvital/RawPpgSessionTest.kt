@@ -44,9 +44,8 @@ class RawPpgSessionTest {
         assertEquals(2, chunk.liveSummary["packetCount"])
         assertEquals(2L, chunk.liveSummary["vendorType119Count"])
         assertFalse(chunk.liveSummary.containsKey("packets"))
-        val packets = chunk.exportSample["packets"] as List<*>
-        assertEquals(first.map { it.toInt() and 0xFF }, (packets[0] as Map<*, *>)["originalBytes"])
-        assertEquals(second.map { it.toInt() and 0xFF }, (packets[1] as Map<*, *>)["originalBytes"])
+        assertEquals(mapOf("153" to 1, "203" to 1, "other" to 0), chunk.liveSummary["notificationLengthCounts"])
+        assertEquals(356, chunk.liveSummary["wireBytes"])
         assertEquals(listOf(first, second).map { it.toList() }, chunk.rawPackets.map { it.toList() })
     }
 
@@ -60,7 +59,7 @@ class RawPpgSessionTest {
 
         assertEquals(mapOf("153" to 0L, "203" to 0L, "other" to 1L), session.toMap()["notificationLengthCounts"])
         assertEquals(1L, session.parseErrorCount)
-        assertEquals(bytes.map { it.toInt() and 0xFF }, (((chunk.exportSample["packets"] as List<*>).first() as Map<*, *>)["originalBytes"]))
+        assertEquals(listOf(bytes.toList()), chunk.rawPackets.map { it.toList() })
         assertFalse(chunk.liveSummary.containsKey("packets"))
     }
 

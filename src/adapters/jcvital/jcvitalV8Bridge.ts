@@ -340,8 +340,8 @@ export interface JCVitalV8RawPpgSession {
   ppgUiSummaryEventDropped?: number
   ppgLastEventPayloadBytes?: number
   ppgMaxEventPayloadBytes?: number
-  first3Chunks?: JCVitalV8RawPpgChunkSample[]
-  last3Chunks?: JCVitalV8RawPpgChunkSample[]
+  first3Chunks?: JCVitalV8RawPpgChunk[]
+  last3Chunks?: JCVitalV8RawPpgChunk[]
   source?: WearableSource
   parseErrors: Array<Record<string, unknown>>
 }
@@ -367,20 +367,6 @@ export interface JCVitalV8RawPpgLayoutSummary {
   decodedSampleCount: number
   minimumRawDecodedValue: number | null
   maximumRawDecodedValue: number | null
-}
-
-export interface JCVitalV8RawPpgChunkSample extends JCVitalV8RawPpgChunk {
-  packets: Array<{
-    sessionId: string
-    sequenceNumber: number
-    receivedAt: string
-    notificationLength: number
-    vendorCommandByte: number
-    originalBytes: number[]
-    vendorDataType119: boolean
-    vendorParserOutput: Array<Record<string, unknown>>
-    decodedSampleCount: number
-  }>
 }
 
 export interface JCVitalV8RawPpgErrorEvent {

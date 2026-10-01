@@ -2,6 +2,19 @@
 
 Elite+ labels this capture `PPG_WORKFLOW_RAW_VENDOR`. The checked-in SDK does not implement `realtimePPGData_V8` or `arrayPPGData`; this workflow uses `BleSDK.ppgWithMode` and the vendor's BGEM/blood-glucose-risk UI. Vendor naming is not evidence of a measured glucose result or calibrated generic PPG.
 
+## Hardware Validation Status
+
+| Capability | Status |
+| --- | --- |
+| PPG workflow (`PPG_WORKFLOW_RAW_VENDOR`) | `CONFIRMED_HARDWARE` on PRO_V8 firmware 0.0.8.8 |
+| Observed physical packet layout | 203 bytes (`203_BYTE_LAYOUT` = `CONFIRMED_HARDWARE`) |
+| Values | 50 vendor-decoded values per data packet |
+| 153-byte parser support | Implemented but NOT physically observed |
+| Sample rate | UNKNOWN |
+| Unit | `UNKNOWN_VENDOR_UNIT` |
+
+No calibrated PPG unit, `sampleRateHz`, or measured-glucose mapping is assigned.
+
 ## Commands and Status
 
 `ppgWithMode` creates a 16-byte command beginning with `DeviceConst.CMD_Get_Bloodsugar` (`0x78`) and uses the final byte as the low byte of the sum of all preceding bytes. Modes are documented as 1=start, 2=send measurement result, 3=stop, 4=send progress, and 5=quit/exit. The builder sets its static `startBloodsugar` flag true only for mode 1.

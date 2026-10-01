@@ -205,6 +205,25 @@ export function includeRawPpgChunk(summary: RawPpgChunkSummary, chunk: JCVitalV8
   }
 }
 
+function boundedChunkSummaries(value: unknown, keep: 'first' | 'last'): JCVitalV8RawPpgChunk[] {
+  if (!Array.isArray(value)) return []
+  const items = keep === 'first' ? value.slice(0, 3) : value.slice(-3)
+  return items.filter((item) => item && typeof item === 'object').map((item) => normalizeChunk(item as JCVitalV8RawPpgChunk))
+}
+
+/** Applies a native PPG session update while keeping bounded chunk summaries from an earlier payload of the same session. */
+export function mergeRawPpgSession(
+  current: JCVitalV8RawPpgSession | null,
+  next: JCVitalV8RawPpgSession,
+): JCVitalV8RawPpgSession {
+  const sameSession = current != null && current.sessionId === next.sessionId
+  const first3Chunks = Array.isArray(next.first3Chunks) ? boundedChunkSummaries(next.first3Chunks, 'first')
+    : sameSession ? current.first3Chunks : undefined
+  const last3Chunks = Array.isArray(next.last3Chunks) ? boundedChunkSummaries(next.last3Chunks, 'last')
+    : sameSession ? current.last3Chunks : undefined
+  return { ...next, first3Chunks, last3Chunks }
+}
+
 export function buildRawPpgValidation(
   session: JCVitalV8RawPpgSession | null,
   chunks: RawPpgChunkSummary,
@@ -223,8 +242,8 @@ export function buildRawPpgValidation(
     notificationLengthCounts: session?.notificationLengthCounts ?? chunks.notificationLengthCounts,
     notificationLengthsExactCounts: session?.notificationLengthsExactCounts ?? {},
     vendorDataType119Count: session?.vendorDataType119Count ?? chunks.vendorDataType119Count ?? 0,
-    first3Chunks: Array.isArray(session?.first3Chunks) ? session.first3Chunks.slice(0, 3) : [],
-    last3Chunks: Array.isArray(session?.last3Chunks) ? session.last3Chunks.slice(-3) : [],
+    first3Chunks: boundedChunkSummaries(session?.first3Chunks, 'first'),
+    last3Chunks: boundedChunkSummaries(session?.last3Chunks, 'last'),
     decodedFieldNames: Array.isArray(session?.decodedFieldNames) ? session.decodedFieldNames.slice(0, 32) : [],
     rawSampleDiagnostics: session?.rawSampleDiagnostics ?? {},
     vendorDerivedFields: Array.isArray(session?.vendorDerivedFields) ? session.vendorDerivedFields.slice(0, 16) : [],
