@@ -46,6 +46,13 @@ import {
   type LiveWorkoutPacket,
   type LiveWorkoutSession,
 } from './WorkoutTelemetry'
+import { WorkoutHrDeliveryService, type WorkoutHrDeliverySnapshot } from './WorkoutHrDelivery'
+import { WORKOUT_HR_E2E_TEST_DURATION_MS, WorkoutHrDeliveryView } from './WorkoutHrDeliveryView'
+import { observationQueue } from '../../services/sync/ObservationQueue'
+import { observationBatchManager } from '../../services/sync/ObservationBatchManager'
+import { connectorIdentityService } from '../../services/base44/ConnectorIdentityService'
+import { jcvitalDeviceIdentityService } from '../../services/storage/JCVitalDeviceIdentityService'
+import type { QueueStats } from '../../services/storage/ObservationQueueStore'
 
 type ExportStatus = 'EXPORTING' | 'EXPORT SUCCESS' | 'EXPORT FAILED'
 
@@ -194,6 +201,47 @@ export function JCVitalV8Panel() {
   const [sleepRun, setSleepRun] = useState<SleepFeedRun>({})
   const [exportStatus, setExportStatus] = useState<ExportStatus | null>(null)
   const [exportLocation, setExportLocation] = useState<string | null>(null)
+  const hrDeliveryRef = useRef<WorkoutHrDeliveryService | null>(null)
+  const [hrDeliverySnapshot, setHrDeliverySnapshot] = useState<WorkoutHrDeliverySnapshot | null>(null)
+  const [deliveryQueueStats, setDeliveryQueueStats] = useState<QueueStats | null>(null)
+  const [deliveryClock, setDeliveryClock] = useState(Date.now())
+  const [hrTestEndsAt, setHrTestEndsAt] = useState<number | null>(null)
+  const hrTestTimerRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    const hrDelivery = new WorkoutHrDeliveryService({
+      queue: observationQueue,
+      deliver: () => observationBatchManager.process(),
+      subscribe: (listener) => observationBatchManager.subscribe(listener),
+      resolveDeviceId: (bleAddress) => jcvitalDeviceIdentityService.resolve(bleAddress),
+    })
+    hrDeliveryRef.current = hrDelivery
+    const unsubscribe = hrDelivery.onChange(() => setHrDeliverySnapshot(hrDelivery.getSnapshot()))
+    hrDelivery.start()
+    return () => {
+      unsubscribe()
+      hrDelivery.dispose()
+      hrDeliveryRef.current = null
+      if (hrTestTimerRef.current !== null) window.clearTimeout(hrTestTimerRef.current)
+      hrTestTimerRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    if (info) hrDeliveryRef.current?.setContext({ bleAddress: info.macAddress ?? info.deviceId, firmwareVersion: info.firmwareVersion ?? null, sdkVersion: info.sdkVersion })
+  }, [info])
+
+  const hrDeliveryActive = Boolean(hrDeliverySnapshot?.enabled) || hrTestEndsAt !== null
+  useEffect(() => {
+    if (!hrDeliveryActive) return
+    const refresh = () => {
+      setDeliveryClock(Date.now())
+      void observationQueue.getQueueStats().then(setDeliveryQueueStats).catch(() => undefined)
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 2000)
+    return () => window.clearInterval(timer)
+  }, [hrDeliveryActive])
 
   useEffect(() => {
     const ppgCoalescer = createRawPpgUiCoalescer((update) => {
@@ -232,7 +280,9 @@ export function JCVitalV8Panel() {
       JCVitalV8.addListener('jcvitalError', setLastError),
       JCVitalV8.addListener('jcvitalWorkoutState', (session) => {
         setWorkoutSession(session)
+        hrDeliveryRef.current?.setContext({ bleAddress: session.deviceId, firmwareVersion: session.firmwareVersion, sdkVersion: session.sdkVersion, vendorActivityMode: session.vendorActivityMode })
         if (['IDLE', 'STOPPED', 'ERROR', 'DISCONNECTED'].includes(session.status)) {
+          if (session.status !== 'IDLE') void hrDeliveryRef.current?.handleWorkoutEnded(session.sessionId)
           setActiveSync((current) => current?.startsWith('workout:') ? null : current)
         } else {
           setActiveSync((current) => current ?? 'workout:capture')
@@ -243,7 +293,10 @@ export function JCVitalV8Panel() {
           ? [...current, packet]
           : [packet])
       }),
-      JCVitalV8.addListener('jcvitalWorkoutHeartRate', setWorkoutHeartRateEvent),
+      JCVitalV8.addListener('jcvitalWorkoutHeartRate', (event) => {
+        setWorkoutHeartRateEvent(event)
+        hrDeliveryRef.current?.handleHeartRate(event)
+      }),
       JCVitalV8.addListener('jcvitalWorkoutError', setWorkoutError),
       JCVitalV8.addListener('jcvitalWorkoutParseError', (error) => {
         setWorkoutParseErrors((current) => [...current, typeof error === 'object' && error !== null ? error as Record<string, unknown> : { error }])
@@ -420,7 +473,7 @@ export function JCVitalV8Panel() {
     }
   }
 
-  async function startWorkout(): Promise<void> {
+  async function startWorkout(): Promise<boolean> {
     setWorkoutPackets([])
     setWorkoutParseErrors([])
     setWorkoutHeartRateEvent(null)
@@ -429,22 +482,48 @@ export function JCVitalV8Panel() {
     setBusy(true)
     setMessage('')
     try {
-      setWorkoutSession(await JCVitalV8.startWorkoutCapture({ activityMode }))
+      const session = await JCVitalV8.startWorkoutCapture({ activityMode })
+      hrDeliveryRef.current?.setContext({ bleAddress: session.deviceId, firmwareVersion: session.firmwareVersion, sdkVersion: session.sdkVersion, vendorActivityMode: session.vendorActivityMode ?? activityMode })
+      setWorkoutSession(session)
+      return true
     } catch (error) {
       setActiveSync(null)
       setMessage(errorText(error))
+      return false
     } finally {
       setBusy(false)
     }
   }
 
+  function clearHrTestTimer(): void {
+    if (hrTestTimerRef.current !== null) window.clearTimeout(hrTestTimerRef.current)
+    hrTestTimerRef.current = null
+    setHrTestEndsAt(null)
+  }
+
+  async function startHrDeliveryTest(): Promise<void> {
+    const delivery = hrDeliveryRef.current
+    if (!delivery) return
+    delivery.resetDiagnostics()
+    delivery.setEnabled(true)
+    if (!(await startWorkout())) return
+    setHrTestEndsAt(Date.now() + WORKOUT_HR_E2E_TEST_DURATION_MS)
+    hrTestTimerRef.current = window.setTimeout(() => {
+      hrTestTimerRef.current = null
+      void stopWorkout()
+    }, WORKOUT_HR_E2E_TEST_DURATION_MS)
+  }
+
   async function stopWorkout(): Promise<void> {
+    clearHrTestTimer()
     setActiveSync('workout:stopping')
     setBusy(true)
     setMessage('')
     try {
-      setWorkoutSession(await JCVitalV8.stopWorkoutCapture())
+      const session = await JCVitalV8.stopWorkoutCapture()
+      setWorkoutSession(session)
       setActiveSync(null)
+      await hrDeliveryRef.current?.handleWorkoutEnded(session.sessionId)
     } catch (error) {
       setMessage(errorText(error))
       try { setWorkoutSession(await JCVitalV8.getWorkoutCaptureStatus()) } catch { /* keep last state */ }
@@ -564,6 +643,7 @@ export function JCVitalV8Panel() {
           ecgStartDiagnostics: rawEcgSession?.ecgStartDiagnostics ?? null,
           rawEcgValidation: buildRawEcgValidation(rawEcgSession, rawEcgChunks, rawEcgParseErrors),
           rawPpgValidation: buildRawPpgValidation(rawPpgSession, rawPpgChunks, rawPpgParseErrors, rawPpgUiDiagnostics, rawPpgRenderErrors),
+          workoutHrDelivery: hrDeliverySnapshot ? { ...hrDeliverySnapshot, queueStats: deliveryQueueStats } : null,
         },
       })
       const filename = `jcvital-v8-phase3abc-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
@@ -691,6 +771,7 @@ export function JCVitalV8Panel() {
   const otherActiveMeasurement = activeSync ?? (realtime ? 'manual HR measurement' : null)
   const workoutStatus = workoutSession?.status ?? 'IDLE'
   const workoutActive = ['STARTING', 'RUNNING', 'PAUSED', 'STOPPING'].includes(workoutStatus)
+  const connectorRegistered = Boolean(connectorIdentityService.getConnectorDeviceId())
   return (
     <section className="wearables" aria-labelledby="jcvital-v8-title">
       <div className="wearables-heading"><h2 id="jcvital-v8-title">JCVital Pro V8</h2><strong>{state}</strong></div>
@@ -887,6 +968,21 @@ export function JCVitalV8Panel() {
           </tr>)}</tbody>
         </table>
       </div>
+      {hrDeliverySnapshot && <WorkoutHrDeliveryView
+        snapshot={hrDeliverySnapshot}
+        queueStats={deliveryQueueStats}
+        connectorRegistered={connectorRegistered}
+        bleDeviceLocalOnly={info?.macAddress ?? info?.deviceId ?? workoutSession?.deviceId ?? null}
+        online={typeof navigator === 'undefined' || navigator.onLine}
+        e2eTestEndsAt={hrTestEndsAt}
+        now={deliveryClock}
+        startTestDisabledReason={workoutStartReason ?? (connectorRegistered ? null : 'Connector is not registered with Elite+')}
+        busy={busy}
+        onToggleEnabled={(enabled) => hrDeliveryRef.current?.setEnabled(enabled)}
+        onStartTest={() => void startHrDeliveryTest()}
+        onFlush={() => void hrDeliveryRef.current?.flush('MANUAL')}
+        onReplay={() => void hrDeliveryRef.current?.replay()}
+      />}
       {message && <p className="error-message" role="alert">{message}</p>}
       {lastError && <p>Last native error: {lastError.code} — {lastError.message}</p>}
     </section>

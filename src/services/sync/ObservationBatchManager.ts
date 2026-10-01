@@ -16,6 +16,24 @@ export interface BatchManagerConfig {
 
 const defaultConfig: BatchManagerConfig = { batchSize: 100, staleInFlightMs: 15 * 60 * 1000, retryBaseMs: 5_000, retryMaxMs: 5 * 60 * 1000 }
 
+export type BatchDeliveryOutcome = 'DELIVERED' | 'PARTIAL' | 'RETRYING' | 'FAILED'
+
+export interface BatchDeliveryEvent {
+  batchId: string
+  attemptedAt: string
+  outcome: BatchDeliveryOutcome
+  observationIds: string[]
+  acknowledgedIds: string[]
+  rejectedIds: string[]
+  httpStatus: number | null
+  errorCode: string | null
+  accepted: number | null
+  duplicate: number | null
+  rejected: number | null
+}
+
+export type BatchDeliveryListener = (event: BatchDeliveryEvent) => void
+
 function createBatchId(): string { return crypto.randomUUID() }
 
 export class ObservationBatchManager {
@@ -25,6 +43,7 @@ export class ObservationBatchManager {
   private rerunRequested = false
   private paused = false
   private unsubscribeNetwork: () => void = () => undefined
+  private readonly listeners = new Set<BatchDeliveryListener>()
 
   constructor(config: Partial<BatchManagerConfig> = {}, network: NetworkStatus = new BrowserNetworkStatus()) { this.config = { ...defaultConfig, ...config }; this.network = network }
 
@@ -41,6 +60,17 @@ export class ObservationBatchManager {
 
   pause(): void { this.paused = true }
   resume(): void { this.paused = false; void this.process() }
+
+  subscribe(listener: BatchDeliveryListener): () => void {
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+
+  private notify(event: BatchDeliveryEvent): void {
+    for (const listener of this.listeners) {
+      try { listener(event) } catch { /* diagnostics listeners must not affect delivery */ }
+    }
+  }
 
   private handleVisibility = (): void => { if (document.visibilityState === 'visible') void this.process() }
 
@@ -62,6 +92,8 @@ export class ObservationBatchManager {
     const records = await observationQueue.getPending(this.config.batchSize)
     if (!records.length) return null
     const batchId = createBatchId()
+    const attemptedAt = new Date().toISOString()
+    const observationIds = records.map((record) => record.observationId)
     await observationQueue.markInFlight(records.map((record) => record.queueId), batchId)
     try {
       const response = await connectorObservationService.submitObservations({ installId: this.installId(), connectorDeviceId, batchId, observations: records.map((record) => record.payload) })
@@ -73,6 +105,7 @@ export class ObservationBatchManager {
         await observationQueue.markPermanentFailure(rejectedQueueIds, { code: 'VALIDATION_ERROR', message: 'Observation rejected by the connector service.' })
       }
       await observationQueue.purgeAcknowledged()
+      this.notify({ batchId, attemptedAt, outcome: rejectedIds.size ? 'PARTIAL' : 'DELIVERED', observationIds, acknowledgedIds: successfulIds, rejectedIds: [...rejectedIds], httpStatus: 200, errorCode: null, accepted: response.accepted, duplicate: response.duplicate, rejected: response.rejected })
       return response
     } catch (error) {
       const mapped = error instanceof ConnectorServiceError ? error : new ConnectorServiceError('NETWORK_ERROR', 'Observation upload failed.')
@@ -82,6 +115,7 @@ export class ObservationBatchManager {
         await observationQueue.markRetry(records.map((record) => record.queueId), { code: mapped.code, message: mapped.message }, this.nextAttempt(records))
       }
       else await observationQueue.markPermanentFailure(records.map((record) => record.queueId), { code: mapped.code, message: mapped.message })
+      this.notify({ batchId, attemptedAt, outcome: retryable ? 'RETRYING' : 'FAILED', observationIds, acknowledgedIds: [], rejectedIds: retryable ? [] : observationIds, httpStatus: mapped.status ?? null, errorCode: mapped.code, accepted: null, duplicate: null, rejected: null })
       return null
     }
   }

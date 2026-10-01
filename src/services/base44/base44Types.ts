@@ -56,6 +56,24 @@ export interface NativeObservationInput {
   originPackage?: string
   deviceManufacturer?: string
   deviceModel?: string
+  // Optional direct-wearable provenance (Build 5A); backend persistence of these fields must be confirmed server-side.
+  metricType?: string
+  sourceConnector?: string
+  sourceProvider?: string
+  sourcePath?: string
+  acquisitionMode?: string
+  measurementContext?: string
+  sessionId?: string
+  packetSequence?: number
+  observedAt?: string
+  observedAtSource?: string
+  timestampConfidence?: string
+  receivedAt?: string
+  deviceId?: string
+  firmwareVersion?: string | null
+  sdkVersion?: string | null
+  vendorDataType?: string
+  rawSourceMetadata?: Record<string, string | number | boolean | null>
 }
 
 export interface ConnectorObservationsRequest {

@@ -361,3 +361,50 @@ model, HeartRateSeries model, and adapter architecture are code-certified and
 covered by unit tests; native bridge and Base44 series delivery are not yet
 implemented). `BUILD_7A_DEVICE_CERTIFIED` = **PENDING** (no hardware, no
 native SDK).
+
+## Build 5A: JCVital Workout HR → Elite+ Ingestion Golden Path
+
+Only physically validated V8 live workout HR (vendor type 82,
+`jcvitalWorkoutHeartRate`) is delivered. Native acquisition is unchanged; PPG,
+ECG and other V8 metrics are not uploaded.
+
+- Transport: existing Base44 `nativeConnectorObservations` through the Build 3
+  durable queue and `ObservationBatchManager`; no new endpoint or credential.
+- Auth: the user's Base44 session bearer token plus `X-App-Id` and the
+  registered `connectorDeviceId`; ownership is derived server-side.
+- Mapping (`src/adapters/jcvital/WorkoutHrDelivery.ts`): `source=jcvital_native`,
+  `provider=JCVITAL`, `metric=heartRate` (same metric name as the Apple Health
+  and Health Connect HR feeds), `metricType=HEART_RATE`, `unit=bpm`, plus
+  optional provenance fields `sourceConnector=JCVITAL_NATIVE`,
+  `sourcePath=DIRECT_BLE`, `deviceModel=PRO_V8`, opaque `deviceId`, `firmwareVersion`,
+  `sdkVersion`, `sessionId`, `packetSequence`, `acquisitionMode=WORKOUT_REALTIME`,
+  `measurementContext=WORKOUT`, `vendorDataType=82` and a small
+  `rawSourceMetadata`. Raw workout sessions are never attached.
+- Time: type-82 packets carry no device timestamp. `observedAt`/`startTime`
+  is the Connector's native BLE receipt time
+  (`observedAtSource=CONNECTOR_BLE_RECEIPT_TIME`,
+  `timestampConfidence=RECEIPT_TIME_NO_VENDOR_TIMESTAMP`); `receivedAt` is kept
+  separately.
+- Idempotency: `sourceRecordId = JCVITAL_NATIVE:PRO_V8:{backendDeviceId}:{sessionId}:HEART_RATE:{packetSequence}:{observedAt}`;
+  `observationId = SHA-256(ownerUserId:sourceRecordId)`. The queue is unique on
+  owner + observationId; the backend deduplicates by observationId.
+- Device identity: the Bluetooth MAC stays local (scan/connect/reconnect and
+  the mapping key). `JCVitalDeviceIdentityService` maps the normalized MAC to a
+  random `jcvital_device_<uuid v4>` persisted in Connector `localStorage`
+  (`jcvitalDeviceIdentityMap.v1`, same durability as `installId`). Only that
+  opaque ID is sent as `deviceId`/`sourceId`; payloads containing a MAC fail
+  preflight. Clearing app data creates a new ID for the same band.
+- Zero/implausible HR (startup sensor acquisition) is counted, not sent.
+- Batching: each HR is written to the durable queue at capture; delivery is
+  requested every 15 observations or 15 s, and on workout stop. Each request
+  carries up to 100 observations with individual timestamps. Network/5xx/408/429
+  failures stay queued with backoff and are retried by the 15 s timer.
+- Diagnostics: "Elite+ Delivery · Workout HR" in the V8 panel and
+  `workoutHrDelivery` in the validation export. Delivery is opt-in per session.
+
+**Backend blocker:** the Base44 backend source is not in this repository. It
+must be confirmed server-side that `nativeConnectorObservations` accepts
+`source=jcvital_native`, persists the optional provenance fields on
+NativeObservation, and that canonical processing maps `heartRate`/`bpm` from
+this source into the existing canonical heart-rate metric with a source
+reference and no elevated source priority.

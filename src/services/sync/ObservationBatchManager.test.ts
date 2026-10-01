@@ -141,6 +141,27 @@ describe('ObservationBatchManager', () => {
     expect((await observationQueue.getQueueStats()).failed).toBe(1)
   })
 
+  it('reports delivered and retrying batch outcomes to subscribers', async () => {
+    Object.assign(globalThis, { localStorage: new TestStorage() })
+    const owner = `listener-${Date.now()}`
+    observationQueue.setOwnerUserId(owner)
+    await observationQueue.initialize()
+    const queued = await observationQueue.enqueue(createSyntheticObservation())
+    connectorIdentityService.setConnectorDeviceId('device-test')
+    vi.spyOn(authenticationService, 'isAuthenticated').mockResolvedValue(true)
+    const upload = vi.spyOn(connectorObservationService, 'submitObservations').mockRejectedValueOnce(new ConnectorServiceError('SERVER_ERROR', 'down', 503))
+    const manager = new ObservationBatchManager({ retryBaseMs: 0, retryMaxMs: 0 }, new TestNetwork(true))
+    const events: Array<{ outcome: string; httpStatus: number | null; acknowledgedIds: string[] }> = []
+    manager.subscribe((event) => events.push(event))
+
+    await manager.process()
+    upload.mockResolvedValueOnce({ success: true, batchId: 'batch', accepted: 1, duplicate: 0, rejected: 0, errors: [], serverTimestamp: new Date().toISOString() })
+    await manager.process()
+
+    expect(events.map((event) => [event.outcome, event.httpStatus])).toEqual([['RETRYING', 503], ['DELIVERED', 200]])
+    expect(events[1].acknowledgedIds).toEqual([queued.record.observationId])
+  })
+
   it('recovers an ACK-loss in-flight row and clears a duplicate response', async () => {
     Object.assign(globalThis, { localStorage: new TestStorage() })
     const owner = `ack-loss-${Date.now()}`
@@ -152,7 +173,8 @@ describe('ObservationBatchManager', () => {
     vi.spyOn(authenticationService, 'isAuthenticated').mockResolvedValue(true)
     const upload = vi.spyOn(connectorObservationService, 'submitObservations').mockResolvedValue({ success: true, batchId: 'retry-batch', accepted: 0, duplicate: 1, rejected: 0, errors: [], serverTimestamp: new Date().toISOString() })
 
-    await new ObservationBatchManager({ staleInFlightMs: 0 }, new TestNetwork(true)).process()
+    // Negative staleness avoids a same-millisecond updatedAt/staleBefore race.
+    await new ObservationBatchManager({ staleInFlightMs: -1_000 }, new TestNetwork(true)).process()
 
     expect(upload).toHaveBeenCalledTimes(1)
     const stats = await observationQueue.getQueueStats()
