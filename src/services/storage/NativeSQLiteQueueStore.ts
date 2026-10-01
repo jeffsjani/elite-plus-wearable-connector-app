@@ -17,14 +17,32 @@ function createId(): string { return crypto.randomUUID() }
 function nowIso(): string { return new Date().toISOString() }
 
 export class NativeSQLiteQueueStore implements ObservationQueueStore {
+  readonly storeType = 'SQLITE' as const
+  readonly databaseName = database
   private initialized = false
+  private initializing: Promise<void> | null = null
+  private schemaVersion: number | null = null
+
+  getSchemaVersion(): number | null { return this.schemaVersion }
 
   async initialize(): Promise<void> {
     if (this.initialized) return
-    await CapacitorSQLite.createConnection({ database, version: schemaVersion, encrypted: false, mode: 'no-encryption', readonly: false })
-    await CapacitorSQLite.open({ database })
+    if (!this.initializing) this.initializing = this.openAndMigrate().finally(() => { this.initializing = null })
+    await this.initializing
+  }
+
+  private async openAndMigrate(): Promise<void> {
+    try {
+      await CapacitorSQLite.createConnection({ database, version: schemaVersion, encrypted: false, mode: 'no-encryption', readonly: false })
+    } catch (error) {
+      // A failed earlier attempt leaves the native connection registered; reuse it.
+      if (!/already exists/i.test(error instanceof Error ? error.message : String(error))) throw error
+    }
+    const open = await CapacitorSQLite.isDBOpen({ database, readonly: false }).catch(() => ({ result: false }))
+    if (!open.result) await CapacitorSQLite.open({ database, readonly: false })
     await CapacitorSQLite.execute({ database, statements: 'CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);' })
-    const current = await CapacitorSQLite.query({ database, statement: 'SELECT version FROM schema_version ORDER BY version DESC LIMIT 1;' })
+    // Android's plugin rejects query/run calls without a values array.
+    const current = await CapacitorSQLite.query({ database, statement: 'SELECT version FROM schema_version ORDER BY version DESC LIMIT 1;', values: [] })
     const currentVersion = Number(current.values?.[0]?.version ?? 0)
     if (currentVersion < 1) {
       await CapacitorSQLite.execute({ database, transaction: true, statements: `
@@ -62,6 +80,7 @@ export class NativeSQLiteQueueStore implements ObservationQueueStore {
         INSERT INTO schema_version(version) VALUES (2);
       ` })
     }
+    this.schemaVersion = schemaVersion
     this.initialized = true
   }
 
@@ -75,6 +94,19 @@ export class NativeSQLiteQueueStore implements ObservationQueueStore {
 
   private fromRow(row: Record<string, unknown>): QueueRecord {
     return { queueId: String(row.queue_id), ownerUserId: String(row.owner_user_id), observationId: String(row.observation_id), payload: JSON.parse(String(row.payload_json)) as NativeObservationInput, state: String(row.state) as QueueRecord['state'], createdAt: String(row.created_at), updatedAt: String(row.updated_at), attemptCount: Number(row.attempt_count), nextAttemptAt: row.next_attempt_at ? String(row.next_attempt_at) : null, lastAttemptAt: row.last_attempt_at ? String(row.last_attempt_at) : null, lastErrorCode: row.last_error_code ? String(row.last_error_code) : null, lastErrorMessage: row.last_error_message ? String(row.last_error_message) : null, batchId: row.batch_id ? String(row.batch_id) : null, acknowledgedAt: row.acknowledged_at ? String(row.acknowledged_at) : null }
+  }
+
+  async getRecord(ownerUserId: string, observationId: string): Promise<QueueRecord | null> {
+    await this.initialize()
+    const result = await CapacitorSQLite.query({ database, statement: 'SELECT * FROM observation_queue WHERE owner_user_id = ? AND observation_id = ?;', values: [ownerUserId, observationId] })
+    const row = result.values?.[0] as Record<string, unknown> | undefined
+    return row ? this.fromRow(row) : null
+  }
+
+  async remove(ownerUserId: string, observationIds: string[]): Promise<void> {
+    if (!observationIds.length) return
+    await this.initialize()
+    await CapacitorSQLite.run({ database, statement: `DELETE FROM observation_queue WHERE owner_user_id = ? AND observation_id IN (${observationIds.map(() => '?').join(',')});`, values: [ownerUserId, ...observationIds] })
   }
 
   async enqueue(ownerUserId: string, observation: NativeObservationInput): Promise<EnqueueResult> {

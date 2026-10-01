@@ -46,13 +46,20 @@ import {
   type LiveWorkoutPacket,
   type LiveWorkoutSession,
 } from './WorkoutTelemetry'
-import { WorkoutHrDeliveryService, type WorkoutHrDeliverySnapshot } from './WorkoutHrDelivery'
-import { WORKOUT_HR_E2E_TEST_DURATION_MS, WorkoutHrDeliveryView } from './WorkoutHrDeliveryView'
-import { observationQueue } from '../../services/sync/ObservationQueue'
+import {
+  buildQueueSelfTestObservation,
+  effectiveQueueHealth,
+  hrDeliveryTestDisabledReason,
+  WorkoutHrDeliveryService,
+  type WorkoutHrDeliverySnapshot,
+} from './WorkoutHrDelivery'
+import { WORKOUT_HR_E2E_TEST_DURATION_MS, WorkoutHrDeliveryView, type QueueSelfTestOutcome } from './WorkoutHrDeliveryView'
+import { observationQueue, type QueueDiagnostics } from '../../services/sync/ObservationQueue'
 import { observationBatchManager } from '../../services/sync/ObservationBatchManager'
 import { connectorIdentityService } from '../../services/base44/ConnectorIdentityService'
 import { jcvitalDeviceIdentityService } from '../../services/storage/JCVitalDeviceIdentityService'
 import type { QueueStats } from '../../services/storage/ObservationQueueStore'
+import { QueueStoreError } from '../../services/storage/ObservationQueueStore'
 
 type ExportStatus = 'EXPORTING' | 'EXPORT SUCCESS' | 'EXPORT FAILED'
 
@@ -204,6 +211,9 @@ export function JCVitalV8Panel() {
   const hrDeliveryRef = useRef<WorkoutHrDeliveryService | null>(null)
   const [hrDeliverySnapshot, setHrDeliverySnapshot] = useState<WorkoutHrDeliverySnapshot | null>(null)
   const [deliveryQueueStats, setDeliveryQueueStats] = useState<QueueStats | null>(null)
+  const [queueDiagnostics, setQueueDiagnostics] = useState<QueueDiagnostics>(() => observationQueue.getDiagnostics())
+  const [queueReadError, setQueueReadError] = useState<string | null>(null)
+  const [queueSelfTest, setQueueSelfTest] = useState<QueueSelfTestOutcome | null>(null)
   const [deliveryClock, setDeliveryClock] = useState(Date.now())
   const [hrTestEndsAt, setHrTestEndsAt] = useState<number | null>(null)
   const hrTestTimerRef = useRef<number | null>(null)
@@ -231,17 +241,18 @@ export function JCVitalV8Panel() {
     if (info) hrDeliveryRef.current?.setContext({ bleAddress: info.macAddress ?? info.deviceId, firmwareVersion: info.firmwareVersion ?? null, sdkVersion: info.sdkVersion })
   }, [info])
 
-  const hrDeliveryActive = Boolean(hrDeliverySnapshot?.enabled) || hrTestEndsAt !== null
   useEffect(() => {
-    if (!hrDeliveryActive) return
     const refresh = () => {
       setDeliveryClock(Date.now())
-      void observationQueue.getQueueStats().then(setDeliveryQueueStats).catch(() => undefined)
+      void observationQueue.getQueueStats().then(
+        (stats) => { setDeliveryQueueStats(stats); setQueueReadError(null) },
+        (error) => { setDeliveryQueueStats(null); setQueueReadError(errorText(error)) },
+      ).finally(() => setQueueDiagnostics(observationQueue.getDiagnostics()))
     }
     refresh()
     const timer = window.setInterval(refresh, 2000)
     return () => window.clearInterval(timer)
-  }, [hrDeliveryActive])
+  }, [])
 
   useEffect(() => {
     const ppgCoalescer = createRawPpgUiCoalescer((update) => {
@@ -501,6 +512,23 @@ export function JCVitalV8Panel() {
     setHrTestEndsAt(null)
   }
 
+  async function testQueue(): Promise<void> {
+    const at = new Date().toISOString()
+    try {
+      const owner = observationQueue.getOwnerUserId()
+      if (!owner) throw new QueueStoreError('QUEUE_OWNER_MISSING', 'Queue owner is not authenticated.')
+      const context = hrDeliveryRef.current?.getContext() ?? { deviceId: null, firmwareVersion: null, sdkVersion: null, vendorActivityMode: null }
+      const observation = await buildQueueSelfTestObservation(owner, context)
+      if (!observation) throw new QueueStoreError('QUEUE_WRITE_FAILED', 'Could not build the self-test observation.')
+      setQueueSelfTest({ ok: true, at, result: await observationQueue.selfTest(observation) })
+    } catch (error) {
+      const { code, message } = (error ?? {}) as { code?: string; message?: string }
+      setQueueSelfTest({ ok: false, at, code: code ?? 'QUEUE_WRITE_FAILED', message: message ?? String(error) })
+    } finally {
+      setQueueDiagnostics(observationQueue.getDiagnostics())
+    }
+  }
+
   async function startHrDeliveryTest(): Promise<void> {
     const delivery = hrDeliveryRef.current
     if (!delivery) return
@@ -643,7 +671,7 @@ export function JCVitalV8Panel() {
           ecgStartDiagnostics: rawEcgSession?.ecgStartDiagnostics ?? null,
           rawEcgValidation: buildRawEcgValidation(rawEcgSession, rawEcgChunks, rawEcgParseErrors),
           rawPpgValidation: buildRawPpgValidation(rawPpgSession, rawPpgChunks, rawPpgParseErrors, rawPpgUiDiagnostics, rawPpgRenderErrors),
-          workoutHrDelivery: hrDeliverySnapshot ? { ...hrDeliverySnapshot, queueStats: deliveryQueueStats } : null,
+          workoutHrDelivery: hrDeliverySnapshot ? { ...hrDeliverySnapshot, queueStats: deliveryQueueStats, queueDiagnostics, queueReadError, queueSelfTest } : null,
         },
       })
       const filename = `jcvital-v8-phase3abc-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
@@ -772,6 +800,7 @@ export function JCVitalV8Panel() {
   const workoutStatus = workoutSession?.status ?? 'IDLE'
   const workoutActive = ['STARTING', 'RUNNING', 'PAUSED', 'STOPPING'].includes(workoutStatus)
   const connectorRegistered = Boolean(connectorIdentityService.getConnectorDeviceId())
+  const deliveryQueueHealth = effectiveQueueHealth(queueDiagnostics.queueStoreInitialized, hrDeliverySnapshot?.queueHealth ?? 'HEALTHY')
   return (
     <section className="wearables" aria-labelledby="jcvital-v8-title">
       <div className="wearables-heading"><h2 id="jcvital-v8-title">JCVital Pro V8</h2><strong>{state}</strong></div>
@@ -976,12 +1005,17 @@ export function JCVitalV8Panel() {
         online={typeof navigator === 'undefined' || navigator.onLine}
         e2eTestEndsAt={hrTestEndsAt}
         now={deliveryClock}
-        startTestDisabledReason={workoutStartReason ?? (connectorRegistered ? null : 'Connector is not registered with Elite+')}
+        startTestDisabledReason={hrDeliveryTestDisabledReason({ workoutStartReason, queueStoreInitialized: queueDiagnostics.queueStoreInitialized, queueHealth: deliveryQueueHealth, connectorRegistered })}
         busy={busy}
         onToggleEnabled={(enabled) => hrDeliveryRef.current?.setEnabled(enabled)}
         onStartTest={() => void startHrDeliveryTest()}
         onFlush={() => void hrDeliveryRef.current?.flush('MANUAL')}
         onReplay={() => void hrDeliveryRef.current?.replay()}
+        onTestQueue={() => void testQueue()}
+        queueDiagnostics={queueDiagnostics}
+        queueHealth={deliveryQueueHealth}
+        queueReadError={queueReadError}
+        selfTest={queueSelfTest}
       />}
       {message && <p className="error-message" role="alert">{message}</p>}
       {lastError && <p>Last native error: {lastError.code} — {lastError.message}</p>}

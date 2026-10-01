@@ -2,12 +2,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { NativeObservationInput } from '../../services/base44/base44Types'
 import type { BatchDeliveryListener } from '../../services/sync/ObservationBatchManager'
 import { JCVitalDeviceIdentityService } from '../../services/storage/JCVitalDeviceIdentityService'
+import { QueueStoreError } from '../../services/storage/ObservationQueueStore'
 import type { JCVitalV8WorkoutHeartRateEvent } from './jcvitalV8Bridge'
 import {
   buildWorkoutHrObservation,
   buildWorkoutHrSourceRecordId,
+  effectiveQueueHealth,
+  hrDeliveryTestDisabledReason,
   validateWorkoutHrObservation,
   WORKOUT_HR_DELIVERY_POLICY,
+  WORKOUT_HR_QUEUE_POLICY,
   WorkoutHrDeliveryService,
 } from './WorkoutHrDelivery'
 
@@ -44,7 +48,7 @@ class Harness {
     queue: {
       getOwnerUserId: () => this.owner,
       enqueue: async (observation: NativeObservationInput) => {
-        if (this.failEnqueue) throw new Error('sqlite busy')
+        if (this.failEnqueue) throw new QueueStoreError('QUEUE_WRITE_FAILED', 'Query: Must provide an Array of Strings')
         if (this.rows.has(observation.observationId)) return { inserted: false, alreadyQueued: true }
         this.rows.set(observation.observationId, { payload: observation, state: 'PENDING' })
         return { inserted: true, alreadyQueued: false }
@@ -246,20 +250,77 @@ describe('JCVital workout HR golden path', () => {
     delivery.dispose()
   })
 
-  it('retains HR that could not be written to the queue and enqueues it on the next flush', async () => {
+  it('retains the enqueue failure cause, buffers the HR, and recovers after backoff', async () => {
+    vi.useFakeTimers()
     const harness = new Harness()
     harness.failEnqueue = true
     const delivery = service(harness)
     delivery.handleHeartRate(hr(1))
     delivery.handleHeartRate(hr(2))
     await delivery.flush('MANUAL')
-    // Two capture-time failures plus two failed retries during the flush.
-    expect(delivery.getSnapshot()).toMatchObject({ enqueueErrors: 4, awaitingEnqueue: 2, queued: 0 })
+    // Two capture-time failures plus one probe of the oldest buffered HR during the flush.
+    expect(delivery.getSnapshot()).toMatchObject({
+      enqueueErrors: 3, awaitingEnqueue: 2, queued: 0, queueHealth: 'UNAVAILABLE',
+      lastEnqueueErrorCode: 'QUEUE_WRITE_FAILED', lastEnqueueErrorMessage: 'Query: Must provide an Array of Strings',
+      enqueueErrorSamples: [{ code: 'QUEUE_WRITE_FAILED', message: 'Query: Must provide an Array of Strings', count: 3 }],
+    })
+    expect(delivery.getSnapshot().lastEnqueueErrorAt).not.toBeNull()
 
     harness.failEnqueue = false
     await delivery.flush('MANUAL')
-    expect(delivery.getSnapshot()).toMatchObject({ awaitingEnqueue: 0, queued: 2, delivered: 2 })
+    expect(delivery.getSnapshot()).toMatchObject({ queued: 0, awaitingEnqueue: 2, enqueueErrors: 3 })
+
+    await vi.advanceTimersByTimeAsync(WORKOUT_HR_QUEUE_POLICY.retryBaseMs)
+    await delivery.flush('MANUAL')
+    expect(delivery.getSnapshot()).toMatchObject({ awaitingEnqueue: 0, queued: 2, delivered: 2, queueHealth: 'HEALTHY', consecutiveEnqueueFailures: 0 })
     delivery.dispose()
+  })
+
+  it('does not spin on an unavailable queue during a 2-minute workout and loses nothing', async () => {
+    vi.useFakeTimers()
+    const harness = new Harness()
+    harness.failEnqueue = true
+    const delivery = service(harness)
+    for (let sequence = 1; sequence <= 152; sequence++) {
+      delivery.handleHeartRate(hr(sequence, sequence <= 15 ? 0 : 90))
+      await vi.advanceTimersByTimeAsync(1_000)
+    }
+    await delivery.handleWorkoutEnded('session-1')
+
+    const unavailable = delivery.getSnapshot()
+    expect(unavailable).toMatchObject({ captured: 152, skippedNonDeliverable: 15, awaitingEnqueue: 137, queued: 0, queueHealth: 'UNAVAILABLE' })
+    expect(unavailable.enqueueErrors).toBeLessThan(15)
+    expect(unavailable.enqueueErrorSamples).toHaveLength(1)
+
+    harness.failEnqueue = false
+    await vi.advanceTimersByTimeAsync(WORKOUT_HR_QUEUE_POLICY.retryMaxMs + WORKOUT_HR_DELIVERY_POLICY.flushIntervalMs)
+    await vi.waitFor(() => expect(delivery.getSnapshot()).toMatchObject({ awaitingEnqueue: 0, queued: 137, delivered: 137, queueHealth: 'HEALTHY' }))
+    expect(harness.server.size).toBe(137)
+    delivery.dispose()
+  })
+
+  it('reports a missing queue owner as an unavailable queue instead of an anonymous error', async () => {
+    const harness = new Harness()
+    harness.owner = null
+    const delivery = service(harness)
+    delivery.handleHeartRate(hr(1))
+    await delivery.flush('MANUAL')
+    expect(delivery.getSnapshot()).toMatchObject({
+      queueHealth: 'UNAVAILABLE', awaitingEnqueue: 1, enqueueErrors: 1,
+      lastEnqueueErrorCode: 'QUEUE_OWNER_MISSING', lastEnqueueErrorMessage: 'Queue owner is not authenticated.',
+    })
+    delivery.dispose()
+  })
+
+  it('disables the physical test unless the queue is initialized and healthy', () => {
+    const ready = { workoutStartReason: null, queueStoreInitialized: true, queueHealth: 'HEALTHY' as const, connectorRegistered: true }
+    expect(hrDeliveryTestDisabledReason(ready)).toBeNull()
+    expect(hrDeliveryTestDisabledReason({ ...ready, queueStoreInitialized: false })).toBe('delivery queue unavailable')
+    expect(hrDeliveryTestDisabledReason({ ...ready, queueHealth: 'UNAVAILABLE' })).toBe('delivery queue unavailable')
+    expect(hrDeliveryTestDisabledReason({ ...ready, queueHealth: 'DEGRADED' })).toBe('delivery queue unavailable')
+    expect(hrDeliveryTestDisabledReason({ ...ready, connectorRegistered: false })).toContain('not registered')
+    expect(effectiveQueueHealth(false, 'HEALTHY')).toBe('UNAVAILABLE')
+    expect(effectiveQueueHealth(true, 'DEGRADED')).toBe('DEGRADED')
   })
 
   it('counts capture but does not queue while delivery is disabled', async () => {

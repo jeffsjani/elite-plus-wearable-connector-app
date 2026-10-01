@@ -401,6 +401,15 @@ ECG and other V8 metrics are not uploaded.
   failures stay queued with backoff and are retried by the 15 s timer.
 - Diagnostics: "Elite+ Delivery · Workout HR" in the V8 panel and
   `workoutHrDelivery` in the validation export. Delivery is opt-in per session.
+- Queue fix (first physical run): Android `CapacitorSQLite.query` rejects calls
+  without `values`, so `NativeSQLiteQueueStore.initialize()` always failed on
+  device, the queue owner was never assigned, and every enqueue failed before
+  Base44 was reached. Initialization now passes `values: []`, reuses an existing
+  native connection, records its error, and retries lazily. The panel shows
+  queue store type/initialization/health, a "Test Queue" self-test (isolated
+  owner, never uploaded), and blocks the 2-minute test unless the queue is
+  initialized and HEALTHY. Enqueue failures keep their cause and back off
+  (5 s doubling to 60 s) while buffering up to 1,000 HR observations in memory.
 
 **Backend blocker:** the Base44 backend source is not in this repository. It
 must be confirmed server-side that `nativeConnectorObservations` accepts

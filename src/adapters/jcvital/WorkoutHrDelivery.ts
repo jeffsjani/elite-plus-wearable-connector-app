@@ -26,6 +26,16 @@ export const WORKOUT_HR_DELIVERY_POLICY = {
   maxRetainedReplayObservations: 2_000,
 } as const
 
+export const WORKOUT_HR_QUEUE_POLICY = {
+  unavailableAfterConsecutiveFailures: 3,
+  retryBaseMs: 5_000,
+  retryMaxMs: 60_000,
+  maxBufferedObservations: 1_000,
+  maxErrorSamples: 5,
+} as const
+
+export type QueueHealth = 'HEALTHY' | 'DEGRADED' | 'UNAVAILABLE'
+
 const DEFAULT_VENDOR_DATA_TYPE = '82'
 const MAX_PLAUSIBLE_BPM = 250
 const UNKNOWN_DEVICE_ID = 'UNKNOWN_DEVICE'
@@ -127,6 +137,36 @@ export interface WorkoutHrQueue {
   enqueue(observation: NativeObservationInput): Promise<{ inserted: boolean; alreadyQueued: boolean }>
 }
 
+/** Combines store initialization with observed enqueue health. */
+export function effectiveQueueHealth(queueStoreInitialized: boolean, serviceHealth: QueueHealth): QueueHealth {
+  return queueStoreInitialized ? serviceHealth : 'UNAVAILABLE'
+}
+
+export function hrDeliveryTestDisabledReason(input: {
+  workoutStartReason: string | null
+  queueStoreInitialized: boolean
+  queueHealth: QueueHealth
+  connectorRegistered: boolean
+}): string | null {
+  if (input.workoutStartReason) return input.workoutStartReason
+  if (!input.queueStoreInitialized || input.queueHealth !== 'HEALTHY') return 'delivery queue unavailable'
+  if (!input.connectorRegistered) return 'Connector is not registered with Elite+'
+  return null
+}
+
+/** A real-shape JCVital HR observation for the local queue self-test; it is written under an isolated owner and never uploaded. */
+export function buildQueueSelfTestObservation(ownerUserId: string, context: WorkoutHrSourceContext): Promise<NativeObservationInput | null> {
+  return buildWorkoutHrObservation(ownerUserId, {
+    sessionId: `queue-self-test-${crypto.randomUUID()}`,
+    heartRate: 60,
+    receivedAt: new Date().toISOString(),
+    packetSequence: 0,
+    vendorDataType: '82',
+    acquisitionMode: 'WORKOUT_REALTIME',
+  }, context)
+}
+
+
 export interface WorkoutHrDeliveryDependencies {
   queue: WorkoutHrQueue
   deliver: () => Promise<unknown>
@@ -138,11 +178,28 @@ export interface WorkoutHrDeliveryDependencies {
 type TrackedState = 'QUEUED' | 'RETRYING' | 'DELIVERED' | 'FAILED'
 type FlushReason = 'BATCH_SIZE' | 'INTERVAL' | 'WORKOUT_STOP' | 'REPLAY' | 'MANUAL'
 
+export interface EnqueueErrorSample {
+  code: string
+  message: string
+  count: number
+  firstAt: string
+  lastAt: string
+}
+
 export interface WorkoutHrDeliverySnapshot {
   enabled: boolean
   backendDeviceId: string | null
   policy: typeof WORKOUT_HR_DELIVERY_POLICY
   timestampPolicy: typeof WORKOUT_HR_TIMESTAMP_POLICY
+  queueHealth: QueueHealth
+  consecutiveEnqueueFailures: number
+  nextEnqueueAttemptAt: string | null
+  enqueueAttempts: number
+  lastEnqueueErrorCode: string | null
+  lastEnqueueErrorMessage: string | null
+  lastEnqueueErrorAt: string | null
+  enqueueErrorSamples: EnqueueErrorSample[]
+  droppedFromMemory: number
   captured: number
   capturedWhileDisabled: number
   skippedNonDeliverable: number
@@ -176,6 +233,14 @@ export interface WorkoutHrDeliverySnapshot {
 
 interface PendingEnqueue { event: JCVitalV8WorkoutHeartRateEvent; context: WorkoutHrSourceContext }
 
+function describeQueueError(error: unknown): { code: string; message: string } {
+  const { code, message } = (error ?? {}) as { code?: unknown; message?: unknown }
+  return {
+    code: typeof code === 'string' && code ? code : 'QUEUE_WRITE_FAILED',
+    message: typeof message === 'string' && message ? message : String(error),
+  }
+}
+
 /** Connector-side golden path: workout HR event -> durable queue -> batched Elite+ delivery. Capture never waits on HTTP. */
 export class WorkoutHrDeliveryService {
   private readonly deps: WorkoutHrDeliveryDependencies
@@ -194,6 +259,10 @@ export class WorkoutHrDeliveryService {
   private readonly sessions = new Set<string>()
   private counters = WorkoutHrDeliveryService.emptyCounters()
   private listeners = new Set<() => void>()
+  private consecutiveEnqueueFailures = 0
+  private nextEnqueueAttemptAt = 0
+  private ownerMissing = false
+  private errorSamples: EnqueueErrorSample[] = []
 
   constructor(deps: WorkoutHrDeliveryDependencies) { this.deps = deps }
 
@@ -203,6 +272,8 @@ export class WorkoutHrDeliveryService {
       queued: 0, alreadyQueued: 0, enqueueErrors: 0, batchesAttempted: 0, batchesDelivered: 0, batchesRetried: 0,
       batchesFailed: 0, serverAcceptedInBatches: 0, serverDuplicateInBatches: 0, serverRejectedInBatches: 0,
       replayQueued: 0, replayAlreadyQueued: 0, replayAcknowledged: 0, workoutStopFlushes: 0,
+      enqueueAttempts: 0, droppedFromMemory: 0,
+      lastEnqueueErrorCode: null as string | null, lastEnqueueErrorMessage: null as string | null, lastEnqueueErrorAt: null as string | null,
       lastFlushReason: null as FlushReason | null, lastFlushAt: null as string | null, lastDeliveryAt: null as string | null,
       lastResult: null as WorkoutHrDeliverySnapshot['lastResult'],
     }
@@ -231,6 +302,7 @@ export class WorkoutHrDeliveryService {
 
   setEnabled(enabled: boolean): void { this.enabled = enabled; this.changed() }
   isEnabled(): boolean { return this.enabled }
+  getContext(): WorkoutHrSourceContext { return { ...this.context } }
 
   setContext(update: WorkoutHrContextUpdate): void {
     this.context = {
@@ -249,7 +321,47 @@ export class WorkoutHrDeliveryService {
     this.replayPayloads = []
     this.sessions.clear()
     this.stopFlushedSessions.clear()
+    this.errorSamples = []
     this.changed()
+  }
+
+  getQueueHealth(): QueueHealth {
+    if (this.ownerMissing || this.consecutiveEnqueueFailures >= WORKOUT_HR_QUEUE_POLICY.unavailableAfterConsecutiveFailures) return 'UNAVAILABLE'
+    return this.consecutiveEnqueueFailures > 0 ? 'DEGRADED' : 'HEALTHY'
+  }
+
+  private inBackoff(): boolean {
+    return this.getQueueHealth() === 'UNAVAILABLE' && Date.now() < this.nextEnqueueAttemptAt
+  }
+
+  private buffer(item: PendingEnqueue): void {
+    this.pendingEnqueue.push(item)
+    if (this.pendingEnqueue.length > WORKOUT_HR_QUEUE_POLICY.maxBufferedObservations) {
+      this.pendingEnqueue.shift()
+      this.counters.droppedFromMemory++
+    }
+  }
+
+  private recordEnqueueFailure(code: string, message: string): void {
+    const at = new Date().toISOString()
+    this.counters.enqueueErrors++
+    this.counters.lastEnqueueErrorCode = code
+    this.counters.lastEnqueueErrorMessage = message
+    this.counters.lastEnqueueErrorAt = at
+    const sample = this.errorSamples.find((entry) => entry.code === code && entry.message === message)
+    if (sample) { sample.count++; sample.lastAt = at }
+    else if (this.errorSamples.length < WORKOUT_HR_QUEUE_POLICY.maxErrorSamples) this.errorSamples.push({ code, message, count: 1, firstAt: at, lastAt: at })
+    this.consecutiveEnqueueFailures++
+    if (this.getQueueHealth() === 'UNAVAILABLE') {
+      const exponent = Math.max(0, this.consecutiveEnqueueFailures - WORKOUT_HR_QUEUE_POLICY.unavailableAfterConsecutiveFailures)
+      this.nextEnqueueAttemptAt = Date.now() + Math.min(WORKOUT_HR_QUEUE_POLICY.retryMaxMs, WORKOUT_HR_QUEUE_POLICY.retryBaseMs * 2 ** exponent)
+    }
+  }
+
+  private recordEnqueueSuccess(): void {
+    this.consecutiveEnqueueFailures = 0
+    this.nextEnqueueAttemptAt = 0
+    this.ownerMissing = false
   }
 
   handleHeartRate(event: JCVitalV8WorkoutHeartRateEvent): void {
@@ -258,31 +370,51 @@ export class WorkoutHrDeliveryService {
     this.sessions.add(event.sessionId)
     const context = { ...this.context }
     if (!context.deviceId) this.counters.contextMissing++
+    if (this.inBackoff()) {
+      if (isDeliverableWorkoutHr(event)) this.buffer({ event, context })
+      else this.counters.skippedNonDeliverable++
+      this.changed()
+      return
+    }
     this.enqueueInProgress++
-    this.chain = this.chain.then(() => this.enqueueOne({ event, context })).finally(() => { this.enqueueInProgress-- })
+    this.chain = this.chain.then(async () => { await this.enqueueOne({ event, context }) }).finally(() => { this.enqueueInProgress-- })
   }
 
-  private async enqueueOne(item: PendingEnqueue): Promise<void> {
-    if (!isDeliverableWorkoutHr(item.event)) { this.counters.skippedNonDeliverable++; this.changed(); return }
+  /** Returns false when the queue rejected the observation, which was buffered for a later attempt. */
+  private async enqueueOne(item: PendingEnqueue): Promise<boolean> {
+    if (!isDeliverableWorkoutHr(item.event)) { this.counters.skippedNonDeliverable++; this.changed(); return true }
+    if (this.inBackoff()) { this.buffer(item); this.changed(); return false }
     const owner = this.deps.queue.getOwnerUserId()
-    if (!owner) { this.counters.enqueueErrors++; this.pendingEnqueue.push(item); this.changed(); return }
+    if (!owner) {
+      this.ownerMissing = true
+      this.recordEnqueueFailure('QUEUE_OWNER_MISSING', 'Queue owner is not authenticated.')
+      this.buffer(item)
+      this.changed()
+      return false
+    }
     const observation = await buildWorkoutHrObservation(owner, item.event, item.context)
-    if (!observation) return
-    if (validateWorkoutHrObservation(observation).length) { this.counters.invalid++; this.changed(); return }
+    if (!observation) return true
+    if (validateWorkoutHrObservation(observation).length) { this.counters.invalid++; this.changed(); return true }
+    this.counters.enqueueAttempts++
     try {
       const result = await this.deps.queue.enqueue(observation)
+      this.recordEnqueueSuccess()
       if (result.inserted) this.counters.queued++
       else this.counters.alreadyQueued++
       if (!this.tracked.has(observation.observationId)) this.tracked.set(observation.observationId, 'QUEUED')
       this.replayPayloads.push(observation)
       if (this.replayPayloads.length > WORKOUT_HR_DELIVERY_POLICY.maxRetainedReplayObservations) this.replayPayloads.shift()
       this.sinceLastFlush++
-    } catch {
-      this.counters.enqueueErrors++
-      this.pendingEnqueue.push(item)
+    } catch (error) {
+      const { code, message } = describeQueueError(error)
+      this.recordEnqueueFailure(code, message)
+      this.buffer(item)
+      this.changed()
+      return false
     }
     this.changed()
     if (this.sinceLastFlush >= WORKOUT_HR_DELIVERY_POLICY.flushObservationCount) void this.flush('BATCH_SIZE')
+    return true
   }
 
   private hasUndeliveredWork(): boolean {
@@ -309,9 +441,7 @@ export class WorkoutHrDeliveryService {
 
   private async runFlush(reason: FlushReason): Promise<void> {
     await this.chain
-    const retryItems = this.pendingEnqueue
-    this.pendingEnqueue = []
-    for (const item of retryItems) await this.enqueueOne(item)
+    await this.drainBuffered()
     this.sinceLastFlush = 0
     this.counters.lastFlushReason = reason
     this.counters.lastFlushAt = new Date().toISOString()
@@ -319,6 +449,18 @@ export class WorkoutHrDeliveryService {
     for (let round = 0; round < WORKOUT_HR_DELIVERY_POLICY.maxDeliveryRoundsPerFlush; round++) {
       const result = await this.deps.deliver()
       if (!result || this.countState('QUEUED') === 0) break
+    }
+  }
+
+  /** Probes the queue with the oldest buffered item and stops at the first failure instead of retrying every item. */
+  private async drainBuffered(): Promise<void> {
+    while (this.pendingEnqueue.length && !this.inBackoff()) {
+      const item = this.pendingEnqueue.shift()!
+      if (!(await this.enqueueOne(item))) {
+        // enqueueOne re-buffered the item at the tail; restore oldest-first order.
+        this.pendingEnqueue.unshift(this.pendingEnqueue.pop()!)
+        return
+      }
     }
   }
 
@@ -336,8 +478,10 @@ export class WorkoutHrDeliveryService {
         const result = await this.deps.queue.enqueue(observation)
         if (result.inserted) this.counters.replayQueued++
         else this.counters.replayAlreadyQueued++
-      } catch {
-        this.counters.enqueueErrors++
+      } catch (error) {
+        const { code, message } = describeQueueError(error)
+        this.recordEnqueueFailure(code, message)
+        break
       }
     }
     this.changed()
@@ -376,6 +520,10 @@ export class WorkoutHrDeliveryService {
     return {
       enabled: this.enabled,
       backendDeviceId: this.context.deviceId,
+      queueHealth: this.getQueueHealth(),
+      consecutiveEnqueueFailures: this.consecutiveEnqueueFailures,
+      nextEnqueueAttemptAt: this.nextEnqueueAttemptAt ? new Date(this.nextEnqueueAttemptAt).toISOString() : null,
+      enqueueErrorSamples: this.errorSamples.map((sample) => ({ ...sample })),
       policy: WORKOUT_HR_DELIVERY_POLICY,
       timestampPolicy: WORKOUT_HR_TIMESTAMP_POLICY,
       ...this.counters,

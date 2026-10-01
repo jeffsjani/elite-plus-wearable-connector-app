@@ -42,7 +42,24 @@ function toRecord(value: QueueRecord | undefined): QueueRecord | undefined {
 }
 
 export class WebQueueStore implements ObservationQueueStore {
+  readonly storeType = 'INDEXEDDB' as const
+  readonly databaseName = databaseName
   private database: IDBDatabase | null = null
+
+  getSchemaVersion(): number | null { return this.database ? schemaVersion : null }
+
+  async getRecord(ownerUserId: string, observationId: string): Promise<QueueRecord | null> {
+    return (await this.all(ownerUserId)).find((record) => record.observationId === observationId) ?? null
+  }
+
+  async remove(ownerUserId: string, observationIds: string[]): Promise<void> {
+    const ids = new Set(observationIds)
+    const records = (await this.all(ownerUserId)).filter((record) => ids.has(record.observationId))
+    const transaction = this.database!.transaction(storeName, 'readwrite')
+    const queue = transaction.objectStore(storeName)
+    records.forEach((record) => queue.delete(record.queueId))
+    await transactionDone(transaction)
+  }
 
   async initialize(): Promise<void> {
     if (this.database) return

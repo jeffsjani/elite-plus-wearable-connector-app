@@ -94,11 +94,16 @@ function App() {
   }
 
   async function prepareQueue(currentUser: LocalUser): Promise<void> {
-    await observationQueue.initialize()
     observationQueue.setOwnerUserId(currentUser.id)
+    try {
+      await observationQueue.initialize()
+    } catch (error) {
+      // Queue diagnostics retain the cause; queue use retries initialization, so sign-in continues.
+      console.error('Observation queue initialization failed', error)
+    }
     observationBatchManager.resume()
     observationBatchManager.start()
-    await refreshQueueStats()
+    await refreshQueueStats().catch(() => undefined)
   }
 
   useEffect(() => {

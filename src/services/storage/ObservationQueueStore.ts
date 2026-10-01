@@ -42,7 +42,26 @@ export interface EnqueueResult {
   record: QueueRecord
 }
 
+export type QueueStoreType = 'SQLITE' | 'INDEXEDDB'
+
+export type QueueErrorCode = 'QUEUE_OWNER_MISSING' | 'QUEUE_INIT_FAILED' | 'QUEUE_WRITE_FAILED' | 'QUEUE_READ_FAILED'
+
+export class QueueStoreError extends Error {
+  readonly code: QueueErrorCode
+
+  constructor(code: QueueErrorCode, message: string) {
+    super(message)
+    this.name = 'QueueStoreError'
+    this.code = code
+  }
+}
+
 export interface ObservationQueueStore {
+  readonly storeType: QueueStoreType
+  readonly databaseName: string
+  getSchemaVersion(): number | null
+  getRecord(ownerUserId: string, observationId: string): Promise<QueueRecord | null>
+  remove(ownerUserId: string, observationIds: string[]): Promise<void>
   initialize(): Promise<void>
   enqueue(ownerUserId: string, observation: NativeObservationInput): Promise<EnqueueResult>
   enqueueMany(ownerUserId: string, observations: NativeObservationInput[]): Promise<EnqueueResult[]>

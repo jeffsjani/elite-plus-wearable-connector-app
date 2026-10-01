@@ -3,7 +3,7 @@ import { connectorObservationService } from '../base44/ConnectorObservationServi
 import { ConnectorServiceError, type ConnectorObservationsResponse } from '../base44/base44Types'
 import { authenticationService } from '../base44/AuthenticationService'
 import { installationIdentityService } from '../storage/InstallationIdentityService'
-import type { QueueRecord } from '../storage/ObservationQueueStore'
+import { QueueStoreError, type QueueRecord } from '../storage/ObservationQueueStore'
 import { observationQueue } from './ObservationQueue'
 import { BrowserNetworkStatus, type NetworkStatus } from './NetworkStatus'
 
@@ -79,7 +79,10 @@ export class ObservationBatchManager {
     if (this.processing) { this.rerunRequested = true; return null }
     this.processing = true
     let result: ConnectorObservationsResponse | null = null
-    try { result = await this.processLoop() } finally { this.processing = false; if (this.rerunRequested) { this.rerunRequested = false; void this.process() } }
+    try { result = await this.processLoop() } catch (error) {
+      // Local queue unavailability is surfaced through queue diagnostics; nothing was sent.
+      if (!(error instanceof QueueStoreError)) throw error
+    } finally { this.processing = false; if (this.rerunRequested) { this.rerunRequested = false; void this.process() } }
     return result
   }
 
