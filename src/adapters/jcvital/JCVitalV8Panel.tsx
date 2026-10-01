@@ -54,6 +54,8 @@ import {
   type WorkoutHrDeliverySnapshot,
 } from './WorkoutHrDelivery'
 import { WORKOUT_HR_E2E_TEST_DURATION_MS, WorkoutHrDeliveryView, type QueueSelfTestOutcome } from './WorkoutHrDeliveryView'
+import { JCVitalPhysiologyDelivery, type PhysiologyDeliverySnapshot } from './PhysiologyDelivery'
+import { PhysiologyDeliveryView } from './PhysiologyDeliveryView'
 import { observationQueue, type QueueDiagnostics } from '../../services/sync/ObservationQueue'
 import { observationBatchManager, type DeliveryDiagnostics } from '../../services/sync/ObservationBatchManager'
 import { connectorIdentityService } from '../../services/base44/ConnectorIdentityService'
@@ -210,6 +212,8 @@ export function JCVitalV8Panel() {
   const [exportLocation, setExportLocation] = useState<string | null>(null)
   const hrDeliveryRef = useRef<WorkoutHrDeliveryService | null>(null)
   const [hrDeliverySnapshot, setHrDeliverySnapshot] = useState<WorkoutHrDeliverySnapshot | null>(null)
+  const physiologyRef = useRef<JCVitalPhysiologyDelivery | null>(null)
+  const [physiologySnapshot, setPhysiologySnapshot] = useState<PhysiologyDeliverySnapshot | null>(null)
   const [deliveryQueueStats, setDeliveryQueueStats] = useState<QueueStats | null>(null)
   const [queueDiagnostics, setQueueDiagnostics] = useState<QueueDiagnostics>(() => observationQueue.getDiagnostics())
   const [queueReadError, setQueueReadError] = useState<string | null>(null)
@@ -231,10 +235,22 @@ export function JCVitalV8Panel() {
     hrDeliveryRef.current = hrDelivery
     const unsubscribe = hrDelivery.onChange(() => setHrDeliverySnapshot(hrDelivery.getSnapshot()))
     hrDelivery.start()
+    const physiology = new JCVitalPhysiologyDelivery({
+      queue: observationQueue,
+      deliver: () => observationBatchManager.process(),
+      subscribe: (listener) => observationBatchManager.subscribe(listener),
+      resolveDeviceId: (bleAddress) => jcvitalDeviceIdentityService.resolve(bleAddress),
+    })
+    physiologyRef.current = physiology
+    const unsubscribePhysiology = physiology.onChange(() => setPhysiologySnapshot(physiology.getSnapshot()))
+    physiology.start()
     return () => {
       unsubscribe()
       hrDelivery.dispose()
       hrDeliveryRef.current = null
+      unsubscribePhysiology()
+      physiology.dispose()
+      physiologyRef.current = null
       if (hrTestTimerRef.current !== null) window.clearTimeout(hrTestTimerRef.current)
       hrTestTimerRef.current = null
     }
@@ -242,6 +258,7 @@ export function JCVitalV8Panel() {
 
   useEffect(() => {
     if (info) hrDeliveryRef.current?.setContext({ bleAddress: info.macAddress ?? info.deviceId, firmwareVersion: info.firmwareVersion ?? null, sdkVersion: info.sdkVersion })
+    if (info) physiologyRef.current?.setContext({ bleAddress: info.macAddress ?? info.deviceId, firmwareVersion: info.firmwareVersion ?? null, sdkVersion: info.sdkVersion })
   }, [info])
 
   useEffect(() => {
@@ -391,6 +408,8 @@ export function JCVitalV8Panel() {
     try {
       const result = await action()
       setHistoricalRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result, error: null } }))
+      // Delivery runs after capture completes and never alters the sync result.
+      void physiologyRef.current?.deliverSyncResult(result).catch((error) => setMessage(errorText(error)))
     } catch (error) {
       const text = errorText(error)
       setHistoricalRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result: null, error: text } }))
@@ -677,6 +696,7 @@ export function JCVitalV8Panel() {
           rawEcgValidation: buildRawEcgValidation(rawEcgSession, rawEcgChunks, rawEcgParseErrors),
           rawPpgValidation: buildRawPpgValidation(rawPpgSession, rawPpgChunks, rawPpgParseErrors, rawPpgUiDiagnostics, rawPpgRenderErrors),
           workoutHrDelivery: hrDeliverySnapshot ? { ...hrDeliverySnapshot, queueStats: deliveryQueueStats, queueDiagnostics, queueReadError, queueSelfTest, deliveryDiagnostics: observationBatchManager.getDeliveryDiagnostics(), staleSendingCount } : null,
+          physiologyDelivery: physiologySnapshot,
         },
       })
       const filename = `jcvital-v8-phase3abc-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
@@ -1028,6 +1048,13 @@ export function JCVitalV8Panel() {
         queueHealth={deliveryQueueHealth}
         queueReadError={queueReadError}
         selfTest={queueSelfTest}
+      />}
+      {physiologySnapshot && <PhysiologyDeliveryView
+        snapshot={physiologySnapshot}
+        busy={busy}
+        onToggleEnabled={(enabled) => physiologyRef.current?.setEnabled(enabled)}
+        onToggleMetric={(key, enabled) => physiologyRef.current?.setMetricEnabled(key, enabled)}
+        onReset={() => physiologyRef.current?.resetDiagnostics()}
       />}
       {message && <p className="error-message" role="alert">{message}</p>}
       {lastError && <p>Last native error: {lastError.code} — {lastError.message}</p>}

@@ -110,7 +110,7 @@ export class NativeSQLiteQueueStore implements ObservationQueueStore {
   }
 
   async enqueue(ownerUserId: string, observation: NativeObservationInput): Promise<EnqueueResult> {
-    const existing = (await this.rows(ownerUserId)).find((record) => record.observationId === observation.observationId)
+    const existing = await this.getRecord(ownerUserId, observation.observationId)
     if (existing) return { inserted: false, alreadyQueued: true, record: existing }
     const timestamp = nowIso(); const record: QueueRecord = { queueId: createId(), ownerUserId, observationId: observation.observationId, payload: observation, state: 'PENDING', createdAt: timestamp, updatedAt: timestamp, attemptCount: 0, nextAttemptAt: null, lastAttemptAt: null, lastErrorCode: null, lastErrorMessage: null, batchId: null, acknowledgedAt: null }
     await CapacitorSQLite.run({ database, statement: 'INSERT INTO observation_queue (queue_id, owner_user_id, observation_id, payload_json, state, created_at, updated_at, attempt_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?);', values: [record.queueId, ownerUserId, observation.observationId, JSON.stringify(observation), record.state, timestamp, timestamp, 0] })

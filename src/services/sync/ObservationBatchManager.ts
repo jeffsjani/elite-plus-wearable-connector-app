@@ -1,6 +1,6 @@
 import { connectorIdentityService } from '../base44/ConnectorIdentityService'
 import { connectorObservationService } from '../base44/ConnectorObservationService'
-import { ConnectorServiceError, type ConnectorObservationsResponse } from '../base44/base44Types'
+import { ConnectorServiceError, type ConnectorObservationResult, type ConnectorObservationsResponse } from '../base44/base44Types'
 import { authenticationService } from '../base44/AuthenticationService'
 import { installationIdentityService } from '../storage/InstallationIdentityService'
 import { QueueStoreError, type QueueRecord } from '../storage/ObservationQueueStore'
@@ -71,6 +71,9 @@ export interface BatchDeliveryEvent {
   accepted: number | null
   duplicate: number | null
   rejected: number | null
+  /** Per-observation results from a 2xx response, when the backend provides them. */
+  results?: ConnectorObservationResult[] | null
+  errors?: ConnectorObservationsResponse['errors'] | null
 }
 
 export type BatchDeliveryListener = (event: BatchDeliveryEvent) => void
@@ -213,7 +216,11 @@ export class ObservationBatchManager {
         responseBatchId: response.batchId ?? null, responseAccepted: response.accepted ?? null, responseDuplicate: response.duplicate ?? null,
         responseRejected: response.rejected ?? null, responseErrorCount: response.errors?.length ?? 0, serverTimestamp: response.serverTimestamp ?? null,
       })
-      const rejectedIds = new Set((response.errors ?? []).map((error) => error.observationId).filter((id): id is string => Boolean(id)))
+      // results[] is authoritative; errors[] is capped at 50 so it can miss rejections.
+      const rejectedIds = new Set([
+        ...(response.results ?? []).filter((result) => result.status === 'rejected').map((result) => result.observationId),
+        ...(response.errors ?? []).map((error) => error.observationId),
+      ].filter((id): id is string => Boolean(id) && observationIds.includes(id!)))
       const successfulIds = observationIds.filter((id) => !rejectedIds.has(id))
       try {
         await observationQueue.markAcknowledged(successfulIds)
@@ -227,11 +234,11 @@ export class ObservationBatchManager {
         diag.lastErrorCode = 'ACK_PROCESSING_FAILED'
         diag.lastErrorMessage = `Base44 responded (accepted ${response.accepted}, duplicate ${response.duplicate}) but the local queue ACK failed: ${error instanceof Error ? error.message : String(error)}`
         await this.scheduleBatchRetry(diag, records, { code: diag.lastErrorCode, message: diag.lastErrorMessage }).catch(() => undefined)
-        this.notify({ batchId, attemptedAt, outcome: 'RETRYING', observationIds, acknowledgedIds: [], rejectedIds: [], httpStatus: diag.httpStatus, errorCode: diag.lastErrorCode, accepted: response.accepted, duplicate: response.duplicate, rejected: response.rejected })
+        this.notify({ batchId, attemptedAt, outcome: 'RETRYING', observationIds, acknowledgedIds: [], rejectedIds: [], httpStatus: diag.httpStatus, errorCode: diag.lastErrorCode, accepted: response.accepted, duplicate: response.duplicate, rejected: response.rejected, results: response.results ?? null, errors: response.errors ?? null })
         return null
       }
       diag.phase = rejectedIds.size ? 'PARTIAL' : 'DELIVERED'
-      this.notify({ batchId, attemptedAt, outcome: diag.phase, observationIds, acknowledgedIds: successfulIds, rejectedIds: [...rejectedIds], httpStatus: diag.httpStatus, errorCode: null, accepted: response.accepted, duplicate: response.duplicate, rejected: response.rejected })
+      this.notify({ batchId, attemptedAt, outcome: diag.phase, observationIds, acknowledgedIds: successfulIds, rejectedIds: [...rejectedIds], httpStatus: diag.httpStatus, errorCode: null, accepted: response.accepted, duplicate: response.duplicate, rejected: response.rejected, results: response.results ?? null, errors: response.errors ?? null })
       return response
     } finally {
       this.lastBatch = { ...diag, elapsedMs: Date.now() - Date.parse(diag.startedAt) }

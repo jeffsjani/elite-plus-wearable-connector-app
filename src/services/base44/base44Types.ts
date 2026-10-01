@@ -40,6 +40,9 @@ export interface ConnectorStatusResponse {
   configuredSourceCount: number
 }
 
+/** PHONE_TIMEZONE: device-local date/time without an offset, interpreted in the phone's current timezone. */
+export type TimestampTimezoneSource = 'PHONE_TIMEZONE'
+
 export interface NativeObservationInput {
   observationId: string
   source: string
@@ -69,11 +72,20 @@ export interface NativeObservationInput {
   observedAtSource?: string
   timestampSource?: string
   timestampConfidence?: string
+  /** How the timezone for a device-local timestamp was chosen; absent when no local time was interpreted. */
+  timestampTimezoneSource?: TimestampTimezoneSource
   receivedAt?: string
   deviceId?: string
   firmwareVersion?: string | null
   sdkVersion?: string | null
   vendorDataType?: string
+  // Optional Build 5B-1 historical physiology fields; additive to the 5A contract.
+  vendorField?: string
+  vendorDerived?: boolean
+  measurementMethod?: string
+  samplingIntervalMs?: number
+  sequenceNumber?: number
+  sourceRecordGroupId?: string
   rawSourceMetadata?: Record<string, string | number | boolean | null>
 }
 
@@ -84,14 +96,32 @@ export interface ConnectorObservationsRequest {
   observations: NativeObservationInput[]
 }
 
+export type ObservationResultStatus = 'accepted' | 'duplicate' | 'rejected'
+export type ObservationCanonicalStatus = 'canonicalized' | 'failed' | 'not_applicable' | null
+
+/** One entry per observation with a usable observationId; the primary per-observation truth. */
+export interface ConnectorObservationResult {
+  observationId: string
+  status: ObservationResultStatus
+  reason?: string | null
+  errorCode?: string | null
+  canonicalStatus?: ObservationCanonicalStatus
+  nativeObservationId?: string | null
+}
+
 export interface ConnectorObservationsResponse {
   success: boolean
   batchId: string
   accepted: number
   duplicate: number
   rejected: number
-  errors: Array<{ observationId?: string; code?: string; message?: string }>
+  /** Capped at 50 entries; supplementary to results[]. */
+  errors: Array<{ observationId?: string; code?: string; message?: string; reason?: string }>
   serverTimestamp: string
+  processing?: unknown
+  canonical?: unknown
+  ingestion_events_created?: number
+  results?: ConnectorObservationResult[]
 }
 
 export type ConnectorErrorCode =

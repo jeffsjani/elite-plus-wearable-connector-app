@@ -98,6 +98,31 @@ describe('ObservationBatchManager 100-observation lifecycle', () => {
     expect(body.observations[0]).toMatchObject({ observationId: observation.observationId, timestampSource: 'CONNECTOR_BLE_RECEIPT_TIME', observedAtSource: 'CONNECTOR_BLE_RECEIPT_TIME', vendorDataType: '82' })
   })
 
+  it('rejects every results[] rejection even when errors[] is capped at 50, and forwards results to listeners', async () => {
+    const ids = await enqueueHundred()
+    const rejected = new Set(ids.slice(0, 60))
+    submitSpy().mockImplementation(async (request) => {
+      const results = request.observations.map((o) => rejected.has(o.observationId)
+        ? { observationId: o.observationId, status: 'rejected' as const, reason: 'invalid', errorCode: 'VALIDATION_ERROR', canonicalStatus: null, nativeObservationId: null }
+        : { observationId: o.observationId, status: 'accepted' as const, reason: null, errorCode: null, canonicalStatus: 'canonicalized' as const, nativeObservationId: `n-${o.observationId.slice(0, 6)}` })
+      const errors = [...rejected].slice(0, 50).map((observationId) => ({ observationId, reason: 'invalid' }))
+      return { success: true, batchId: request.batchId, serverTimestamp: new Date().toISOString(), accepted: 40, duplicate: 0, rejected: 60, errors: [...errors, { reason: 'no usable id' }], results }
+    })
+    const manager = new ObservationBatchManager({}, online)
+    const events: BatchDeliveryEvent[] = []
+    manager.subscribe((event) => events.push(event))
+
+    await manager.process()
+
+    const stats = await observationQueue.getQueueStats()
+    expect([stats.failed, stats.pending, stats.inFlight, stats.retrying]).toEqual([60, 0, 0, 0])
+    expect(events[0]).toMatchObject({ outcome: 'PARTIAL' })
+    expect(new Set(events[0].rejectedIds)).toEqual(rejected)
+    expect(events[0].acknowledgedIds).toHaveLength(40)
+    expect(events[0].results).toHaveLength(100)
+    expect(events[0].errors).toHaveLength(51)
+  })
+
   it('exposes the active batch while the request is outstanding', async () => {
     await enqueueHundred()
     let release!: () => void

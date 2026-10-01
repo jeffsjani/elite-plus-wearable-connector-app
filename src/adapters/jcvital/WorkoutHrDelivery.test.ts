@@ -254,6 +254,7 @@ describe('JCVital workout HR golden path', () => {
 
   it('does not change the observation ID when timestampSource is added', async () => {
     const observation = (await buildWorkoutHrObservation('user-1', hr(5), context))!
+    expect(observation.timestampTimezoneSource).toBeUndefined()
     expect(observation.observationId).toMatch(/^[0-9a-f]{64}$/)
     expect(observation.sourceRecordId).not.toContain('CONNECTOR_BLE_RECEIPT_TIME')
   })

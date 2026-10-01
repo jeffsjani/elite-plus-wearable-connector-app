@@ -337,6 +337,88 @@ Connector diagnostics report two kinds of numbers:
   batch, including retries and replays. Accepted + duplicate can exceed the
   unique count and must not be read as physiological record counts.
 
+## Build 5B-1 historical physiology delivery
+
+`PhysiologyContract.ts` maps native Phase 3A historical observations to
+`NativeObservationInput`; `PhysiologyDelivery.ts` enqueues them in the durable
+queue and drains through the unchanged Build 5A `ObservationBatchManager`
+(≤100 per `nativeConnectorObservations` request, 30 s timeout, backoff retry).
+Delivery is off by default and runs only after a sync completes.
+
+| Metric | Connector metricType | `metric` | Unit | Vendor type / field | Canonical target | vendorDerived | Canonicalized | timestampSource / timestampConfidence | timestampTimezoneSource |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Continuous HR history | `HEART_RATE` | `heartRate` | bpm | 27 / `arrayDynamicHR` | `body.heart_rate` | no | yes (existing 5A route) | `DEVICE_HISTORY_RECORD_TIME` / `DEVICE_RECORDED` (first sample of each record), `DEVICE_HISTORY_RECORD_TIME_PLUS_NOMINAL_INTERVAL` / `NOMINAL_INTERVAL_DERIVED` (+5 s × index) | `PHONE_TIMEZONE` |
+| SpO2 | `SPO2` | `oxygenSaturation` | percent (0–100) | 68 / `Blood_oxygen` | `body.oxygen_saturation` | no | yes (Base44 certified) | `DEVICE_HISTORY_RECORD_TIME` / `DEVICE_LOCAL_CLOCK_PHONE_TIMEZONE` | `PHONE_TIMEZONE` |
+| Wearable temperature | `WEARABLE_TEMPERATURE` | `wearableTemperature` | celsius | 59 / `temperature` | `body.wearable_temperature` (skin; never core body temperature) | no | yes (Base44 certified) | `DEVICE_HISTORY_RECORD_TIME` / `DEVICE_LOCAL_CLOCK_PHONE_TIMEZONE` | `PHONE_TIMEZONE` |
+| HRV | `HRV_VENDOR` | `hrvVendor` | `UNKNOWN_VENDOR_UNIT` | 42 / `hrv` | — | yes | **no — NativeObservation only** | `DEVICE_HISTORY_RECORD_TIME` / `DEVICE_LOCAL_CLOCK_PHONE_TIMEZONE` | `PHONE_TIMEZONE` |
+| Stress | `STRESS_VENDOR` | `stressVendor` | `UNKNOWN_VENDOR_UNIT` | 42 / `stress` | — (source input for the Elite+ stress engine; never replaces it) | yes | **no — NativeObservation only** | `DEVICE_HISTORY_RECORD_TIME` / `DEVICE_LOCAL_CLOCK_PHONE_TIMEZONE` | `PHONE_TIMEZONE` |
+| Estimated BP systolic | `BP_SYSTOLIC_ESTIMATED` | `bloodPressureSystolicEstimated` | `UNKNOWN_VENDOR_UNIT` | 42 / `highBP` | — (`ESTIMATED_VENDOR_BP`, never cuff BP) | yes | **no — NativeObservation only** | `DEVICE_HISTORY_RECORD_TIME` / `DEVICE_LOCAL_CLOCK_PHONE_TIMEZONE` | `PHONE_TIMEZONE` |
+| Estimated BP diastolic | `BP_DIASTOLIC_ESTIMATED` | `bloodPressureDiastolicEstimated` | `UNKNOWN_VENDOR_UNIT` | 42 / `lowBP` | — (`ESTIMATED_VENDOR_BP`, never cuff BP) | yes | **no — NativeObservation only** | `DEVICE_HISTORY_RECORD_TIME` / `DEVICE_LOCAL_CLOCK_PHONE_TIMEZONE` | `PHONE_TIMEZONE` |
+| PPI | `PPI` | `ppiVendorRaw` | `UNKNOWN_VENDOR_UNIT` (no ms assumption) | 127 / `ppiData` | — | no | **no — NativeObservation only** | `DEVICE_HISTORY_RECORD_TIME` / `DEVICE_LOCAL_CLOCK_PHONE_TIMEZONE` (group time; per-slot offsets unknown) | `PHONE_TIMEZONE` |
+| Workout HR (5A, type 82) | `HEART_RATE` | `heartRate` | bpm | 82 | `body.heart_rate` | no | yes | `CONNECTOR_BLE_RECEIPT_TIME` / `RECEIPT_TIME_NO_VENDOR_TIMESTAMP` | absent |
+
+- Every row: `source=jcvital_native`, `provider=JCVITAL`, `JCVITAL_NATIVE` /
+  `DIRECT_BLE`, `deviceModel=PRO_V8`, opaque `jcvital_device_<uuid>`, firmware
+  and SDK version. The native observation's MAC-bearing `source`, `id`,
+  `provenance` and `rawPayload` are never forwarded.
+- `observedAt` is the device history record time (device-local `date` in the
+  phone time zone); `receivedAt` is BLE receipt. Records without a parseable
+  source date are not delivered. `CONNECTOR_BLE_RECEIPT_TIME` stays reserved
+  for type-82 workout HR.
+- Timestamp provenance has two independent parts; the top-level fields are
+  authoritative and `rawSourceMetadata` carries no timestamp keys:
+  - **Derivation** — `timestampSource` + `timestampConfidence`: continuous HR
+    first sample of each record `DEVICE_HISTORY_RECORD_TIME` / `DEVICE_RECORDED`;
+    later samples `DEVICE_HISTORY_RECORD_TIME_PLUS_NOMINAL_INTERVAL` /
+    `NOMINAL_INTERVAL_DERIVED` (`samplingIntervalMs = 5000`); SpO2, temperature,
+    HRV, stress, estimated BP and PPI `DEVICE_HISTORY_RECORD_TIME` /
+    `DEVICE_LOCAL_CLOCK_PHONE_TIMEZONE`.
+  - **Timezone interpretation** — `timestampTimezoneSource` (optional):
+    `PHONE_TIMEZONE` on every 5B-1 historical observation. It means: the device
+    supplied a local date/time with no explicit timezone offset; the Connector
+    interpreted that timestamp using the phone's current timezone. Type-82
+    workout HR omits it because receipt time is already absolute.
+  - Neither part participates in `sourceRecordId` or `observationId`.
+- IDs: `sourceRecordId = JCVITAL_NATIVE:PRO_V8:<deviceId>:<metricType>:<vendorType>:<vendor date>|<group serial or ->|<index>`;
+  `observationId = sha256(owner:sourceRecordId)`. Values and phone time zone are
+  excluded, so repeating a sync yields duplicates only.
+- One HRV record becomes four observations (HRV, stress, systolic, diastolic)
+  sharing `sourceRecordGroupId`. HR embedded in type 42 (`HEART_RATE_AUTOMATIC`),
+  `fatigueDegree` and `vascularAging` are not delivered in 5B-1.
+- One PPI group becomes one observation per slot (zeros kept), each with
+  `ppiSlotIndex`, `ppiGroupSlotCount`, `ppiGroupNonZeroCount`, `ppiZeroValue`
+  and `ppiTrailingZeroPaddingCandidate`.
+- No-measurement placeholders are not sent: HR ≤0 or >250, SpO2 ≤0 or >100,
+  temperature/HRV/BP ≤0. Stress 0 is delivered; PPI 0 is delivered.
+- NativeObservation-only metrics (HRV, stress, estimated BP, PPI) are a
+  successful ingestion outcome: Base44 records `WearableIngestionEvent`
+  `COMPLETE / CANONICAL_NOT_APPLICABLE`. The Connector counts them as delivered
+  once acknowledged and never as failed for lacking a canonical row.
+- Build 5B-1 writes no Brain Readiness, Overall Strain or WearableDailySummary
+  rows; it validates ingestion and canonical storage only.
+- `timestampTimezoneSource` is persisted by Base44 as NativeObservation
+  `timestamp_timezone_source` (`PHONE_TIMEZONE` for 5B-1 historical rows;
+  null for 5A workout HR and legacy sources).
+- Per-observation response handling. `results[]` (one entry per observation
+  with a usable `observationId`) is the primary truth; `errors[]` (capped at 50,
+  `{observationId, reason}`) is supplementary and also feeds queue rejection so
+  nothing beyond the cap is acknowledged by mistake.
+
+  | `status` | `canonicalStatus` | Connector outcome | Counted as |
+  | --- | --- | --- | --- |
+  | accepted | canonicalized | `DELIVERED_CANONICALIZED` | delivered, canonicalized |
+  | accepted | not_applicable | `DELIVERED_NATIVE_ONLY` | delivered, native only (success) |
+  | accepted | failed | `CANONICAL_FAILED` | delivered to NativeObservation, canonical failed (surfaced, not a delivery failure) |
+  | accepted | null | `DELIVERED` | delivered |
+  | duplicate | null | `DELIVERED_DUPLICATE` | delivered (already stored) |
+  | rejected | — | `REJECTED` with `reason` / `errorCode` | failed |
+
+  `nativeObservationId` is retained for fresh accepted rows and is not required
+  for duplicates or rejections. `errors[]` entries without an `observationId`
+  are counted as unattributed. Responses without `results[]` fall back to batch
+  totals, attributed per metric only when a batch holds one metric.
+- `uniqueObservationsDelivered` is per-ID exact in both modes.
+
 ## Files
 
 - `JCVitalCapabilities.ts` — capability/evidence model and registry.

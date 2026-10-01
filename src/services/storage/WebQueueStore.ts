@@ -45,11 +45,16 @@ export class WebQueueStore implements ObservationQueueStore {
   readonly storeType = 'INDEXEDDB' as const
   readonly databaseName = databaseName
   private database: IDBDatabase | null = null
+  private lastCreatedMs = 0
 
   getSchemaVersion(): number | null { return this.database ? schemaVersion : null }
 
   async getRecord(ownerUserId: string, observationId: string): Promise<QueueRecord | null> {
-    return (await this.all(ownerUserId)).find((record) => record.observationId === observationId) ?? null
+    await this.initialize()
+    const transaction = this.database!.transaction(storeName, 'readonly')
+    const value = await requestResult(transaction.objectStore(storeName).index('ownerObservation').get([ownerUserId, observationId]))
+    await transactionDone(transaction)
+    return (value as QueueRecord | undefined) ?? null
   }
 
   async remove(ownerUserId: string, observationIds: string[]): Promise<void> {
@@ -91,9 +96,11 @@ export class WebQueueStore implements ObservationQueueStore {
 
   async enqueue(ownerUserId: string, observation: NativeObservationInput): Promise<EnqueueResult> {
     await this.initialize()
-    const existing = (await this.all(ownerUserId)).find((record) => record.observationId === observation.observationId)
+    const existing = await this.getRecord(ownerUserId, observation.observationId)
     if (existing) return { inserted: false, alreadyQueued: true, record: existing }
-    const timestamp = nowIso()
+    // Strictly increasing so the createdAt index preserves FIFO order for same-millisecond inserts.
+    this.lastCreatedMs = Math.max(Date.now(), this.lastCreatedMs + 1)
+    const timestamp = new Date(this.lastCreatedMs).toISOString()
     const record: QueueRecord = {
       queueId: createId(), ownerUserId, observationId: observation.observationId,
       payload: observation, state: 'PENDING', createdAt: timestamp, updatedAt: timestamp,
