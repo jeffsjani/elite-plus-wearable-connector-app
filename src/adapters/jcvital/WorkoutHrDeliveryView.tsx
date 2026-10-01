@@ -113,11 +113,12 @@ export function WorkoutHrDeliveryView({
       {snapshot.enqueueErrorSamples.map((sample) => <span key={`${sample.code}:${sample.message}`}>Enqueue error ×{sample.count}: {sample.code}: {sample.message}</span>)}
       <span>Not sent · zero/implausible HR: {snapshot.skippedNonDeliverable} · captured while disabled: {snapshot.capturedWhileDisabled} · preflight invalid: {snapshot.invalid} · missing device context: {snapshot.contextMissing}</span>
       <span>Batches · attempted: {snapshot.batchesAttempted} · delivered: {snapshot.batchesDelivered} · retried: {snapshot.batchesRetried} · failed: {snapshot.batchesFailed}</span>
-      <span>Server (batch totals) · accepted: {snapshot.serverAcceptedInBatches} · duplicate: {snapshot.serverDuplicateInBatches} · rejected: {snapshot.serverRejectedInBatches}</span>
+      <span><strong>Unique observations delivered (acknowledged Connector IDs): {snapshot.uniqueObservationsDelivered}</strong></span>
+      <span>Server response counts (raw, summed across batches incl. retries) · accepted: {snapshot.serverAcceptedInBatches} · duplicate: {snapshot.serverDuplicateInBatches} · rejected: {snapshot.serverRejectedInBatches}</span>
       <span>Replay · re-queued: {snapshot.replayQueued} · already queued locally: {snapshot.replayAlreadyQueued} · re-acknowledged: {snapshot.replayAcknowledged}</span>
       <span>Last delivery: {snapshot.lastDeliveryAt ?? '—'} · last result: {snapshot.lastResult ? `${snapshot.lastResult.outcome} · HTTP ${snapshot.lastResult.httpStatus ?? '—'}${snapshot.lastResult.errorCode ? ` · ${snapshot.lastResult.errorCode}` : ''}` : '—'}</span>
       <span>Last flush: {snapshot.lastFlushReason ?? '—'} {snapshot.lastFlushAt ?? ''} · workout-stop flushes: {snapshot.workoutStopFlushes}</span>
-      <span>Policy: flush every {snapshot.policy.flushObservationCount} observations or {snapshot.policy.flushIntervalMs / 1000}s, and on workout stop · observedAt = {snapshot.timestampPolicy.observedAtSource}</span>
+      <span>Policy: flush every {snapshot.policy.flushObservationCount} observations or {snapshot.policy.flushIntervalMs / 1000}s, and on workout stop · observedAt = {snapshot.timestampPolicy.observedAtSource} · timestampSource = {snapshot.timestampPolicy.timestampSource}</span>
     </section>
   </>
 }

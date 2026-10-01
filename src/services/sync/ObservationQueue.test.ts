@@ -89,6 +89,7 @@ describe('ObservationQueue on the Android SQLite path', () => {
     const result = await queue.enqueue(observation)
     expect(result).toMatchObject({ inserted: true, alreadyQueued: false })
     const pending = await queue.getPending(100)
+    expect(pending[0].payload.timestampSource).toBe('CONNECTOR_BLE_RECEIPT_TIME')
     expect(pending.map((record) => record.queueId)).toEqual([result.record.queueId])
     expect((await queue.getQueueStats()).pending).toBe(1)
     expect(await queue.enqueue(observation)).toMatchObject({ inserted: false, alreadyQueued: true })

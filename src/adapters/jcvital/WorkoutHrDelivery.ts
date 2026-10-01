@@ -16,6 +16,7 @@ export const JCVITAL_NATIVE_SOURCE = {
 /** V8 type-82 workout packets carry no device timestamp; observedAt is the Connector's native BLE receipt time. */
 export const WORKOUT_HR_TIMESTAMP_POLICY = {
   observedAtSource: 'CONNECTOR_BLE_RECEIPT_TIME',
+  timestampSource: 'CONNECTOR_BLE_RECEIPT_TIME',
   timestampConfidence: 'RECEIPT_TIME_NO_VENDOR_TIMESTAMP',
 } as const
 
@@ -75,6 +76,7 @@ export function validateWorkoutHrObservation(observation: NativeObservationInput
   if (!isDeliverableWorkoutHr({ heartRate: observation.valueNumber })) problems.push('valueNumber must be a positive plausible bpm')
   if (!observation.sourceRecordId || !observation.sessionId || observation.packetSequence === undefined) problems.push('sourceRecordId, sessionId and packetSequence are required')
   if (!observation.observedAt || Number.isNaN(Date.parse(observation.observedAt))) problems.push('observedAt must be an ISO timestamp')
+  if (observation.timestampSource !== WORKOUT_HR_TIMESTAMP_POLICY.timestampSource) problems.push('timestampSource must be CONNECTOR_BLE_RECEIPT_TIME')
   if (!observation.receivedAt || Number.isNaN(Date.parse(observation.receivedAt))) problems.push('receivedAt must be an ISO timestamp')
   if (!isOpaqueJCVitalDeviceId(observation.deviceId) && observation.deviceId !== UNKNOWN_DEVICE_ID) problems.push('deviceId must be an opaque jcvital_device_ ID')
   if (BLUETOOTH_MAC_PATTERN.test(JSON.stringify(observation))) problems.push('payload must not contain a Bluetooth MAC address')
@@ -116,6 +118,7 @@ export async function buildWorkoutHrObservation(
     packetSequence: event.packetSequence,
     observedAt,
     observedAtSource: WORKOUT_HR_TIMESTAMP_POLICY.observedAtSource,
+    timestampSource: WORKOUT_HR_TIMESTAMP_POLICY.timestampSource,
     timestampConfidence: WORKOUT_HR_TIMESTAMP_POLICY.timestampConfidence,
     receivedAt: event.receivedAt,
     deviceId,
@@ -213,6 +216,8 @@ export interface WorkoutHrDeliverySnapshot {
   retrying: number
   delivered: number
   failed: number
+  /** Unique tracked observation IDs acknowledged as delivered, whether the server counted them accepted or duplicate. */
+  uniqueObservationsDelivered: number
   batchesAttempted: number
   batchesDelivered: number
   batchesRetried: number
@@ -254,6 +259,7 @@ export class WorkoutHrDeliveryService {
   private enqueueInProgress = 0
   private sinceLastFlush = 0
   private readonly tracked = new Map<string, TrackedState>()
+  private readonly deliveredIds = new Set<string>()
   private replayPayloads: NativeObservationInput[] = []
   private readonly stopFlushedSessions = new Set<string>()
   private readonly sessions = new Set<string>()
@@ -318,6 +324,7 @@ export class WorkoutHrDeliveryService {
   resetDiagnostics(): void {
     this.counters = WorkoutHrDeliveryService.emptyCounters()
     for (const [id, state] of this.tracked) if (state === 'DELIVERED' || state === 'FAILED') this.tracked.delete(id)
+    this.deliveredIds.clear()
     this.replayPayloads = []
     this.sessions.clear()
     this.stopFlushedSessions.clear()
@@ -502,6 +509,7 @@ export class WorkoutHrDeliveryService {
       for (const id of event.acknowledgedIds) {
         const state = this.tracked.get(id)
         if (state === undefined) continue
+        this.deliveredIds.add(id)
         if (state === 'DELIVERED') this.counters.replayAcknowledged++
         else this.tracked.set(id, 'DELIVERED')
       }
@@ -532,6 +540,7 @@ export class WorkoutHrDeliveryService {
       retrying: this.countState('RETRYING'),
       delivered: this.countState('DELIVERED'),
       failed: this.countState('FAILED'),
+      uniqueObservationsDelivered: this.deliveredIds.size,
       sessionIds: [...this.sessions],
     }
   }

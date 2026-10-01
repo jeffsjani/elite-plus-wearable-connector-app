@@ -9,6 +9,7 @@ import { ObservationBatchManager, type BatchDeliveryEvent } from './ObservationB
 import { observationQueue } from './ObservationQueue'
 import type { NetworkStatus } from './NetworkStatus'
 import { createSyntheticObservation } from '../testing/SyntheticObservationFactory'
+import { buildWorkoutHrObservation } from '../../adapters/jcvital/WorkoutHrDelivery'
 
 class TestStorage {
   private readonly values = new Map<string, string>()
@@ -83,6 +84,18 @@ describe('ObservationBatchManager 100-observation lifecycle', () => {
     expect(diagnostics.activeBatch).toBeNull()
     expect(diagnostics.lastBatch).toMatchObject({ observationCount: 100, attemptNumber: 1, phase: 'DELIVERED', httpStatus: 200, backendResponseReceived: true, responseAccepted: 100, responseDuplicate: 0, responseRejected: 0, timedOut: false })
     expect(diagnostics.lastBatch?.requestDurationMs).toBeGreaterThanOrEqual(0)
+  })
+
+  it('sends JCVital workout HR timestampSource unchanged in the Base44 request body', async () => {
+    const observation = (await buildWorkoutHrObservation(owner, { sessionId: 's-1', heartRate: 120, packetSequence: 1, receivedAt: new Date().toISOString(), vendorDataType: '82', acquisitionMode: 'WORKOUT_REALTIME' }, { deviceId: 'jcvital_device_864cdfe8-8beb-481f-b4d5-5f361d57bfbb', firmwareVersion: null, sdkVersion: null, vendorActivityMode: null }))!
+    await observationQueue.enqueue(observation)
+    const backend = new FakeBackend()
+    const upload = submitSpy().mockImplementation(async (request) => backend.accept(request))
+
+    await new ObservationBatchManager({}, online).process()
+
+    const body = JSON.parse(JSON.stringify(upload.mock.calls[0][0])) as ConnectorObservationsRequest
+    expect(body.observations[0]).toMatchObject({ observationId: observation.observationId, timestampSource: 'CONNECTOR_BLE_RECEIPT_TIME', observedAtSource: 'CONNECTOR_BLE_RECEIPT_TIME', vendorDataType: '82' })
   })
 
   it('exposes the active batch while the request is outstanding', async () => {

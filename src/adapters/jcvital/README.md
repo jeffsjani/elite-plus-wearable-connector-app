@@ -293,6 +293,50 @@ session-scoped buffer at that boundary without replacing transport behavior.
 PPG start/stop semantics, ECG duration units, sample frequency, rates, and
 buffer-loss behavior require Phase 3D hardware validation.
 
+## Build 5A workout HR delivery — physical pass
+
+JCVital Pro V8 type-82 workout HR was delivered end-to-end from the native
+Connector to Elite+ and verified in Base44 for one physical session:
+
+| Evidence | Count |
+| --- | --- |
+| NativeObservation (unique) | 104 |
+| Canonical `body.heart_rate` (unique) | 104 |
+| WearableIngestionEvent rows | 165 |
+| Duplicate/retry receipt events | 61 |
+| Duplicate NativeObservation / canonical rows | 0 / 0 |
+| Rejected | 0 |
+| FAILED / DEAD_LETTER | 0 / 0 |
+
+- Canonical metric: `body.heart_rate`.
+- Source provenance: `JCVITAL_NATIVE` / `DIRECT_BLE`, retained on every record.
+- Device identity: opaque `jcvital_device_<uuid>` only; the BLE MAC stays local.
+- Timestamps: type-82 packets carry no device clock, so `observedAt` is the
+  Connector's BLE receipt time and each payload states
+  `observedAtSource` and `timestampSource` = `CONNECTOR_BLE_RECEIPT_TIME`, with
+  `timestampConfidence` = `RECEIPT_TIME_NO_VENDOR_TIMESTAMP`. `timestampSource`
+  is not part of the idempotency key, so observation IDs are unchanged.
+
+### Reading event and delivery counts
+
+Base44 `WearableIngestionEvent` count may exceed the unique observation count
+because duplicate/retry receipts are intentionally retained as audit events.
+In the session above, 104 unique observations + 61 duplicate receipt events =
+165 `WearableIngestionEvent` rows. This is expected and is **not** duplicate
+physiological data: NativeObservation and canonical rows stayed at 104.
+
+Connector diagnostics report two kinds of numbers:
+
+- `uniqueObservationsDelivered` — unique Connector observation IDs that reached
+  an acknowledged delivered state, whether the final successful response
+  classified them as accepted or duplicate. For the session above this is 104.
+  It counts acknowledged Connector IDs only and makes no claim about backend
+  table counts.
+- `serverAcceptedInBatches` / `serverDuplicateInBatches` /
+  `serverRejectedInBatches` — raw per-response counters summed across every
+  batch, including retries and replays. Accepted + duplicate can exceed the
+  unique count and must not be read as physiological record counts.
+
 ## Files
 
 - `JCVitalCapabilities.ts` — capability/evidence model and registry.

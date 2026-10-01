@@ -67,6 +67,7 @@ export interface NativeObservationInput {
   packetSequence?: number
   observedAt?: string
   observedAtSource?: string
+  timestampSource?: string
   timestampConfidence?: string
   receivedAt?: string
   deviceId?: string

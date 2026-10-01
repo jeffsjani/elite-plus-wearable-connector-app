@@ -36,6 +36,8 @@ function hr(packetSequence: number, heartRate = 80 + (packetSequence % 20), sess
 class Harness {
   owner: string | null = 'user-1'
   outage = false
+  /** Server commits the batch but the client never sees the response. */
+  loseAck = false
   failEnqueue = false
   posts: NativeObservationInput[][] = []
   readonly rows = new Map<string, { payload: NativeObservationInput; state: 'PENDING' | 'RETRY_WAIT' }>()
@@ -60,6 +62,11 @@ class Harness {
       const ids = batch.map((row) => row.payload.observationId)
       this.posts.push(batch.map((row) => row.payload))
       const attemptedAt = new Date().toISOString()
+      if (this.loseAck) {
+        batch.forEach((row) => { this.server.set(row.payload.observationId, row.payload); row.state = 'RETRY_WAIT' })
+        this.listeners.forEach((listener) => listener({ batchId: `b${this.posts.length}`, attemptedAt, outcome: 'RETRYING', observationIds: ids, acknowledgedIds: [], rejectedIds: [], httpStatus: null, errorCode: 'TIMEOUT', accepted: null, duplicate: null, rejected: null }))
+        return null
+      }
       if (this.outage) {
         batch.forEach((row) => { row.state = 'RETRY_WAIT' })
         this.listeners.forEach((listener) => listener({ batchId: `b${this.posts.length}`, attemptedAt, outcome: 'RETRYING', observationIds: ids, acknowledgedIds: [], rejectedIds: [], httpStatus: 503, errorCode: 'SERVER_ERROR', accepted: null, duplicate: null, rejected: null }))
@@ -219,6 +226,60 @@ describe('JCVital workout HR golden path', () => {
     await vi.waitFor(() => expect(delivery.getSnapshot().delivered).toBe(20))
     expect(delivery.getSnapshot()).toMatchObject({ retrying: 0, delivered: 20, lastResult: { outcome: 'DELIVERED' } })
     expect(harness.server.size).toBe(20)
+    delivery.dispose()
+  })
+
+  it('transmits timestampSource = CONNECTOR_BLE_RECEIPT_TIME in every type-82 payload sent to Base44', async () => {
+    const harness = new Harness()
+    const delivery = service(harness)
+    for (let sequence = 1; sequence <= 20; sequence++) delivery.handleHeartRate(hr(sequence))
+    await delivery.flush('MANUAL')
+
+    const sent = harness.posts.flat()
+    expect(sent).toHaveLength(20)
+    for (const observation of sent) {
+      expect(observation.vendorDataType).toBe('82')
+      expect(observation.timestampSource).toBe('CONNECTOR_BLE_RECEIPT_TIME')
+      expect(JSON.parse(JSON.stringify(observation))).toHaveProperty('timestampSource', 'CONNECTOR_BLE_RECEIPT_TIME')
+    }
+    delivery.dispose()
+  })
+
+  it('rejects a workout HR payload without timestampSource in preflight', async () => {
+    const valid = (await buildWorkoutHrObservation('user-1', hr(1), context))!
+    const { timestampSource: _omitted, ...missing } = valid
+    expect(validateWorkoutHrObservation(missing)).toContain('timestampSource must be CONNECTOR_BLE_RECEIPT_TIME')
+    expect(validateWorkoutHrObservation({ ...valid, timestampSource: 'DEVICE_CLOCK' })).toContain('timestampSource must be CONNECTOR_BLE_RECEIPT_TIME')
+  })
+
+  it('does not change the observation ID when timestampSource is added', async () => {
+    const observation = (await buildWorkoutHrObservation('user-1', hr(5), context))!
+    expect(observation.observationId).toMatch(/^[0-9a-f]{64}$/)
+    expect(observation.sourceRecordId).not.toContain('CONNECTOR_BLE_RECEIPT_TIME')
+  })
+
+  it('counts 104 unique observations delivered when 61 final receipts were duplicates', async () => {
+    const harness = new Harness()
+    const delivery = service(harness)
+    harness.loseAck = true
+    for (let sequence = 1; sequence <= 61; sequence++) delivery.handleHeartRate(hr(sequence))
+    await delivery.flush('MANUAL')
+    expect(harness.server.size).toBe(61)
+    expect(delivery.getSnapshot()).toMatchObject({ uniqueObservationsDelivered: 0, retrying: 61 })
+
+    harness.loseAck = false
+    for (let sequence = 62; sequence <= 104; sequence++) delivery.handleHeartRate(hr(sequence))
+    await delivery.flush('MANUAL')
+
+    expect(harness.server.size).toBe(104)
+    expect(delivery.getSnapshot()).toMatchObject({
+      uniqueObservationsDelivered: 104, delivered: 104, retrying: 0, failed: 0,
+      serverAcceptedInBatches: 43, serverDuplicateInBatches: 61, serverRejectedInBatches: 0,
+    })
+
+    await delivery.replay()
+    expect(harness.server.size).toBe(104)
+    expect(delivery.getSnapshot().uniqueObservationsDelivered).toBe(104)
     delivery.dispose()
   })
 
