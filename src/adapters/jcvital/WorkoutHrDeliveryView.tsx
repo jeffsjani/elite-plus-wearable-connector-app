@@ -38,7 +38,7 @@ function backendResult(batch: BatchDiagnostics): string {
 }
 
 function deliveryTimedOut(diagnostics: DeliveryDiagnostics): boolean {
-  if (diagnostics.activeBatch && diagnostics.activeBatch.elapsedMs > diagnostics.requestTimeoutMs) return true
+  if (diagnostics.activeBatches.some((batch) => batch.elapsedMs > diagnostics.requestTimeoutMs)) return true
   return !diagnostics.activeBatch && diagnostics.lastBatch?.timedOut === true && diagnostics.lastBatch.phase === 'RETRYING'
 }
 
@@ -67,7 +67,7 @@ export function WorkoutHrDeliveryView({
       <span>Queue store type: {queueDiagnostics.queueStoreType} · database: {queueDiagnostics.queueDatabaseName} · schema: {queueDiagnostics.queueSchemaVersion ?? '—'}</span>
       <span>Queue initialized: {queueDiagnostics.queueStoreInitialized ? 'yes' : 'NO'} · owner assigned: {queueDiagnostics.ownerAssigned ? 'yes' : 'NO'}</span>
       <span>Queue health: {queueHealth}{snapshot.nextEnqueueAttemptAt ? ` · next enqueue attempt ${snapshot.nextEnqueueAttemptAt}` : ''}</span>
-      <span>Pending: {queueStats?.pending ?? '—'} · retrying: {queueStats?.retrying ?? '—'} · delivered (this session): {snapshot.delivered}</span>
+      <span>Queue: pending {queueStats?.pending ?? '—'} · in flight {queueStats?.inFlight ?? '—'} · retrying {queueStats?.retrying ?? '—'} · failed {queueStats?.failed ?? '—'} · delivered (this session): {snapshot.delivered}</span>
       <span>Last queue error: {lastQueueError}</span>
       {selfTest && (selfTest.ok
         ? <span>Test Queue ({selfTest.at}): inserted {String(selfTest.result.enqueueResult.inserted)} · record {selfTest.result.recordId ?? '—'} · read back {String(selfTest.result.readBack)} · payload match {String(selfTest.result.readBackPayloadMatches)} · pending {selfTest.result.pendingCount} · removed {String(selfTest.result.removed)}</span>
@@ -92,6 +92,14 @@ export function WorkoutHrDeliveryView({
     </div>
     <section className="workout-live-diagnostics" aria-label="Active delivery batch">
       <strong>Delivery batch · {active ? `SENDING (${active.phase})` : last ? `last: ${last.phase}` : 'idle'}</strong>
+      <span>Concurrency: configured {deliveryDiagnostics.configuredConcurrency} · effective {deliveryDiagnostics.effectiveConcurrency} · active workers {deliveryDiagnostics.activeWorkerCount} · active batches {deliveryDiagnostics.activeBatches.length}</span>
+      {deliveryDiagnostics.configWarning && <span role="alert">Concurrency configuration warning: {deliveryDiagnostics.configWarning}</span>}
+      {deliveryDiagnostics.canonicalFailureAlert && <span role="alert"><strong>CANONICALIZATION FAILURE</strong> · {deliveryDiagnostics.canonicalFailureAlert} · cumulative failures {deliveryDiagnostics.canonicalFailureCount}</span>}
+      {deliveryDiagnostics.canonicalRecoveryRequired && <span role="alert"><strong>CANONICAL RECOVERY REQUIRED — QUEUE PAUSED</strong> · affected observations {deliveryDiagnostics.canonicalRecoveryObservationCount} · batches {deliveryDiagnostics.canonicalRecoveryBatchCount} · last batch {deliveryDiagnostics.lastCanonicalFailureBatchId ?? '—'} · at {deliveryDiagnostics.lastCanonicalFailureAt ?? '—'} · reason {deliveryDiagnostics.pauseReason ?? '—'}</span>}
+      {deliveryDiagnostics.canonicalRecoveryBatches.map((batch) => <span key={batch.batchId}>Recovery batch {batch.batchId} · {batch.observationCount} observation(s) · last failure {batch.lastFailureAt}</span>)}
+      <span>Rolling throughput: {deliveryDiagnostics.observationsPerMinute.toFixed(1)} observations/min · batch median {deliveryDiagnostics.medianBatchDurationMs ?? '—'} ms · p95 {deliveryDiagnostics.p95BatchDurationMs ?? '—'} ms · batches success/retry/failed {deliveryDiagnostics.successfulBatches}/{deliveryDiagnostics.retryBatches}/{deliveryDiagnostics.failedBatches} · ETA {deliveryDiagnostics.estimatedMinutesRemaining === null ? '—' : `${deliveryDiagnostics.estimatedMinutesRemaining.toFixed(1)} min`}</span>
+      {deliveryDiagnostics.activeBatches.map((batch) => <span key={batch.batchId}>Worker batch {batch.batchId} · {batch.observationCount} obs · attempt {batch.attemptNumber} · started {batch.startedAt} · elapsed {Math.round(batch.elapsedMs / 1000)}s</span>)}
+      {deliveryDiagnostics.queueStatsError && <span role="alert">Queue diagnostics unavailable: {deliveryDiagnostics.queueStatsError}</span>}
       {deliveryTimedOut(deliveryDiagnostics) && <span role="alert"><strong>DELIVERY TIMED OUT — RETRY SCHEDULED</strong>{last?.nextAttemptAt ? ` (next attempt ${last.nextAttemptAt})` : ''}</span>}
       <span>Active batch ID: {active?.batchId ?? '—'} · size: {active?.observationCount ?? '—'} · attempt: {active?.attemptNumber ?? '—'} · time in SENDING: {active ? `${Math.round(active.elapsedMs / 1000)}s` : '—'} (timeout {deliveryDiagnostics.requestTimeoutMs / 1000}s)</span>
       <span>Stale SENDING (&gt; {deliveryDiagnostics.staleSendingMs / 1000}s): {staleSendingCount ?? '—'}{deliveryDiagnostics.lastStaleRecovery ? ` · last recovery ${deliveryDiagnostics.lastStaleRecovery.trigger} ${deliveryDiagnostics.lastStaleRecovery.at}: released ${deliveryDiagnostics.lastStaleRecovery.released}` : ''}</span>

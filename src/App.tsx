@@ -7,6 +7,8 @@ import { connectorIdentityService } from './services/base44/ConnectorIdentitySer
 import { connectorObservationService } from './services/base44/ConnectorObservationService'
 import { connectorRegistrationService } from './services/base44/ConnectorRegistrationService'
 import { connectorStatusService } from './services/base44/ConnectorStatusService'
+import { getBackendEnvironmentDiagnostics } from './services/base44/base44Environment'
+import { Base44ContractProbePanel } from './services/base44/Base44ContractProbePanel'
 import {
   ConnectorServiceError,
   type ConnectorObservationsResponse,
@@ -44,6 +46,20 @@ function describeError(error: unknown, isLogin = false): string {
 function getPlatformLabel(): string {
   const platform = getPlatform()
   return platform === 'ios' ? 'iOS' : platform === 'android' ? 'Android' : 'Web'
+}
+
+function BackendEnvironmentPanel() {
+  const environment = getBackendEnvironmentDiagnostics()
+  return (
+    <section className="diagnostics" aria-label="Backend environment diagnostics">
+      <h2>Backend environment</h2>
+      {!environment.environmentMatch && <p className="error-message" role="alert"><strong>BACKEND ENVIRONMENT MISMATCH</strong></p>}
+      <p>Expected host: {environment.expectedHost} · resolved host: {environment.resolvedHost}</p>
+      <p>Observations: {environment.resolvedObservationsUrl}</p>
+      <p>Registration: {environment.resolvedRegistrationUrl}</p>
+      <p>Environment match: {String(environment.environmentMatch)}</p>
+    </section>
+  )
 }
 
 function createBatchId(): string {
@@ -101,8 +117,14 @@ function App() {
       // Queue diagnostics retain the cause; queue use retries initialization, so sign-in continues.
       console.error('Observation queue initialization failed', error)
     }
-    observationBatchManager.resume()
-    observationBatchManager.start()
+    await refreshQueueStats().catch(() => undefined)
+  }
+
+  async function startDurableQueueResume(): Promise<void> {
+    await observationBatchManager.start({
+      restoredBackendDeviceId: connectorIdentityService.getConnectorDeviceId() !== null,
+      persistedDeliveryEnablement: false,
+    })
     await refreshQueueStats().catch(() => undefined)
   }
 
@@ -119,10 +141,9 @@ function App() {
         setConnectionState('AUTHENTICATED')
         setErrorMessage('')
         await prepareQueue(currentUser)
-        const result = await connectorRegistrationService.registerConnector({ installId: installationIdentityService.getInstallId(), platform: getRegistrationPlatform(), appVersion })
+        await registerConnector()
         if (!active) return
-        setRegistration(result)
-        setConnectionState('REGISTERED')
+        await startDurableQueueResume()
       } catch (error) {
         if (!active) return
         handleServiceError(error)
@@ -154,9 +175,9 @@ function App() {
       const currentUser = await authenticationService.loginWithEmailPassword(email, password)
       setPassword('')
       setUser(currentUser)
-      connectorIdentityService.clearConnectorDeviceId()
       await prepareQueue(currentUser)
       await registerConnector()
+      await startDurableQueueResume()
     } catch (error) {
       handleServiceError(error, true)
     }
@@ -293,6 +314,7 @@ function App() {
         <section className="status-panel auth-panel" aria-labelledby="app-title">
           <div className="eyebrow">Elite+ / Connector connection</div>
           <h1 id="app-title">Elite+ Connector</h1>
+          <BackendEnvironmentPanel />
           <p className="lede">Connect your Elite+ account to securely synchronize wearable and phone health data.</p>
           <form className="auth-form" onSubmit={(event) => void handleSignIn(event)}>
             <label htmlFor="email">Email</label>
@@ -312,6 +334,7 @@ function App() {
       <section className="status-panel" aria-labelledby="app-title">
         <div className="eyebrow">Elite+ / Connector connection</div>
         <h1 id="app-title">Elite+ Connector</h1>
+        <BackendEnvironmentPanel />
         <p className="signed-in">Signed in as: <strong>{user.email}</strong></p>
         <div className="readiness" role="status">
           <span className={`readiness-dot ${connectionState === 'ERROR' ? 'is-error' : ''}`} aria-hidden="true" />
@@ -326,6 +349,7 @@ function App() {
           <div><dt>Last sync</dt><dd>{status?.lastSuccessfulSync ?? 'Not available'}</dd></div>
           <div><dt>Sources configured</dt><dd>{status?.configuredSourceCount ?? registration?.sources.length ?? 0}</dd></div>
         </dl>
+        <Base44ContractProbePanel installId={installId} connectorDeviceId={connectorDeviceId} />
         {errorMessage && <p className="error-message" role="alert">{errorMessage}</p>}
         <div className="actions">
           <button type="button" onClick={() => void registerConnector()} disabled={isBusy}>Register Connector</button>

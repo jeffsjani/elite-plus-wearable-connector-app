@@ -157,6 +157,43 @@ class JCVitalV8EventNormalizer {
         }
     }
 
+    fun continuousHeartRateValues(record: Map<String, Any?>): List<Int> = record[DeviceKey.ArrayDynamicHR].integerArray()
+
+    /** Record start parsed exactly as for observedAt; null when the vendor date is missing or malformed. */
+    fun vendorRecordStartMillis(record: Map<String, Any?>, timezone: String): Long? =
+        parseVendorDate(record[DeviceKey.Date]?.toString(), timezone)?.time
+
+    /**
+     * Lazy, bounded continuous-HR expansion for streaming: identical ids, values, timestamps and sequence numbers to
+     * normalize(), but the packet envelope is never attached and the source record only on sample 0.
+     */
+    fun continuousHeartRateSamples(record: Map<String, Any?>, ctx: Context, receipt: String): Sequence<Map<String, Any?>> {
+        val values = record[DeviceKey.ArrayDynamicHR].integerArray()
+        val sourceTime = record[DeviceKey.Date]?.toString()
+        val startMillis = parseVendorDate(sourceTime, ctx.timezone)?.time
+        return values.asSequence().mapIndexed { sequence, value ->
+            observation(
+                metricType = "HEART_RATE_CONTINUOUS",
+                value = value,
+                unit = "bpm",
+                observedAtSource = sourceTime,
+                observedAt = startMillis?.let { JCVitalV8Time.isoUtc(it + sequence * CONTINUOUS_HR_INTERVAL_MS) },
+                dataType = BleConst.GetDynamicHR,
+                vendorField = DeviceKey.ArrayDynamicHR,
+                vendorDerived = false,
+                context = "CONTINUOUS_HISTORY",
+                sequence = sequence,
+                samplingIntervalMs = CONTINUOUS_HR_INTERVAL_MS,
+                packetId = null,
+                record = record,
+                envelope = emptyMap<Any?, Any?>(),
+                ctx = ctx,
+                receipt = receipt,
+                boundedRaw = true,
+            )
+        }
+    }
+
     private fun spo2(record: Map<String, Any?>, envelope: Map<*, *>, dataType: String, ctx: Context, receipt: String) = listOf(
         observation(
             "SPO2", record[DeviceKey.Blood_oxygen].asInt(), "percent", record[DeviceKey.Date]?.toString(),
@@ -335,6 +372,7 @@ class JCVitalV8EventNormalizer {
         receipt: String,
         values: List<Int>? = null,
         acquisitionMode: String = "HISTORICAL_SYNC",
+        boundedRaw: Boolean = false,
     ): Map<String, Any?> {
         val sourceRecordId = listOf(ctx.deviceId, dataType, vendorField, observedAtSource, packetId, sequence, value, values).joinToString("|")
         val id = UUID.nameUUIDFromBytes(sourceRecordId.toByteArray(StandardCharsets.UTF_8)).toString()
@@ -365,7 +403,11 @@ class JCVitalV8EventNormalizer {
             "vendorDataType" to dataType,
             "vendorField" to vendorField,
             "vendorDerived" to vendorDerived,
-            "rawPayload" to linkedMapOf("vendorEnvelope" to sanitize(envelope), "record" to sanitize(record)),
+            "rawPayload" to when {
+                !boundedRaw -> linkedMapOf("vendorEnvelope" to sanitize(envelope), "record" to sanitize(record))
+                sequence == 0 -> linkedMapOf("record" to record)
+                else -> null
+            },
             "provenance" to linkedMapOf(
                 "sourceConnector" to "JCVITAL_NATIVE", "provider" to "JCVITAL",
                 "sourceRecordId" to sourceRecordId, "parserVersion" to PARSER_VERSION,
@@ -373,7 +415,7 @@ class JCVitalV8EventNormalizer {
         )
     }
 
-    private fun parseError(dataType: String, message: String, rawRecord: Any?, receipt: String) = linkedMapOf(
+    internal fun parseError(dataType: String, message: String, rawRecord: Any?, receipt: String) = linkedMapOf(
         "vendorDataType" to dataType, "message" to message, "rawRecord" to sanitize(rawRecord), "receivedAt" to receipt,
     )
 
@@ -452,6 +494,7 @@ class JCVitalV8EventNormalizer {
         const val EVENT_BATTERY = "jcvitalBattery"
         const val EVENT_HEART_RATE = "jcvitalHeartRate"
         const val EVENT_OBSERVATION = "jcvitalObservation"
+        const val EVENT_HISTORICAL_HR_CHUNK = "jcvitalHistoricalHrChunk"
         const val EVENT_PARSE_ERROR = "jcvitalParseError"
         const val EVENT_WORKOUT_STATE = "jcvitalWorkoutState"
         const val EVENT_WORKOUT_PACKET = "jcvitalWorkoutPacket"

@@ -451,15 +451,17 @@ describe('Build 5B-1 delivery through the Build 5A queue and batch sender', () =
     expect(second.lastNativeObservationIds.hrv).toBeNull()
   })
 
-  it('surfaces accepted + canonical failed as CANONICAL_FAILED, delivered but not failed', async () => {
+  it('surfaces accepted + canonical failed as recovery-required, never delivered', async () => {
     backend.canonicalFailMetric = 'oxygenSaturation'
     vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => backend.accept(request))
     await delivery.deliverSyncResult(allFeeds()[1])
     const snapshot = delivery.getSnapshot()
-    expect(snapshot.metrics.spo2).toMatchObject({ serverAccepted: 4, canonicalFailed: 4, canonicalized: 0, uniqueObservationsDelivered: 4, failed: 0 })
+    expect(snapshot.metrics.spo2).toMatchObject({ serverAccepted: 4, canonicalFailed: 4, canonicalized: 0, uniqueObservationsDelivered: 0, failed: 0 })
     expect(snapshot.outcomeCounts.CANONICAL_FAILED).toBe(4)
     expect(snapshot.lastCanonicalFailure).toMatchObject({ metric: 'spo2', errorCode: 'CANONICAL_WRITE_FAILED' })
     expect((await observationQueue.getQueueStats()).failed).toBe(0)
+    expect((await observationQueue.getQueueStats()).canonicalRecoveryObservationCount).toBe(4)
+    expect((await observationQueue.getPending(100))).toHaveLength(0)
   })
 
   it('maps rejected results with reason/errorCode and rejects them in the queue even beyond the 50-entry errors[] cap', async () => {

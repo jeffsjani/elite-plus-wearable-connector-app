@@ -68,8 +68,13 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         val command: (Byte) -> ByteArray,
         val startedAt: Long,
         val callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit,
+        val hrStream: JCVitalV8HistoricalHrStream? = null,
     ) {
         val observations = LinkedHashMap<String, Map<String, Any?>>()
+        var hrAcquiring = true
+        var hrCompletionStatus = "COMPLETE"
+        var hrUnackedChunks = 0
+        var hrAckTimeout: Runnable? = null
         val parseErrors = mutableListOf<Map<String, Any?>>()
         var packetCount = 0
         var recordGroupCount = 0
@@ -281,6 +286,17 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     private val bluetoothManager = appContext.getSystemService(BluetoothManager::class.java)
     private val registry = JCVitalV8DeviceRegistry()
     private val normalizer = JCVitalV8EventNormalizer()
+    private val nativeBreadcrumbs = JCVitalV8NativeBreadcrumbs(
+        object : JCVitalV8NativeBreadcrumbs.Store {
+            private val prefs = appContext.getSharedPreferences(JCVitalV8NativeBreadcrumbs.PREFERENCES_NAME, Context.MODE_PRIVATE)
+
+            override fun read(key: String): String? = prefs.getString(key, null)
+
+            override fun write(key: String, value: String) {
+                prefs.edit().putString(key, value).commit()
+            }
+        },
+    )
     private val workoutNormalizer = JCVitalV8WorkoutNormalizer()
     private val stateMachine = JCVitalV8ConnectionStateMachine { from, to, reason ->
         Log.i(TAG, "state $from -> $to${reason?.let { " ($it)" } ?: ""}")
@@ -314,6 +330,8 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     private var writeTimeout: Runnable? = null
     private val pendingRequests = mutableListOf<PendingRequest>()
     private var historicalRequest: HistoricalRequest? = null
+    // Set after an HR stream ends early (Safe Test) so the rest of the in-flight page is dropped, not normalized.
+    private var ignoreTrailingHrHistory = false
     private var monitoringRequest: MonitoringRequest? = null
     private var workoutCapture: WorkoutCapture? = null
     private var lastWorkoutSession: Map<String, Any?>? = null
@@ -704,9 +722,16 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         callback(linkedMapOf("sessionId" to sessionId), null)
     }
 
-    fun syncHistoricalHeartRate(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
+    /**
+     * Streams history to JS as [JCVitalV8EventNormalizer.EVENT_HISTORICAL_HR_CHUNK] events and resolves with a summary
+     * only. [maxValidSamples] (Safe Test) stops expansion and paging once that many valid samples were bridged.
+     */
+    fun syncHistoricalHeartRate(maxValidSamples: Int?, callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
         "GetDynamicHRWithMode", BleConst.GetDynamicHR, { mode -> BleSDK.GetDynamicHRWithMode(mode, "") }, callback,
+        streamHeartRate = true, maxValidSamples = maxValidSamples,
     )
+
+    fun nativeBreadcrumbs(): Map<String, Any?> = nativeBreadcrumbs.snapshot()
 
     fun syncHistoricalSpo2(callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit) = startHistorical(
         "Oxygen_data", BleConst.GetAutomaticSpo2Monitoring, { mode -> BleSDK.Oxygen_data(mode, "") }, callback,
@@ -1398,13 +1423,25 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         dataType: String,
         command: (Byte) -> ByteArray,
         callback: (Map<String, Any?>?, JCVitalV8Exception?) -> Unit,
+        streamHeartRate: Boolean = false,
+        maxValidSamples: Int? = null,
     ) = onMain {
         if (!requireReady(callback)) return@onMain
         val blocked = JCVitalV8WorkoutGuard.blockedReason(workoutCapture?.session, realtimeSessionId != null, historicalRequest != null, monitoringRequest != null, rawEcgCapture != null)
         if (blocked != null) {
             return@onMain callback(null, JCVitalV8Exception(JCVitalV8ErrorCode.UNSUPPORTED_OPERATION, blocked))
         }
-        val request = HistoricalRequest(UUID.randomUUID().toString(), name, dataType, command, System.currentTimeMillis(), callback)
+        val syncId = UUID.randomUUID().toString()
+        val stream = if (!streamHeartRate) null else JCVitalV8HistoricalHrStream(
+            syncSessionId = syncId,
+            maxValidSamples = maxValidSamples,
+            normalizer = normalizer,
+            emitChunk = { chunk -> emit(JCVitalV8EventNormalizer.EVENT_HISTORICAL_HR_CHUNK, chunk) },
+            breadcrumb = nativeBreadcrumbs::record,
+        )
+        if (stream != null) nativeBreadcrumbs.record("NATIVE_HR_SYNC_REQUESTED", mapOf("safeTestLimit" to maxValidSamples, "chunkSize" to stream.chunkSize))
+        val request = HistoricalRequest(syncId, name, dataType, command, System.currentTimeMillis(), callback, stream)
+        ignoreTrailingHrHistory = false
         historicalRequest = request
         armHistoricalTimeout(request)
         enqueue("$name(start)", command(HISTORY_MODE_START))
@@ -1596,6 +1633,13 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
             }
         }
         Log.i(TAG, "<- vendor dataType=$dataType")
+        val hrStreamRequest = historicalRequest?.takeIf { it.hrStream != null && dataType == it.dataType }
+        if (hrStreamRequest != null || (ignoreTrailingHrHistory && historicalRequest == null && dataType == BleConst.GetDynamicHR)) {
+            // Bypass normalize(): it would copy the whole packet envelope into every 5-second sample.
+            hrStreamRequest?.let { handleHistoricalHrPacket(it, vendor) }
+            resolveResponse(dataType!!)
+            return
+        }
         val events = try {
             normalizer.normalize(
                 vendor,
@@ -2044,10 +2088,84 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         if (request.packetCount % HISTORY_PAGE_PACKETS == 0) enqueue("${request.name}(continue)", request.command(HISTORY_MODE_CONTINUE))
     }
 
+    private fun handleHistoricalHrPacket(request: HistoricalRequest, vendor: Map<String?, Any?>) {
+        val stream = request.hrStream ?: return
+        if (!request.hrAcquiring) return
+        request.packetCount++
+        val ctx = JCVitalV8EventNormalizer.Context(
+            deviceId = connectedDeviceId,
+            firmwareVersion = deviceInfo["firmwareVersion"] as? String,
+            sessionId = request.syncId,
+            receiptMillis = System.currentTimeMillis(),
+            timezone = TimeZone.getDefault().id,
+        )
+        val wantsMore = try {
+            stream.acceptPacket(vendor, ctx)
+        } catch (t: Throwable) {
+            nativeBreadcrumbs.record("NATIVE_HR_SYNC_FAILED", mapOf("error" to (t.message ?: t.javaClass.simpleName)))
+            request.timeout?.let(main::removeCallbacks)
+            historicalRequest = null
+            request.callback(null, JCVitalV8Errors.fromThrowable(t, JCVitalV8ErrorCode.RESPONSE_PARSE_FAILED))
+            return
+        }
+        if (!wantsMore || vendor[DeviceKey.End] == true) {
+            beginHrEmission(request, if (stream.plannedSampleCount == 0) "EMPTY_VALID" else "COMPLETE")
+            return
+        }
+        armHistoricalTimeout(request)
+        if (request.packetCount % HISTORY_PAGE_PACKETS == 0) enqueue("${request.name}(continue)", request.command(HISTORY_MODE_CONTINUE))
+    }
+
+    /** Acquisition is over: order buffered records, then emit chunks paced by JS acknowledgements. */
+    private fun beginHrEmission(request: HistoricalRequest, completionStatus: String) {
+        val stream = request.hrStream ?: return
+        request.timeout?.let(main::removeCallbacks)
+        request.timeout = null
+        request.hrAcquiring = false
+        request.hrCompletionStatus = completionStatus
+        ignoreTrailingHrHistory = true
+        stream.completeAcquisition()
+        pumpHrChunks(request)
+    }
+
+    private fun pumpHrChunks(request: HistoricalRequest) {
+        val stream = request.hrStream ?: return
+        if (historicalRequest !== request) return
+        while (!stream.finished && request.hrUnackedChunks < HR_CHUNK_ACK_WINDOW) {
+            request.hrUnackedChunks++
+            stream.emitNextChunk()
+        }
+        if (stream.finished && request.hrUnackedChunks == 0) {
+            finishHistorical(request, request.hrCompletionStatus)
+            return
+        }
+        request.hrAckTimeout?.let(main::removeCallbacks)
+        request.hrAckTimeout = Runnable {
+            if (historicalRequest !== request) return@Runnable
+            nativeBreadcrumbs.record("NATIVE_HR_ACK_TIMEOUT", mapOf("unacked" to request.hrUnackedChunks, "chunks" to stream.chunkCount))
+            stream.abort("JS_ACK_TIMEOUT")
+            finishHistorical(request, "PARTIAL")
+        }.also { main.postDelayed(it, HR_CHUNK_ACK_TIMEOUT_MS) }
+    }
+
+    /** JS has processed (mapped/enqueued) a chunk; releases the next one. */
+    fun ackHistoricalHrChunk(syncSessionId: String, chunkIndex: Int) = onMain {
+        val request = historicalRequest ?: return@onMain
+        if (request.hrStream?.syncSessionId != syncSessionId || request.hrUnackedChunks == 0) return@onMain
+        request.hrUnackedChunks--
+        Log.d(TAG, "HR chunk $chunkIndex acknowledged")
+        pumpHrChunks(request)
+    }
+
     private fun armHistoricalTimeout(request: HistoricalRequest) {
         request.timeout?.let(main::removeCallbacks)
         request.timeout = Runnable {
             if (historicalRequest !== request) return@Runnable
+            val stream = request.hrStream
+            if (stream != null) {
+                beginHrEmission(request, if (stream.plannedSampleCount == 0) "FAILED" else "PARTIAL")
+                return@Runnable
+            }
             finishHistorical(request, if (request.observations.isEmpty()) "FAILED" else "PARTIAL")
         }.also { main.postDelayed(it, HISTORY_TIMEOUT_MS) }
     }
@@ -2055,7 +2173,41 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
     private fun finishHistorical(request: HistoricalRequest, completionStatus: String) {
         if (historicalRequest !== request) return
         request.timeout?.let(main::removeCallbacks)
+        request.hrAckTimeout?.let(main::removeCallbacks)
         historicalRequest = null
+        request.hrStream?.let { stream ->
+            ignoreTrailingHrHistory = true
+            if (!stream.finished) stream.abort("FINISHED_EARLY")
+            val stats = stream.stats()
+            request.callback(
+                linkedMapOf(
+                    "syncId" to request.syncId,
+                    "deviceId" to connectedDeviceId,
+                    "provider" to "JCVITAL",
+                    "sdkCommand" to request.name,
+                    "vendorDataType" to request.dataType,
+                    "startedAt" to JCVitalV8Time.isoUtc(request.startedAt),
+                    "completedAt" to JCVitalV8Time.isoUtc(System.currentTimeMillis()),
+                    "recordsReceived" to stream.emittedSampleCount,
+                    "recordGroupsReceived" to stream.vendorRecordCount,
+                    "recordsStored" to 0,
+                    "recordsDeduplicated" to stream.duplicateCount,
+                    "recordsRejected" to stream.parseErrorCount,
+                    "earliestObservation" to stream.earliestObservation,
+                    "latestObservation" to stream.latestObservation,
+                    "partial" to (completionStatus == "PARTIAL"),
+                    "completionStatus" to completionStatus,
+                    "packetCount" to request.packetCount,
+                    "parseErrors" to stream.parseErrors,
+                    // Observations were already delivered through chunk events; the result never carries history.
+                    "observations" to emptyList<Any?>(),
+                    "streamed" to true,
+                    "stream" to stats,
+                ),
+                null,
+            )
+            return
+        }
         val observations = request.observations.values.toList()
         val times = observations.mapNotNull { it["observedAt"] as? String }.sorted()
         request.callback(
@@ -2151,7 +2303,12 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         }
         historicalRequest?.let { request ->
             request.timeout?.let(main::removeCallbacks)
+            request.hrAckTimeout?.let(main::removeCallbacks)
             historicalRequest = null
+            request.hrStream?.let { stream ->
+                stream.abort(error.code.name)
+                nativeBreadcrumbs.record("NATIVE_HR_SYNC_FAILED", mapOf("error" to error.code.name, "emitted" to stream.emittedSampleCount))
+            }
             request.callback(null, error)
         }
         monitoringRequest?.let { request ->
@@ -2281,6 +2438,9 @@ class JCVitalV8Manager(context: Context, private val listener: Listener) {
         private const val RAW_PPG_UI_UPDATE_INTERVAL_MS = 750L
         private const val RAW_PPG_SAFE_TEST_DURATION_MS = 20_000L
         private const val HISTORY_TIMEOUT_MS = 15_000L
+        /** Chunks emitted but not yet acknowledged by JS; bounds what the WebView bridge holds at once. */
+        private const val HR_CHUNK_ACK_WINDOW = 2
+        private const val HR_CHUNK_ACK_TIMEOUT_MS = 60_000L
         private const val HISTORY_PAGE_PACKETS = 50
         private const val HISTORY_MODE_START: Byte = 0x00
         private const val HISTORY_MODE_CONTINUE: Byte = 0x02

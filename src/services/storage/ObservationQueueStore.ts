@@ -1,6 +1,8 @@
 import type { NativeObservationInput } from '../base44/base44Types'
 
-export type QueueState = 'PENDING' | 'IN_FLIGHT' | 'RETRY_WAIT' | 'ACKNOWLEDGED' | 'FAILED_PERMANENT'
+export const MAX_QUEUE_CLAIM = 100
+
+export type QueueState = 'PENDING' | 'IN_FLIGHT' | 'RETRY_WAIT' | 'ACKNOWLEDGED' | 'FAILED_PERMANENT' | 'CANONICAL_RECOVERY_REQUIRED'
 
 export interface QueueRecord {
   queueId: string
@@ -10,6 +12,7 @@ export interface QueueRecord {
   state: QueueState
   createdAt: string
   updatedAt: string
+  claimedAt: string | null
   attemptCount: number
   nextAttemptAt: string | null
   lastAttemptAt: string | null
@@ -17,11 +20,30 @@ export interface QueueRecord {
   lastErrorMessage: string | null
   batchId: string | null
   acknowledgedAt: string | null
+  nativeObservationId: string | null
+  canonicalFailureAt: string | null
+}
+
+export interface CanonicalRecoveryClaim extends QueueClaim {
+  nativeObservationId: string | null
+  canonicalFailureAt: string
+}
+
+export interface CanonicalRecoveryBatch {
+  batchId: string
+  observationCount: number
+  lastFailureAt: string
 }
 
 export interface QueueErrorMetadata {
   code: string
   message: string
+}
+
+export interface QueueClaim {
+  queueId: string
+  batchId: string
+  attemptCount: number
 }
 
 export interface QueueStats {
@@ -34,6 +56,11 @@ export interface QueueStats {
   lastAttemptAt: string | null
   lastSuccessfulUploadAt: string | null
   warnings: string[]
+  canonicalRecoveryObservationCount?: number
+  canonicalRecoveryBatchCount?: number
+  canonicalRecoveryRequired?: boolean
+  lastCanonicalFailureBatchId?: string | null
+  lastCanonicalFailureAt?: string | null
 }
 
 export interface EnqueueResult {
@@ -66,10 +93,18 @@ export interface ObservationQueueStore {
   enqueue(ownerUserId: string, observation: NativeObservationInput): Promise<EnqueueResult>
   enqueueMany(ownerUserId: string, observations: NativeObservationInput[]): Promise<EnqueueResult[]>
   getPending(ownerUserId: string, limit: number, now?: Date): Promise<QueueRecord[]>
-  markInFlight(queueIds: string[], batchId: string): Promise<void>
-  markAcknowledged(observationIds: string[], ownerUserId: string): Promise<void>
-  markRetry(queueIds: string[], error: QueueErrorMetadata, nextAttemptAt: string): Promise<void>
-  markPermanentFailure(queueIds: string[], error: QueueErrorMetadata): Promise<void>
+  getNextRetryAt(ownerUserId: string, now?: Date): Promise<string | null>
+  /**
+   * Atomically selects up to `limit` eligible rows and marks them IN_FLIGHT under `batchId` in one transaction,
+   * so two concurrent workers can never claim the same PENDING/RETRY_WAIT rows.
+   */
+  claimPending(ownerUserId: string, limit: number, batchId: string, now?: Date): Promise<QueueRecord[]>
+  acknowledgeClaims(claims: QueueClaim[], ownerUserId: string): Promise<number>
+  markCanonicalRecoveryRequired(claims: CanonicalRecoveryClaim[], ownerUserId: string, error: QueueErrorMetadata): Promise<number>
+  getCanonicalRecoveryBatches(ownerUserId: string, limit: number): Promise<CanonicalRecoveryBatch[]>
+  recordCanonicalRecoveryPause(ownerUserId: string, batchId: string, observationCount: number, at: string): Promise<void>
+  retryClaims(claims: QueueClaim[], error: QueueErrorMetadata, nextAttemptAt: string): Promise<number>
+  failClaims(claims: QueueClaim[], error: QueueErrorMetadata): Promise<number>
   releaseStaleInFlight(ownerUserId: string, staleBefore: string): Promise<number>
   countStaleInFlight(ownerUserId: string, staleBefore: string): Promise<number>
   getQueueStats(ownerUserId: string, now?: Date): Promise<QueueStats>

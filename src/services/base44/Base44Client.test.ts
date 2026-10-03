@@ -39,4 +39,37 @@ describe('invokeConnectorFunction', () => {
     expect(statuses).toEqual([200])
     expect(result).toEqual(body)
   })
+
+  it('reports the resolved production URL and only allowlisted response trace headers', async () => {
+    vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: {
+        'x-request-id': 'request-123',
+        'set-cookie': 'session=must-not-be-reported',
+        authorization: 'Bearer must-not-be-reported',
+      },
+    }))
+    const { invokeConnectorFunction } = await loadClient()
+    const requestMetadata: unknown[] = []
+    const responseMetadata: unknown[] = []
+
+    await invokeConnectorFunction('nativeConnectorObservations', {}, {
+      onRequestMetadata: (metadata) => requestMetadata.push(metadata),
+      onResponseMetadata: (metadata) => responseMetadata.push(metadata),
+    })
+
+    expect(requestMetadata).toEqual([{
+      resolvedRequestUrl: 'https://waves-elite-sync.base44.app/functions/nativeConnectorObservations',
+      resolvedHost: 'waves-elite-sync.base44.app',
+      configuredAppId: '6a89a92c780c9ffa5ba886bc',
+    }])
+    expect(responseMetadata).toEqual([{
+      resolvedRequestUrl: 'https://waves-elite-sync.base44.app/functions/nativeConnectorObservations',
+      resolvedHost: 'waves-elite-sync.base44.app',
+      configuredAppId: '6a89a92c780c9ffa5ba886bc',
+      httpStatus: 200,
+      safeRequestTraceId: { header: 'x-request-id', value: 'request-123' },
+    }])
+    expect(JSON.stringify(responseMetadata)).not.toMatch(/must-not-be-reported|cookie|authorization/i)
+  })
 })

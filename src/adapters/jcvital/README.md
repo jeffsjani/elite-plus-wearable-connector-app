@@ -408,7 +408,7 @@ Delivery is off by default and runs only after a sync completes.
   | --- | --- | --- | --- |
   | accepted | canonicalized | `DELIVERED_CANONICALIZED` | delivered, canonicalized |
   | accepted | not_applicable | `DELIVERED_NATIVE_ONLY` | delivered, native only (success) |
-  | accepted | failed | `CANONICAL_FAILED` | delivered to NativeObservation, canonical failed (surfaced, not a delivery failure) |
+  | accepted | failed | `CANONICAL_RECOVERY_REQUIRED` | not acknowledged as delivered; persist recovery context and pause queue |
   | accepted | null | `DELIVERED` | delivered |
   | duplicate | null | `DELIVERED_DUPLICATE` | delivered (already stored) |
   | rejected | — | `REJECTED` with `reason` / `errorCode` | failed |
@@ -418,6 +418,75 @@ Delivery is off by default and runs only after a sync completes.
   are counted as unattributed. Responses without `results[]` fall back to batch
   totals, attributed per metric only when a batch holds one metric.
 - `uniqueObservationsDelivered` is per-ID exact in both modes.
+
+## Build 5B-1 throughput and queue-resume certification
+
+The live Base44 r3 benchmark establishes that larger requests do not improve
+fresh canonical HR throughput. Keep the production batch size at 100:
+
+| Fresh canonical HR batch | Processing time | Throughput |
+| --- | ---: | ---: |
+| 100 | 18.7 s | 5.34 observations/s |
+| 250 | 52.3 s | 4.78 observations/s |
+| 500 | 97.2 s | 5.15 observations/s |
+
+Duplicate-only processing took 0.7 s / 1.1 s / 1.7 s for 100 / 250 / 500
+observations. Three simultaneous fresh 100-row requests completed in 17.8 s:
+all 300 were accepted and canonicalized, with no 429 or other errors (about
+16.8 observations/s aggregate). Four simultaneous fresh 100-row requests
+completed in 20.06 s: all 400 were accepted and canonicalized, all native
+observation IDs were present, and there were no 429, 5xx, timeout, duplicate
+collision, or canonical failures (about 19.9 observations/s aggregate).
+Concurrency 5 is unsafe: Base44 reported 500 accepted with zero canonical
+creates in one run, and 14-22 canonical failures per 100-row batch in another.
+The sustained physical run invalidated concurrency 4 despite the clean
+single-wave benchmark: five 100-row batches reported 500 accepted raw rows and
+500 canonical failures, followed by another failed batch after backoff. Sustained
+Base44 tests later recorded 0 failures / 1,000 observations at concurrency 1,
+588 / 2,000 at concurrency 2, and 1,554 / 3,000 at concurrency 3; concurrency
+4 also failed physically. Therefore Build 5B-1 pins batch size, production
+default concurrency, and production maximum concurrency to 100 / 1 / 1. All
+higher requested concurrency values are clamped to one with a diagnostic
+warning. Internal parallel-worker architecture is retained for a future backend
+release but cannot start a second request in Build 5B-1. The live backend is
+`nc-observations-5b1-results-2026-10-03-r4` and retains the
+`native-observations-results-v1` response contract.
+Transient failures reduce effective concurrency one step at a time. Canonical
+failure now pauses the queue and cannot recover concurrency.
+
+Queue claims are capped at 100 rows and atomically move eligible rows to
+`IN_FLIGHT`, assign the unique batch ID, increment the attempt count, and write
+`claimedAt`. Acknowledgement, retry, and permanent-failure updates are guarded
+by that claim's batch ID and attempt count, so a late response cannot change a
+row reclaimed by a later attempt. The SQLite schema migration adds claim time
+without clearing/replacing queue rows. The canonical-recovery migration is also
+additive and preserves existing queue rows. Startup now restores authentication,
+assigns the queue owner, initializes the durable queue, restores/re-registers
+the Connector backend ID, recovers stale claims, then resumes queue delivery at the
+configured concurrency (currently default 1, hard ceiling 4). This queue resume is independent of the in-memory physiological
+acquisition toggle and does not require a connected V8. Startup diagnostics
+include whether resume was attempted/started, any blocking prerequisite, and
+whether the Connector identity was restored. Future-due retry rows are
+scheduled for their persisted retry time. Installing the certification APK
+must preserve app data. Do not clear app storage or repeat the full HR
+acquisition.
+
+For a response containing `canonicalStatus: failed` or a positive
+`canonical.failed` total, affected rows enter `CANONICAL_RECOVERY_REQUIRED`
+instead of being acknowledged or ordinarily retried. Their observation ID,
+native observation ID (when returned), batch ID, payload, and failure time are
+preserved. The delivery manager pauses all further queue claims and persists a
+bounded, payload-free batch diagnostic across restarts. A normal duplicate
+response cannot clear this state; wait for Base44's explicit server-side
+reconciliation procedure before implementing or enabling recovery.
+
+The full-scale 580/37,230 non-deliverables were expected zero/no-measurement
+placeholders and remain excluded by the existing `heartRateHistory` mapping
+policy (integer 1-250 bpm); Base44's authoritative physiological validation
+remains 20-250 bpm. Per-sync diagnostics report the placeholder count. The
+sample-level chronological merge fix and the 37,230-sample regression fixture
+remain in place; overlapping timestamps do not cause legitimate observations
+to be deduplicated.
 
 ## Files
 

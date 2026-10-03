@@ -5,6 +5,8 @@ import type {
   JCVitalV8HistoricalSyncResult,
   JCVitalV8MonitoringConfiguration,
 } from './jcvitalV8Bridge'
+import type { HistoricalHrStreamSummary } from './HistoricalHrStream'
+import { getBackendEnvironmentDiagnostics, type BackendEnvironmentDiagnostics } from '../../services/base44/base44Environment'
 
 export type HistoricalFeedKey = 'heartRate' | 'spo2' | 'temperature' | 'hrv' | 'ppi'
 export type Phase3AFeedKey = HistoricalFeedKey | 'monitoringConfiguration'
@@ -14,6 +16,8 @@ export interface HistoricalFeedRun {
   requestCompletedAt: string | null
   result: JCVitalV8HistoricalSyncResult | null
   error: string | null
+  /** Streamed HR: totals and first/last samples; result.observations then holds only those samples. */
+  streamSummary?: HistoricalHrStreamSummary
 }
 
 export interface MonitoringFeedRun {
@@ -183,15 +187,17 @@ function sampleDiagnostics(key: HistoricalFeedKey, result: JCVitalV8HistoricalSy
 export function buildHistoricalFeedResult(key: HistoricalFeedKey, run?: HistoricalFeedRun) {
   if (!run) return unknownFeedResult()
   if (!run.result) return run.error ? failedFeedResult(run) : pendingFeedResult(run)
+  const stream = run.streamSummary
   const records = historicalRecords(key, run.result.observations)
+  const normalizedCount = stream ? stream.observationsReceived : run.result.observations.length
   return {
     status: run.result.completionStatus,
     requestStartedAt: run.result.startedAt ?? run.requestStartedAt,
     requestCompletedAt: run.result.completedAt ?? run.requestCompletedAt,
     recordsReceived: run.result.recordsReceived,
     sourceRecordsReceived: run.result.recordGroupsReceived,
-    normalizedObservationsProduced: run.result.observations.length,
-    recordsAccepted: Math.max(0, run.result.observations.length - run.result.recordsRejected),
+    normalizedObservationsProduced: normalizedCount,
+    recordsAccepted: Math.max(0, normalizedCount - run.result.recordsRejected),
     recordsDeduplicated: run.result.recordsDeduplicated,
     recordsRejected: run.result.recordsRejected,
     earliestObservation: run.result.earliestObservation,
@@ -199,11 +205,28 @@ export function buildHistoricalFeedResult(key: HistoricalFeedKey, run?: Historic
     completionStatus: run.result.completionStatus,
     vendorDataType: run.result.vendorDataType,
     acquisitionMode: run.result.observations[0]?.acquisitionMode ?? 'HISTORICAL_SYNC',
-    sampleDiagnostics: sampleDiagnostics(key, run.result),
+    sampleDiagnostics: stream ? streamedHeartRateDiagnostics(run.result, stream) : sampleDiagnostics(key, run.result),
     parseErrors: run.result.parseErrors,
-    firstFive: records.slice(0, 5),
-    lastFive: records.slice(-5),
+    firstFive: stream ? historicalRecords(key, stream.firstFive) : records.slice(0, 5),
+    lastFive: stream ? historicalRecords(key, stream.lastFive) : records.slice(-5),
     allRecords: records,
+  }
+}
+
+function streamedHeartRateDiagnostics(result: JCVitalV8HistoricalSyncResult, stream: HistoricalHrStreamSummary) {
+  return {
+    totalSampleCount: stream.observationsReceived,
+    earliestTimestamp: result.earliestObservation,
+    latestTimestamp: result.latestObservation,
+    medianIntervalSeconds: stream.intervals.medianSeconds,
+    minimumIntervalSeconds: stream.intervals.minimumSeconds,
+    maximumIntervalSeconds: stream.intervals.maximumSeconds,
+    intervalsBetween4And6Seconds: stream.intervals.between4And6Seconds,
+    percentageBetween4And6Seconds: stream.intervals.percentageBetween4And6Seconds,
+    outOfOrderTimestamps: stream.intervals.outOfOrderTimestamps,
+    resampled: false,
+    nativeStream: result.stream ?? null,
+    jsStream: { chunksReceived: stream.chunksReceived, largestChunkReceived: stream.largestChunkReceived, largestChunkEstimatedBytes: stream.largestChunkEstimatedBytes, sourceRecordCount: stream.sourceRecordCount, finalReceived: stream.finalReceived, ignoredChunks: stream.ignoredChunks },
   }
 }
 
@@ -305,6 +328,7 @@ export function buildPhase3AValidationReport(options: {
   historicalRuns: Partial<Record<HistoricalFeedKey, HistoricalFeedRun>>
   monitoringRun?: MonitoringFeedRun
   additionalFeedResults?: Record<string, unknown>
+  backendEnvironment?: BackendEnvironmentDiagnostics
 }) {
   const feeds = {
     heartRate: buildHistoricalFeedResult('heartRate', options.historicalRuns.heartRate),
@@ -329,6 +353,7 @@ export function buildPhase3AValidationReport(options: {
       startedAt: starts[0] ?? null,
       completedAt: completions.at(-1) ?? null,
     },
+    backendEnvironment: options.backendEnvironment ?? getBackendEnvironmentDiagnostics(),
     feedResults: {
       heartRate: exportFeed(feeds.heartRate),
       spo2: exportFeed(feeds.spo2),

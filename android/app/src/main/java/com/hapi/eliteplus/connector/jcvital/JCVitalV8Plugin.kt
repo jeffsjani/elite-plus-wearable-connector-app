@@ -191,7 +191,29 @@ class JCVitalV8Plugin : Plugin() {
     }
 
     @PluginMethod
-    fun syncHistoricalHeartRate(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalHeartRate)
+    fun syncHistoricalHeartRate(call: PluginCall) {
+        val maxValidSamples = call.getInt("maxValidSamples")
+        if (maxValidSamples != null && maxValidSamples !in 1..MAX_SAFE_TEST_SAMPLES) {
+            return call.reject("maxValidSamples must be 1..$MAX_SAFE_TEST_SAMPLES", JCVitalV8ErrorCode.UNSUPPORTED_OPERATION.name)
+        }
+        resolveHistorical(call) { callback -> manager.syncHistoricalHeartRate(maxValidSamples, callback) }
+    }
+
+    @PluginMethod
+    fun ackHistoricalHrChunk(call: PluginCall) {
+        val syncSessionId = call.getString("syncSessionId")
+        val chunkIndex = call.getInt("chunkIndex")
+        if (syncSessionId.isNullOrBlank() || chunkIndex == null) {
+            return call.reject("syncSessionId and chunkIndex are required", JCVitalV8ErrorCode.UNSUPPORTED_OPERATION.name)
+        }
+        manager.ackHistoricalHrChunk(syncSessionId, chunkIndex)
+        call.resolve()
+    }
+
+    @PluginMethod
+    fun getNativeBreadcrumbs(call: PluginCall) {
+        call.resolve(toJsObject(manager.nativeBreadcrumbs()))
+    }
 
     @PluginMethod
     fun syncHistoricalSpo2(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalSpo2)
@@ -256,6 +278,7 @@ class JCVitalV8Plugin : Plugin() {
 
     companion object {
         private const val TAG = "JCVitalV8"
+        private const val MAX_SAFE_TEST_SAMPLES = 50_000
 
         fun toJsObject(map: Map<String, Any?>): JSObject {
             val result = JSObject()

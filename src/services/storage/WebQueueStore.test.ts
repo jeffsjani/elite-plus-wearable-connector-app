@@ -38,8 +38,9 @@ describe('WebQueueStore', () => {
 
   it('recovers stale in-flight rows and tracks queue metadata', async () => {
     const owner = `${ownerPrefix}-a`
-    const queued = await store.enqueue(owner, observation('observation-1'))
-    await store.markInFlight([queued.record.queueId], 'batch-1')
+    await store.enqueue(owner, observation('observation-1'))
+    const claims = await store.claimPending(owner, 100, 'batch-1')
+    expect(claims).toHaveLength(1)
     await store.releaseStaleInFlight(owner, new Date(Date.now() + 1000).toISOString())
 
     const stats = await store.getQueueStats(owner)
@@ -47,10 +48,76 @@ describe('WebQueueStore', () => {
     expect((await store.getPending(owner, 100)).length).toBe(1)
   })
 
+  it('finds the next persisted retry without loading acknowledged or pending payloads', async () => {
+    const owner = `${ownerPrefix}-a`
+    await store.enqueue(owner, observation('observation-1'))
+    const [claim] = await store.claimPending(owner, 100, 'batch-1')
+    const nextAttemptAt = new Date(Date.now() + 60_000).toISOString()
+    await store.retryClaims([{ queueId: claim.queueId, batchId: 'batch-1', attemptCount: claim.attemptCount }], { code: 'TIMEOUT', message: 't' }, nextAttemptAt)
+
+    expect(await store.getNextRetryAt(owner)).toBe(nextAttemptAt)
+    expect(await store.getNextRetryAt(owner, new Date(Date.now() + 120_000))).toBeNull()
+  })
+
+  it('persists canonical recovery separately from ordinary retry and protects it from stale acknowledgements', async () => {
+    const owner = `${ownerPrefix}-a`
+    const inserted = await store.enqueue(owner, observation('observation-canonical-failed'))
+    const [claim] = await store.claimPending(owner, 100, 'canonical-batch')
+    const canonicalFailureAt = new Date().toISOString()
+    expect(await store.markCanonicalRecoveryRequired([{
+      queueId: claim.queueId,
+      batchId: claim.batchId!,
+      attemptCount: claim.attemptCount,
+      nativeObservationId: 'native-row-id',
+      canonicalFailureAt,
+    }], owner, { code: 'CANONICAL_FAILURE', message: 'server recovery required' })).toBe(1)
+    expect(await store.acknowledgeClaims([{ queueId: claim.queueId, batchId: claim.batchId!, attemptCount: claim.attemptCount }], owner)).toBe(0)
+
+    const reopened = new WebQueueStore()
+    const record = await reopened.getRecord(owner, inserted.record.observationId)
+    expect(record).toMatchObject({
+      observationId: inserted.record.observationId,
+      payload: inserted.record.payload,
+      state: 'CANONICAL_RECOVERY_REQUIRED',
+      batchId: 'canonical-batch',
+      nativeObservationId: 'native-row-id',
+      canonicalFailureAt,
+    })
+    expect(await reopened.getQueueStats(owner)).toMatchObject({
+      pending: 0, retrying: 0, failed: 0, inFlight: 0,
+      canonicalRecoveryObservationCount: 1,
+      canonicalRecoveryBatchCount: 1,
+      lastCanonicalFailureBatchId: 'canonical-batch',
+      lastCanonicalFailureAt: canonicalFailureAt,
+    })
+    expect(await reopened.getCanonicalRecoveryBatches(owner, 10)).toEqual([
+      { batchId: 'canonical-batch', observationCount: 1, lastFailureAt: canonicalFailureAt },
+    ])
+  })
+
+  it('persists a queue-level canonical pause when a response failure has no identifiable row', async () => {
+    const owner = `${ownerPrefix}-metadata-only`
+    const failureAt = new Date().toISOString()
+    await store.recordCanonicalRecoveryPause(owner, 'unattributed-canonical-batch', 3, failureAt)
+
+    const reopened = new WebQueueStore()
+    expect(await reopened.getQueueStats(owner)).toMatchObject({
+      canonicalRecoveryRequired: true,
+      canonicalRecoveryObservationCount: 3,
+      canonicalRecoveryBatchCount: 1,
+      lastCanonicalFailureBatchId: 'unattributed-canonical-batch',
+      lastCanonicalFailureAt: failureAt,
+    })
+    expect(await reopened.getCanonicalRecoveryBatches(owner, 10)).toEqual([
+      { batchId: 'unattributed-canonical-batch', observationCount: 3, lastFailureAt: failureAt },
+    ])
+  })
+
   it('acknowledges and purges successful records without exposing payload values in stats', async () => {
     const owner = `${ownerPrefix}-a`
     await store.enqueue(owner, observation('observation-1'))
-    await store.markAcknowledged(['observation-1'], owner)
+    const [claim] = await store.claimPending(owner, 100, 'batch-1')
+    expect(await store.acknowledgeClaims([{ queueId: claim.queueId, batchId: 'batch-1', attemptCount: claim.attemptCount }], owner)).toBe(1)
 
     expect((await store.getQueueStats(owner)).acknowledged).toBe(1)
     expect((await store.getQueueStats(owner)).lastSuccessfulUploadAt).not.toBeNull()

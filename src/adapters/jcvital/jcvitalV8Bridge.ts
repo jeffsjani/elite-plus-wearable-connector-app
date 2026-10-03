@@ -119,6 +119,64 @@ export interface JCVitalV8HistoricalSyncResult {
   packetCount: number
   parseErrors: JCVitalV8ParseErrorEvent[]
   observations: NativeObservation[]
+  /** Set for streamed HR history: observations arrived as jcvitalHistoricalHrChunk events and are [] here. */
+  streamed?: boolean
+  stream?: JCVitalV8HistoricalHrStreamStats
+}
+
+export interface JCVitalV8HistoricalHrStreamStats {
+  syncSessionId: string
+  chunkSize: number
+  safeTestLimit: number | null
+  safeTestLimitReached: boolean
+  packetCount: number
+  vendorRecordCount: number
+  bufferedRecordCount: number
+  /** Arrival order of vendor source records; the physical V8 sends NEWEST_FIRST. */
+  vendorRecordOrder: 'OLDEST_FIRST' | 'NEWEST_FIRST' | 'MIXED' | 'UNKNOWN'
+  vendorAscendingTransitions: number
+  vendorDescendingTransitions: number
+  emittedOrder: 'CHRONOLOGICAL_BY_RECORD_START'
+  outOfOrderEmitted: number
+  plannedSampleCount: number
+  expandedSampleCount: number
+  emittedSampleCount: number
+  validSampleCount: number
+  skippedNoMeasurementCount: number
+  duplicateCount: number
+  chunkCount: number
+  largestChunkCount: number
+  estimatedSerializedChunkBytes: number
+  parseErrorCount: number
+  finalEmitted: boolean
+}
+
+/** One bounded native chunk of historical continuous HR (≤ chunkSize observations). */
+export interface JCVitalV8HistoricalHrChunk {
+  syncSessionId: string
+  chunkIndex: number
+  isFinal: boolean
+  vendorDataType: string
+  safeTestLimit: number | null
+  /** Cumulative source records read so far. */
+  sourceRecordCount: number
+  /** Samples the native stream will send in total for this sync. */
+  plannedSampleCount: number
+  sampleCount: number
+  emittedSampleCountTotal: number
+  estimatedSerializedBytes: number
+  observations: NativeObservation[]
+}
+
+export interface JCVitalV8NativeBreadcrumb {
+  at: string
+  stage: string
+  detail: Record<string, string | number | boolean | null>
+}
+
+export interface JCVitalV8NativeBreadcrumbs {
+  current: JCVitalV8NativeBreadcrumb[]
+  previous: JCVitalV8NativeBreadcrumb[]
 }
 
 export interface JCVitalV8MonitoringConfiguration {
@@ -445,7 +503,14 @@ export interface JCVitalV8Plugin {
   /** measurementSeconds: V8 heart-rate measurement window, 31–65535 s (default 60). */
   startRealtimeData(options?: { measurementSeconds?: number }): Promise<{ sessionId: string; measurementSeconds: number }>
   stopRealtimeData(): Promise<{ sessionId: string | null }>
-  syncHistoricalHeartRate(): Promise<JCVitalV8HistoricalSyncResult>
+  /**
+   * Streams history as jcvitalHistoricalHrChunk events and resolves with a summary (observations: []).
+   * maxValidSamples bounds the Safe Test natively: no more valid samples are expanded or bridged.
+   */
+  syncHistoricalHeartRate(options?: { maxValidSamples?: number }): Promise<JCVitalV8HistoricalSyncResult>
+  /** Releases the next native HR chunk; native holds at most two unacknowledged chunks. */
+  ackHistoricalHrChunk(options: { syncSessionId: string; chunkIndex: number }): Promise<void>
+  getNativeBreadcrumbs(): Promise<JCVitalV8NativeBreadcrumbs>
   syncHistoricalSpo2(): Promise<JCVitalV8HistoricalSyncResult>
   syncHistoricalTemperature(): Promise<JCVitalV8HistoricalSyncResult>
   syncHistoricalHrv(): Promise<JCVitalV8HistoricalSyncResult>
@@ -474,6 +539,7 @@ export interface JCVitalV8Plugin {
   addListener(event: 'jcvitalBattery', listener: (battery: JCVitalV8Battery) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalHeartRate', listener: (observation: JCVitalV8Observation) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalObservation', listener: (observation: NativeObservation) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalHistoricalHrChunk', listener: (chunk: JCVitalV8HistoricalHrChunk) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalParseError', listener: (error: JCVitalV8ParseErrorEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalRawVendorData', listener: (event: JCVitalV8RawVendorDataEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalError', listener: (error: JCVitalV8ErrorEvent) => void): Promise<PluginListenerHandle>

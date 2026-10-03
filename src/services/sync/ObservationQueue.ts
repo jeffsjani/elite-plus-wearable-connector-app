@@ -2,16 +2,20 @@ import type { NativeObservationInput } from '../base44/base44Types'
 import { getQueueStore } from '../storage/QueueStoreFactory'
 import {
   QueueStoreError,
+  MAX_QUEUE_CLAIM,
   type EnqueueResult,
   type ObservationQueueStore,
   type QueueErrorCode,
   type QueueErrorMetadata,
+  type QueueClaim,
+  type CanonicalRecoveryClaim,
+  type CanonicalRecoveryBatch,
   type QueueRecord,
   type QueueStats,
   type QueueStoreType,
 } from '../storage/ObservationQueueStore'
 
-export const queueLimits = { maxObservations: 100_000, warningAgeMs: 30 * 24 * 60 * 60 * 1000 }
+export const queueLimits = { maxObservations: 100_000, warningAgeMs: 30 * 24 * 60 * 60 * 1000, maxBatchClaim: MAX_QUEUE_CLAIM }
 
 export interface QueueDiagnostics {
   queueStoreType: QueueStoreType
@@ -103,11 +107,17 @@ export class ObservationQueue {
     const owner = await this.ready()
     return this.guard('QUEUE_WRITE_FAILED', () => this.store.enqueueMany(owner, observations))
   }
-  async getPending(limit: number): Promise<QueueRecord[]> { const owner = await this.ready(); return this.store.getPending(owner, Math.min(limit, 100)) }
-  async markInFlight(queueIds: string[], batchId: string): Promise<void> { await this.store.markInFlight(queueIds, batchId) }
-  async markAcknowledged(observationIds: string[]): Promise<void> { await this.store.markAcknowledged(observationIds, this.requireOwner()) }
-  async markRetry(queueIds: string[], error: QueueErrorMetadata, nextAttemptAt: string): Promise<void> { await this.store.markRetry(queueIds, error, nextAttemptAt) }
-  async markPermanentFailure(queueIds: string[], error: QueueErrorMetadata): Promise<void> { await this.store.markPermanentFailure(queueIds, error) }
+  async getRecord(observationId: string): Promise<QueueRecord | null> { const owner = await this.ready(); return this.store.getRecord(owner, observationId) }
+  async getPending(limit: number): Promise<QueueRecord[]> { const owner = await this.ready(); return this.store.getPending(owner, Math.min(limit, queueLimits.maxBatchClaim)) }
+  /** Atomic claim used by the batch manager so concurrent workers never pick up the same PENDING rows. */
+  async claimPending(limit: number, batchId: string): Promise<QueueRecord[]> { const owner = await this.ready(); return this.store.claimPending(owner, Math.min(limit, queueLimits.maxBatchClaim), batchId) }
+  async getNextRetryAt(now = new Date()): Promise<string | null> { const owner = await this.ready(); return this.store.getNextRetryAt(owner, now) }
+  async acknowledgeClaims(claims: QueueClaim[]): Promise<number> { const owner = await this.ready(); return this.store.acknowledgeClaims(claims, owner) }
+  async markCanonicalRecoveryRequired(claims: CanonicalRecoveryClaim[], error: QueueErrorMetadata): Promise<number> { const owner = await this.ready(); return this.store.markCanonicalRecoveryRequired(claims, owner, error) }
+  async getCanonicalRecoveryBatches(limit = 10): Promise<CanonicalRecoveryBatch[]> { const owner = await this.ready(); return this.store.getCanonicalRecoveryBatches(owner, limit) }
+  async recordCanonicalRecoveryPause(batchId: string, observationCount: number, at: string): Promise<void> { const owner = await this.ready(); return this.store.recordCanonicalRecoveryPause(owner, batchId, observationCount, at) }
+  async retryClaims(claims: QueueClaim[], error: QueueErrorMetadata, nextAttemptAt: string): Promise<number> { await this.ready(); return this.store.retryClaims(claims, error, nextAttemptAt) }
+  async failClaims(claims: QueueClaim[], error: QueueErrorMetadata): Promise<number> { await this.ready(); return this.store.failClaims(claims, error) }
   async releaseStaleInFlight(staleBefore: string): Promise<number> { const owner = await this.ready(); return this.store.releaseStaleInFlight(owner, staleBefore) }
   async countStaleInFlight(staleBefore: string): Promise<number> { const owner = await this.ready(); return this.store.countStaleInFlight(owner, staleBefore) }
   async getQueueStats(): Promise<QueueStats> {

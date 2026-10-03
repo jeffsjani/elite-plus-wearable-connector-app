@@ -1,5 +1,9 @@
 import { PHYSIOLOGY_CONTRACTS, PHYSIOLOGY_METRIC_KEYS, PHYSIOLOGY_METRIC_LABELS, type PhysiologyMetricKey } from './PhysiologyContract'
-import type { PhysiologyDeliverySnapshot, PhysiologyMetricCounters } from './PhysiologyDelivery'
+import { PHYSIOLOGY_DELIVERY_POLICY, type PhysiologyDeliverySnapshot, type PhysiologyMetricCounters } from './PhysiologyDelivery'
+import type { HistoricalHrStreamSummary } from './HistoricalHrStream'
+import type { JCVitalV8HistoricalHrStreamStats, JCVitalV8NativeBreadcrumb, JCVitalV8NativeBreadcrumbs } from './jcvitalV8Bridge'
+import type { BreadcrumbSession, BreadcrumbState } from '../../services/diagnostics/CrashBreadcrumbs'
+import type { ResponseShapeDiagnostic } from '../../services/sync/ObservationBatchManager'
 
 interface PhysiologyDeliveryViewProps {
   snapshot: PhysiologyDeliverySnapshot
@@ -7,6 +11,35 @@ interface PhysiologyDeliveryViewProps {
   onToggleEnabled: (enabled: boolean) => void
   onToggleMetric: (key: PhysiologyMetricKey, enabled: boolean) => void
   onReset: () => void
+  safeTestDisabledReason: string | null
+  /** Runs the streamed HR sync with a native limit on valid samples. */
+  onHistoricalHrSafeTest: (maxValidSamples: number) => void
+  heartRateStream: { native: JCVitalV8HistoricalHrStreamStats | null; js: HistoricalHrStreamSummary } | null
+  nativeBreadcrumbs: JCVitalV8NativeBreadcrumbs | null
+  lastResponseShape: ResponseShapeDiagnostic | null
+  breadcrumbs: BreadcrumbState
+}
+
+function kb(bytes: number): string { return `${Math.round(bytes / 1024).toLocaleString()} KB` }
+
+function NativeTrail({ label, trail }: { label: string; trail: JCVitalV8NativeBreadcrumb[] }) {
+  const last = trail.at(-1)
+  return <>
+    <span>{label} · last native stage: <strong>{last?.stage ?? '—'}</strong>{last ? ` at ${last.at} ${JSON.stringify(last.detail)}` : ''}</span>
+    <span>Native trail: {trail.slice(-12).map((crumb) => crumb.stage).join(' → ') || '—'}</span>
+  </>
+}
+
+function SessionSummary({ label, session }: { label: string; session: BreadcrumbSession | null }) {
+  if (!session) return <span>{label}: none recorded</span>
+  const last = session.trail.at(-1)
+  return <>
+    <span>{label} (started {session.sessionStartedAt}) · last stage: <strong>{session.lastSuccessStage ?? '—'}</strong>{last ? ` at ${last.at}${last.detail ? ` ${JSON.stringify(last.detail)}` : ''}` : ''}</span>
+    {session.lastHistoricalDeliveryError && <span role="alert">Last historical delivery error: {session.lastHistoricalDeliveryError.message} ({session.lastHistoricalDeliveryError.context ?? '—'}, {session.lastHistoricalDeliveryError.at})</span>}
+    {session.lastUnhandledJsError && <span role="alert">Last unhandled JS error: {session.lastUnhandledJsError.message} ({session.lastUnhandledJsError.at})</span>}
+    {session.lastUnhandledPromiseRejection && <span role="alert">Last unhandled promise rejection: {session.lastUnhandledPromiseRejection.message} ({session.lastUnhandledPromiseRejection.at})</span>}
+    <span>Trail: {session.trail.slice(-12).map((crumb) => crumb.stage).join(' → ') || '—'}</span>
+  </>
 }
 
 function Row({ label, counters }: { label: string; counters: PhysiologyMetricCounters }) {
@@ -18,9 +51,52 @@ function Row({ label, counters }: { label: string; counters: PhysiologyMetricCou
   </tr>
 }
 
-export function PhysiologyDeliveryView({ snapshot, busy, onToggleEnabled, onToggleMetric, onReset }: PhysiologyDeliveryViewProps) {
+export function PhysiologyDeliveryView({ snapshot, busy, onToggleEnabled, onToggleMetric, onReset, safeTestDisabledReason, onHistoricalHrSafeTest, heartRateStream, nativeBreadcrumbs, lastResponseShape, breadcrumbs }: PhysiologyDeliveryViewProps) {
+  const progress = snapshot.progress
+  const lastHandling = snapshot.resultHandling.at(-1) ?? null
+  const nativeStream = heartRateStream?.native ?? null
+  const jsStream = heartRateStream?.js ?? null
   return <>
     <h3>Elite+ Delivery · JCVital historical physiology (Build 5B-1)</h3>
+    <section className="workout-live-diagnostics" aria-label="Crash breadcrumbs">
+      <strong>Crash breadcrumbs (persisted across restarts)</strong>
+      <SessionSummary label="Previous app session" session={breadcrumbs.previous} />
+      <SessionSummary label="This session" session={breadcrumbs.current} />
+      {nativeBreadcrumbs && <>
+        <NativeTrail label="Previous app session (native)" trail={nativeBreadcrumbs.previous} />
+        <NativeTrail label="This session (native)" trail={nativeBreadcrumbs.current} />
+      </>}
+    </section>
+    <div className="wearable-actions">
+      <div className="diagnostic-control">
+        <button type="button" disabled={safeTestDisabledReason !== null} onClick={() => onHistoricalHrSafeTest(PHYSIOLOGY_DELIVERY_POLICY.safeTestMaxObservations)}>Historical HR Safe Test (native-bounded first {PHYSIOLOGY_DELIVERY_POLICY.safeTestMaxObservations})</button>
+        <small>{safeTestDisabledReason ? `Disabled: ${safeTestDisabledReason}` : 'Native stops expanding the band history after the first valid samples; at most that many cross the bridge. Works even with delivery toggled off.'}</small>
+      </div>
+      <div className="diagnostic-control">
+        <button type="button" className="secondary" disabled={safeTestDisabledReason !== null} onClick={() => onHistoricalHrSafeTest(PHYSIOLOGY_DELIVERY_POLICY.boundedTestMaxObservations)}>Historical HR Bounded Test (native-bounded first {PHYSIOLOGY_DELIVERY_POLICY.boundedTestMaxObservations.toLocaleString()})</button>
+        <small>Run only after the {PHYSIOLOGY_DELIVERY_POLICY.safeTestMaxObservations} Safe Test passes.</small>
+      </div>
+    </div>
+    {jsStream && <section className="workout-live-diagnostics" aria-label="Historical HR native stream">
+      <strong>Historical HR native stream{nativeStream?.safeTestLimit ? ` · native limit ${nativeStream.safeTestLimit}` : ''}{jsStream.finalReceived ? ' · final chunk received' : ' · streaming'}</strong>
+      <span>JS received: {jsStream.chunksReceived} chunks · {jsStream.observationsReceived} observations · largest chunk {jsStream.largestChunkReceived} (≈ {kb(jsStream.largestChunkEstimatedBytes)}) · source records {jsStream.sourceRecordCount}</span>
+      {nativeStream && <span>Native: vendor records {nativeStream.vendorRecordCount} · expanded {nativeStream.expandedSampleCount} · bridged {nativeStream.emittedSampleCount} (valid {nativeStream.validSampleCount}, skipped no-measurement {nativeStream.skippedNoMeasurementCount}, duplicate {nativeStream.duplicateCount}) · chunks {nativeStream.chunkCount} · largest {nativeStream.largestChunkCount} (≈ {kb(nativeStream.estimatedSerializedChunkBytes)}){nativeStream.safeTestLimitReached ? ' · limit reached' : ''}</span>}
+      {nativeStream && <span>Ordering: vendor records arrived {nativeStream.vendorRecordOrder} (ascending {nativeStream.vendorAscendingTransitions} / descending {nativeStream.vendorDescendingTransitions}) · emitted {nativeStream.emittedOrder} · native out-of-order {nativeStream.outOfOrderEmitted}</span>}
+      <span>Intervals: median {jsStream.intervals.medianSeconds ?? '—'} s · min {jsStream.intervals.minimumSeconds ?? '—'} · max {jsStream.intervals.maximumSeconds ?? '—'} · out-of-order {jsStream.intervals.outOfOrderTimestamps}</span>
+    </section>}
+    {(lastResponseShape || lastHandling) && <section className="workout-live-diagnostics" aria-label="Base44 per-observation results">
+      <strong>Base44 per-observation results (last batch)</strong>
+      {lastResponseShape && <span>Contract: {lastResponseShape.responseContractVersion ?? 'MISSING'} · deployment revision: {lastResponseShape.deploymentRevision ?? 'MISSING'}</span>}
+      {lastResponseShape && (!lastResponseShape.responseContractVersion || !lastResponseShape.deploymentRevision) && <span role="alert">BASE44 RESPONSE FINGERPRINT MISSING · stop physical validation</span>}
+      {lastResponseShape && <span>Transport: results[] {lastResponseShape.transportHasResults ? `present (${lastResponseShape.transportResultCount})` : 'ABSENT'} · keys [{lastResponseShape.transportTopLevelKeys.join(', ')}] · manager: results[] {lastResponseShape.responseHasResults ? `present (${lastResponseShape.responseResultCount})` : 'ABSENT'} · accepted {lastResponseShape.accepted ?? '—'} · duplicate {lastResponseShape.duplicate ?? '—'} · rejected {lastResponseShape.rejected ?? '—'} · canonical created {lastResponseShape.canonicalCreated ?? '—'} / failed {lastResponseShape.canonicalFailed ?? '—'}</span>}
+      {lastResponseShape?.firstResults.map((result, index) => <span key={index}>#{index + 1} {result.observationIdPrefix ?? '—'}… · {result.status ?? '—'} · canonical {result.canonicalStatus ?? '—'} · nativeObservationId {result.hasNativeObservationId ? 'yes' : 'NO'}{result.reason ? ` · ${result.reason}` : ''}{result.errorCode ? ` · ${result.errorCode}` : ''}</span>)}
+      {lastHandling && <span>PhysiologyDelivery: event results[] {lastHandling.eventHasResults ? `present (${lastHandling.eventResultCount})` : 'ABSENT'} · matched {lastHandling.matchedResults}/{lastHandling.trackedObservations} · accepted {lastHandling.appliedAccepted} · duplicate {lastHandling.appliedDuplicate} · canonicalized {lastHandling.appliedCanonicalized} · with nativeObservationId {lastHandling.withNativeObservationId}{lastHandling.legacyTotalsPath ? ' · LEGACY TOTALS PATH' : ''}</span>}
+    </section>}
+    {progress && <section className="workout-live-diagnostics" aria-label="Historical delivery progress">
+      <strong>Historical delivery progress · type {progress.vendorDataType}{progress.safeTest ? ' · SAFE TEST' : ''} · {progress.stage}</strong>
+      <span>Source records {progress.sourceRecords} · normalized {progress.normalized} · selected for test {progress.selectedForTest ?? 'all'} · mapped {progress.mapped} · queued {progress.queued} · already queued {progress.alreadyQueued} · non-deliverable {progress.notDeliverable}</span>
+      <span>Chunk {progress.currentChunk} / ~{progress.estimatedTotalChunks} (≤ {PHYSIOLOGY_DELIVERY_POLICY.processingChunkSize} per chunk, largest {progress.largestChunk}) · delivered {snapshot.total.uniqueObservationsDelivered} · duplicate {snapshot.total.serverDuplicate} · rejected {snapshot.total.serverRejected}</span>
+    </section>}
     <div className="wearable-actions">
       <label className="workout-mode">
         <input type="checkbox" checked={snapshot.enabled} disabled={busy} onChange={(event) => onToggleEnabled(event.target.checked)} />
@@ -33,7 +109,7 @@ export function PhysiologyDeliveryView({ snapshot, busy, onToggleEnabled, onTogg
       <button type="button" className="secondary" disabled={busy} onClick={onReset}>Reset 5B-1 counters</button>
     </div>
     <section className="workout-live-diagnostics" aria-label="Historical physiology delivery diagnostics">
-      <span>Backend Device ID: {snapshot.backendDeviceId ?? '— (resolved on connect)'} · last sync: {snapshot.lastSync ? `type ${snapshot.lastSync.vendorDataType} · mapped ${snapshot.lastSync.mapped} · newly queued ${snapshot.lastSync.queued} · ${snapshot.lastSync.at}` : '—'}</span>
+      <span>Backend Device ID: {snapshot.backendDeviceId ?? '— (resolved on connect)'} · last sync: {snapshot.lastSync ? `type ${snapshot.lastSync.vendorDataType} · mapped ${snapshot.lastSync.mapped} · newly queued ${snapshot.lastSync.queued} · non-deliverable ${snapshot.lastSync.notDeliverable} · ${snapshot.lastSync.at}` : '—'}</span>
       {snapshot.lastError && <span role="alert">Last delivery error: {snapshot.lastError}</span>}
       {snapshot.lastInvalidReason && <span>Last invalid observation: {snapshot.lastInvalidReason}</span>}
       <span>Per-observation outcomes · {Object.entries(snapshot.outcomeCounts).filter(([, count]) => count > 0).map(([state, count]) => `${state} ${count}`).join(' · ') || '—'}. Native-only (canonical not applicable) is a successful delivery.</span>

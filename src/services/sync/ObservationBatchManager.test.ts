@@ -167,8 +167,8 @@ describe('ObservationBatchManager', () => {
     const owner = `ack-loss-${Date.now()}`
     observationQueue.setOwnerUserId(owner)
     await observationQueue.initialize()
-    const queued = await observationQueue.enqueue(createSyntheticObservation())
-    await observationQueue.markInFlight([queued.record.queueId], 'lost-ack-batch')
+    await observationQueue.enqueue(createSyntheticObservation())
+    await observationQueue.claimPending(100, 'lost-ack-batch')
     connectorIdentityService.setConnectorDeviceId('device-test')
     vi.spyOn(authenticationService, 'isAuthenticated').mockResolvedValue(true)
     const upload = vi.spyOn(connectorObservationService, 'submitObservations').mockResolvedValue({ success: true, batchId: 'retry-batch', accepted: 0, duplicate: 1, rejected: 0, errors: [], serverTimestamp: new Date().toISOString() })

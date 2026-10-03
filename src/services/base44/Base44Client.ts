@@ -4,30 +4,28 @@ import {
   ConnectorServiceError,
   type ConnectorErrorCode,
 } from './base44Types'
+import {
+  BASE44_PRODUCTION_ENVIRONMENT,
+  getBackendEnvironmentDiagnostics,
+  resolveConnectorFunctionUrl,
+} from './base44Environment'
 
-const appId = import.meta.env.VITE_BASE44_APP_ID ?? ''
-const configuredServerUrl = import.meta.env.VITE_BASE44_SERVER_URL ?? ''
-const configuredAppBaseUrl = import.meta.env.VITE_BASE44_APP_BASE_URL ?? ''
-const functionBaseUrl = import.meta.env.VITE_BASE44_FUNCTION_BASE_URL ?? ''
-const normalizedFunctionBaseUrl = functionBaseUrl.replace(/\/+$/, '')
-const serverUrl = configuredServerUrl || normalizedFunctionBaseUrl.replace(/\/functions$/, '')
+const { appId, serverUrl, appBaseUrl } = BASE44_PRODUCTION_ENVIRONMENT
 
 export const base44: Base44Client = createClient({
   appId,
-  serverUrl: serverUrl || undefined,
-  appBaseUrl: configuredAppBaseUrl || serverUrl || undefined,
+  serverUrl,
+  appBaseUrl,
   analytics: { enabled: false },
 })
 
 function getConfiguredFunctionUrl(functionName: string): string {
-  if (!appId || !normalizedFunctionBaseUrl) {
-    throw new ConnectorServiceError(
-      'SERVER_ERROR',
-      'Connector service configuration is missing.',
-    )
+  const environment = getBackendEnvironmentDiagnostics()
+  if (!environment.environmentMatch) {
+    throw new ConnectorServiceError('SERVER_ERROR', 'BACKEND ENVIRONMENT MISMATCH')
   }
 
-  return `${normalizedFunctionBaseUrl}/${functionName}`
+  return resolveConnectorFunctionUrl(functionName)
 }
 
 function getErrorCode(status: number | undefined): ConnectorErrorCode {
@@ -58,6 +56,31 @@ export interface InvokeOptions {
   signal?: AbortSignal
   /** Called as soon as HTTP headers arrive, before the body is read. */
   onHttpResponse?: (status: number) => void
+  /** Called with the parsed JSON body exactly as received, before any service-level handling. */
+  onResponseBody?: (body: unknown) => void
+  onRequestMetadata?: (metadata: ConnectorRequestMetadata) => void
+  onResponseMetadata?: (metadata: ConnectorResponseMetadata) => void
+}
+
+export interface ConnectorRequestMetadata {
+  resolvedRequestUrl: string
+  resolvedHost: string
+  configuredAppId: string
+}
+
+export interface ConnectorResponseMetadata extends ConnectorRequestMetadata {
+  httpStatus: number
+  safeRequestTraceId: { header: string; value: string } | null
+}
+
+const SAFE_TRACE_HEADERS = ['x-request-id', 'request-id', 'x-correlation-id', 'x-trace-id', 'traceparent']
+
+function safeRequestTraceId(headers: Headers): ConnectorResponseMetadata['safeRequestTraceId'] {
+  for (const header of SAFE_TRACE_HEADERS) {
+    const value = headers.get(header)?.trim()
+    if (value && value.length <= 200 && /^[A-Za-z0-9._:/-]+$/.test(value)) return { header, value }
+  }
+  return null
 }
 
 function abortedError(): ConnectorServiceError {
@@ -79,9 +102,16 @@ export async function invokeConnectorFunction<T>(
   }
 
   let response: Response
+  const resolvedRequestUrl = getConfiguredFunctionUrl(functionName)
+  const requestMetadata: ConnectorRequestMetadata = {
+    resolvedRequestUrl,
+    resolvedHost: new URL(resolvedRequestUrl).hostname,
+    configuredAppId: appId,
+  }
+  options.onRequestMetadata?.(requestMetadata)
 
   try {
-    response = await fetch(getConfiguredFunctionUrl(functionName), {
+    response = await fetch(resolvedRequestUrl, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -97,6 +127,7 @@ export async function invokeConnectorFunction<T>(
   }
 
   options.onHttpResponse?.(response.status)
+  options.onResponseMetadata?.({ ...requestMetadata, httpStatus: response.status, safeRequestTraceId: safeRequestTraceId(response.headers) })
   let responseBody: unknown
 
   try {
@@ -109,6 +140,8 @@ export async function invokeConnectorFunction<T>(
       response.status,
     )
   }
+
+  options.onResponseBody?.(responseBody)
 
   if (!response.ok) {
     const message =

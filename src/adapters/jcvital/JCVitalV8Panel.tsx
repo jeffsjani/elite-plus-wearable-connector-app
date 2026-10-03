@@ -1,4 +1,4 @@
-import { Component, useEffect, useRef, useState, type ErrorInfo, type ReactNode } from 'react'
+import { Component, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from 'react'
 import { Capacitor } from '@capacitor/core'
 import { Directory, Encoding, Filesystem } from '@capacitor/filesystem'
 import { Share } from '@capacitor/share'
@@ -10,7 +10,9 @@ import {
   type JCVitalV8DeviceInfo,
   type JCVitalV8ErrorEvent,
   type JCVitalV8HistoricalSyncResult,
+  type JCVitalV8HistoricalHrStreamStats,
   type JCVitalV8LiveWorkoutSession,
+  type JCVitalV8NativeBreadcrumbs,
   type JCVitalV8Observation,
   type JCVitalV8PermissionResult,
   type JCVitalV8RawEcgErrorEvent,
@@ -56,14 +58,21 @@ import {
 import { WORKOUT_HR_E2E_TEST_DURATION_MS, WorkoutHrDeliveryView, type QueueSelfTestOutcome } from './WorkoutHrDeliveryView'
 import { JCVitalPhysiologyDelivery, type PhysiologyDeliverySnapshot } from './PhysiologyDelivery'
 import { PhysiologyDeliveryView } from './PhysiologyDeliveryView'
+import { auditHistoricalResult, boundHistoricalResult } from './HistoricalResultBounds'
+import { chunkAsSyncResult, HistoricalHrStreamCollector, type HistoricalHrStreamSummary } from './HistoricalHrStream'
+import { crashBreadcrumbs } from '../../services/diagnostics/CrashBreadcrumbs'
 import { observationQueue, type QueueDiagnostics } from '../../services/sync/ObservationQueue'
 import { observationBatchManager, type DeliveryDiagnostics } from '../../services/sync/ObservationBatchManager'
 import { connectorIdentityService } from '../../services/base44/ConnectorIdentityService'
+import { getBackendEnvironmentDiagnostics } from '../../services/base44/base44Environment'
 import { jcvitalDeviceIdentityService } from '../../services/storage/JCVitalDeviceIdentityService'
 import type { QueueStats } from '../../services/storage/ObservationQueueStore'
 import { QueueStoreError } from '../../services/storage/ObservationQueueStore'
 
 type ExportStatus = 'EXPORTING' | 'EXPORT SUCCESS' | 'EXPORT FAILED'
+
+/** Chunk events and the call result travel separately over the bridge; wait this long for the final chunk. */
+const FINAL_HR_CHUNK_WAIT_MS = 10_000
 
 function errorText(error: unknown): string {
   const { code, message } = (error ?? {}) as { code?: string; message?: string }
@@ -205,6 +214,8 @@ export function JCVitalV8Panel() {
   const [rawPpgRenderErrors, setRawPpgRenderErrors] = useState<Array<Record<string, unknown>>>([])
   const rawPpgUiCoalescerRef = useRef<ReturnType<typeof createRawPpgUiCoalescer> | null>(null)
   const [historicalRuns, setHistoricalRuns] = useState<Partial<Record<HistoricalFeedKey, HistoricalFeedRun>>>({})
+  const [hrStream, setHrStream] = useState<{ native: JCVitalV8HistoricalHrStreamStats | null; js: HistoricalHrStreamSummary } | null>(null)
+  const [nativeBreadcrumbs, setNativeBreadcrumbs] = useState<JCVitalV8NativeBreadcrumbs | null>(null)
   const [monitoringRun, setMonitoringRun] = useState<MonitoringFeedRun | undefined>()
   const [phase3bRuns, setPhase3bRuns] = useState<Partial<Record<Exclude<Phase3BFeedKey, 'sleep'>, HistoricalFeedRun>>>({})
   const [sleepRun, setSleepRun] = useState<SleepFeedRun>({})
@@ -357,6 +368,7 @@ export function JCVitalV8Panel() {
       }),
     ]
     void JCVitalV8.isAvailable().then((result) => setPluginAvailable(result.available)).catch(() => setPluginAvailable(false))
+    void JCVitalV8.getNativeBreadcrumbs().then(setNativeBreadcrumbs).catch(() => undefined)
     void JCVitalV8.getPermissionStatus().then(setPermission).catch((error) => setMessage(errorText(error)))
     void JCVitalV8.getConnectionState().then((result) => setState(result.state)).catch(() => undefined)
     void JCVitalV8.getWorkoutCaptureStatus().then((session) => {
@@ -404,17 +416,99 @@ export function JCVitalV8Panel() {
 
   async function executeHistoricalSync(key: HistoricalFeedKey, action: () => Promise<JCVitalV8HistoricalSyncResult>): Promise<void> {
     const requestStartedAt = new Date().toISOString()
+    const prefix = key === 'heartRate' ? 'HR' : key.toUpperCase()
+    crashBreadcrumbs.record(`${prefix}_SYNC_STARTED`, { safeTest: false })
     setHistoricalRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: null, result: null, error: null } }))
     try {
-      const result = await action()
+      const nativeResult = await action()
+      crashBreadcrumbs.record(`${prefix}_SYNC_NATIVE_COMPLETE`, { completionStatus: nativeResult.completionStatus, packets: nativeResult.packetCount })
+      crashBreadcrumbs.record(`${prefix}_SOURCE_RECORD_COUNT`, { sourceRecords: nativeResult.recordGroupsReceived })
+      const audit = auditHistoricalResult(nativeResult)
+      crashBreadcrumbs.record(`${prefix}_NORMALIZED_COUNT`, { normalized: audit.normalizedObservations, estimatedNativeResultBytes: audit.estimatedNativeResultBytes, envelopeDuplicated: audit.rawPayloadEnvelopeDuplicated, estimatedDuplicatedEnvelopeBytes: audit.estimatedDuplicatedEnvelopeBytes })
+      // Only first/last samples keep raw vendor payloads in React state and exports.
+      const result = boundHistoricalResult(nativeResult)
       setHistoricalRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result, error: null } }))
-      // Delivery runs after capture completes and never alters the sync result.
-      void physiologyRef.current?.deliverSyncResult(result).catch((error) => setMessage(errorText(error)))
+      const physiology = physiologyRef.current
+      // Delivery OFF: no mapping or queue work at all, preserving pre-5B-1 Sync behavior.
+      if (physiology?.isEnabled()) {
+        void physiology.deliverSyncResult(result).catch((error) => {
+          crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, prefix)
+          setMessage(errorText(error))
+        })
+      }
     } catch (error) {
       const text = errorText(error)
+      crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, `${prefix} native sync`)
       setHistoricalRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result: null, error: text } }))
       setMessage((current) => current ? `${current}; ${text}` : text)
     }
+  }
+
+  /**
+   * Historical HR arrives as bounded native chunks; each chunk is mapped and enqueued, then released. Screen state keeps
+   * only totals and first/last samples. maxValidSamples is enforced natively, before the bridge.
+   */
+  async function executeHistoricalHrStream(maxValidSamples?: number): Promise<void> {
+    const requestStartedAt = new Date().toISOString()
+    const safeTest = maxValidSamples !== undefined
+    crashBreadcrumbs.record('HR_SYNC_STARTED', { safeTest, nativeLimit: maxValidSamples ?? null, streamed: true })
+    setHistoricalRuns((current) => ({ ...current, heartRate: { requestStartedAt, requestCompletedAt: null, result: null, error: null } }))
+    setHrStream(null)
+    const physiology = physiologyRef.current
+    const deliver = physiology !== null && (safeTest || physiology.isEnabled())
+    const collector = new HistoricalHrStreamCollector()
+    let work: Promise<void> = Promise.resolve()
+    let deliveryFailed = false
+    const onDeliveryError = (error: unknown, context: string) => {
+      deliveryFailed = true
+      crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, context)
+      setMessage(errorText(error))
+    }
+    const handle = await JCVitalV8.addListener('jcvitalHistoricalHrChunk', (chunk) => {
+      const observations = collector.accept(chunk)
+      if (!observations) return
+      crashBreadcrumbs.record('HR_CHUNK_RECEIVED', { chunk: chunk.chunkIndex, samples: observations.length, isFinal: chunk.isFinal, estimatedBytes: chunk.estimatedSerializedBytes })
+      setHrStream({ native: null, js: collector.summary() })
+      // Native emits the next chunk only after this ack, so the bridge never holds more than a small window.
+      work = work.then(async () => {
+        if (!deliver || !physiology || !observations.length || deliveryFailed) return
+        await physiology.deliverSyncResult(chunkAsSyncResult(chunk, observations), {
+          ...(maxValidSamples !== undefined ? { maxObservations: maxValidSamples } : {}),
+          deferDrain: true,
+          expectedTotalObservations: chunk.plannedSampleCount,
+        })
+      }).catch((error) => onDeliveryError(error, `HR chunk ${chunk.chunkIndex}`))
+        .finally(() => JCVitalV8.ackHistoricalHrChunk({ syncSessionId: chunk.syncSessionId, chunkIndex: chunk.chunkIndex }).catch(() => undefined))
+    })
+    try {
+      const nativeResult = await JCVitalV8.syncHistoricalHeartRate(safeTest ? { maxValidSamples } : {})
+      crashBreadcrumbs.record('HR_SYNC_NATIVE_COMPLETE', { completionStatus: nativeResult.completionStatus, packets: nativeResult.packetCount, chunks: nativeResult.stream?.chunkCount ?? null, vendorOrder: nativeResult.stream?.vendorRecordOrder ?? null })
+      const finalReceived = nativeResult.stream?.finalEmitted === false ? false : await collector.waitForFinal(FINAL_HR_CHUNK_WAIT_MS)
+      const summary = collector.summary()
+      crashBreadcrumbs.record('HR_SOURCE_RECORD_COUNT', { sourceRecords: nativeResult.recordGroupsReceived })
+      crashBreadcrumbs.record('HR_NORMALIZED_COUNT', { normalized: summary.observationsReceived, nativeEmitted: nativeResult.stream?.emittedSampleCount ?? null, chunks: summary.chunksReceived, finalReceived })
+      setHrStream({ native: nativeResult.stream ?? null, js: summary })
+      setHistoricalRuns((current) => ({ ...current, heartRate: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result: collector.toSyncResult(nativeResult), error: null, streamSummary: summary } }))
+      if (!finalReceived) setMessage('Historical HR: final native chunk not received; delivered chunks remain queued.')
+      if (deliver && physiology) {
+        void work.then(() => deliveryFailed ? undefined : physiology.drainDeferred(nativeResult.vendorDataType)).catch((error) => onDeliveryError(error, 'HR drain'))
+      }
+    } catch (error) {
+      const text = errorText(error)
+      crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, 'HR native sync')
+      setHistoricalRuns((current) => ({ ...current, heartRate: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result: null, error: text, streamSummary: collector.summary() } }))
+      setMessage((current) => current ? `${current}; ${text}` : text)
+    } finally {
+      void handle.remove()
+      void JCVitalV8.getNativeBreadcrumbs().then(setNativeBreadcrumbs).catch(() => undefined)
+    }
+  }
+
+  async function runHistoricalHrStream(maxValidSamples?: number): Promise<void> {
+    setBusy(true)
+    setActiveSync('phase3a:heartRate')
+    setMessage('')
+    try { await executeHistoricalHrStream(maxValidSamples) } finally { setActiveSync(null); setBusy(false) }
   }
 
   async function runSync(key: HistoricalFeedKey, action: () => Promise<JCVitalV8HistoricalSyncResult>): Promise<void> {
@@ -687,8 +781,13 @@ export function JCVitalV8Panel() {
         sleep: sleepRun,
         workouts: phase3bRuns.workouts,
       })
+      const latestResponseShape = observationBatchManager.getDeliveryDiagnostics().recentResponseShapes.at(-1)
       const payload = buildPhase3AValidationReport({
         deviceInfo, historicalRuns, monitoringRun,
+        backendEnvironment: getBackendEnvironmentDiagnostics({
+          responseContractVersion: latestResponseShape?.responseContractVersion,
+          deploymentRevision: latestResponseShape?.deploymentRevision,
+        }),
         additionalFeedResults: {
           ...phase3bFeedResults,
           workoutLiveValidation,
@@ -696,7 +795,7 @@ export function JCVitalV8Panel() {
           rawEcgValidation: buildRawEcgValidation(rawEcgSession, rawEcgChunks, rawEcgParseErrors),
           rawPpgValidation: buildRawPpgValidation(rawPpgSession, rawPpgChunks, rawPpgParseErrors, rawPpgUiDiagnostics, rawPpgRenderErrors),
           workoutHrDelivery: hrDeliverySnapshot ? { ...hrDeliverySnapshot, queueStats: deliveryQueueStats, queueDiagnostics, queueReadError, queueSelfTest, deliveryDiagnostics: observationBatchManager.getDeliveryDiagnostics(), staleSendingCount } : null,
-          physiologyDelivery: physiologySnapshot,
+          physiologyDelivery: physiologySnapshot ? { ...physiologySnapshot, deliveryDiagnostics: observationBatchManager.getDeliveryDiagnostics(), queueStats: deliveryQueueStats } : null,
         },
       })
       const filename = `jcvital-v8-phase3abc-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
@@ -729,14 +828,15 @@ export function JCVitalV8Panel() {
 
   const ready = state === 'READY'
   const linked = state === 'CONNECTING' || state === 'CONNECTED' || state === 'INITIALIZING' || ready
-  const feedDiagnostics = {
+  // Recomputing these (sorting intervals, mapping every observation) on each 2 s diagnostics tick was unbounded work.
+  const feedDiagnostics = useMemo(() => ({
     heartRate: buildHistoricalFeedResult('heartRate', historicalRuns.heartRate),
     spo2: buildHistoricalFeedResult('spo2', historicalRuns.spo2),
     temperature: buildHistoricalFeedResult('temperature', historicalRuns.temperature),
     hrv: buildHistoricalFeedResult('hrv', historicalRuns.hrv),
     ppi: buildHistoricalFeedResult('ppi', historicalRuns.ppi),
     monitoringConfiguration: buildMonitoringFeedResult(monitoringRun),
-  }
+  }), [historicalRuns, monitoringRun])
   const phase3bDiagnostics = buildPhase3BFeedResults({
     activity: phase3bRuns.activity,
     detailedActivity: phase3bRuns.detailedActivity,
@@ -862,7 +962,7 @@ export function JCVitalV8Panel() {
       {heartRate && <p>Heart rate: <strong>{heartRate.value} {heartRate.unit}</strong> · received {new Date(heartRate.receiptTimestamp).toLocaleTimeString()} · packet type {heartRate.vendorDataType}</p>}
       <h3>Data Sync</h3>
       <div className="wearable-actions">
-        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void runSync('heartRate', () => JCVitalV8.syncHistoricalHeartRate())}>Sync HR</button>
+        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void runHistoricalHrStream()}>Sync HR</button>
         <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void runSync('spo2', () => JCVitalV8.syncHistoricalSpo2())}>Sync SpO2</button>
         <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void runSync('temperature', () => JCVitalV8.syncHistoricalTemperature())}>Sync Temperature</button>
         <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void syncHrvAndPpi()}>Sync HRV/PPI</button>
@@ -1055,6 +1155,12 @@ export function JCVitalV8Panel() {
         onToggleEnabled={(enabled) => physiologyRef.current?.setEnabled(enabled)}
         onToggleMetric={(key, enabled) => physiologyRef.current?.setMetricEnabled(key, enabled)}
         onReset={() => physiologyRef.current?.resetDiagnostics()}
+        safeTestDisabledReason={busy ? 'busy' : !ready ? 'V8 not READY' : otherActiveMeasurement !== null ? `${otherActiveMeasurement} active` : null}
+        onHistoricalHrSafeTest={(limit) => void runHistoricalHrStream(limit)}
+        heartRateStream={hrStream}
+        nativeBreadcrumbs={nativeBreadcrumbs}
+        lastResponseShape={deliveryDiagnostics.recentResponseShapes.at(-1) ?? null}
+        breadcrumbs={crashBreadcrumbs.getState()}
       />}
       {message && <p className="error-message" role="alert">{message}</p>}
       {lastError && <p>Last native error: {lastError.code} — {lastError.message}</p>}

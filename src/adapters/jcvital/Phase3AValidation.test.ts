@@ -138,5 +138,12 @@ describe('Phase 3A physical validation diagnostics', () => {
     expect(report.feedResults.heartRate.lastFive).toHaveLength(5)
     expect(report.feedResults.heartRate).not.toHaveProperty('allRecords')
     expect(report.feedResults.monitoringConfiguration.completionStatus).toBe('UNKNOWN')
+    expect(report.backendEnvironment).toMatchObject({
+      expectedHost: 'waves-elite-sync.base44.app',
+      resolvedHost: 'waves-elite-sync.base44.app',
+      resolvedObservationsUrl: 'https://waves-elite-sync.base44.app/functions/nativeConnectorObservations',
+      resolvedRegistrationUrl: 'https://waves-elite-sync.base44.app/functions/nativeConnectorRegister',
+      environmentMatch: true,
+    })
   })
 })

@@ -203,6 +203,48 @@ describe('ObservationBatchManager 100-observation lifecycle', () => {
     expect((await observationQueue.getQueueStats()).retrying).toBe(0)
   })
 
+  it('records the raw response shape: results[] present vs absent, first 3 results, canonical totals', async () => {
+    await enqueueHundred()
+    submitSpy().mockImplementation(async (request, options?: InvokeOptions) => {
+      const results = request.observations.map((o, index) => ({ observationId: o.observationId, status: 'accepted' as const, canonicalStatus: 'canonicalized' as const, nativeObservationId: index === 1 ? null : `n-${index}`, reason: null, errorCode: null }))
+      const body = { success: true, batchId: request.batchId, accepted: 100, duplicate: 0, rejected: 0, errors: [], serverTimestamp: '', canonical: { created: 100, failed: 0 }, results }
+      options?.onResponseBody?.({ ...body, responseContractVersion: 'native-observations-results-v1', deploymentRevision: 'nc-observations-5b1-results-2026-10-03-r4', authorization: 'Bearer must-not-be-exported' })
+      return body
+    })
+    const manager = new ObservationBatchManager({}, online)
+    await manager.process()
+    const shape = manager.getDeliveryDiagnostics().lastBatch?.responseShape
+    expect(shape).toMatchObject({
+      transportHasResults: true, transportResultCount: 100, responseHasResults: true, responseResultCount: 100,
+      accepted: 100, canonicalCreated: 100, canonicalFailed: 0,
+      responseContractVersion: 'native-observations-results-v1',
+      deploymentRevision: 'nc-observations-5b1-results-2026-10-03-r4',
+    })
+    expect(manager.getDeliveryDiagnostics().lastBatch).toMatchObject({
+      responseContractVersion: 'native-observations-results-v1',
+      deploymentRevision: 'nc-observations-5b1-results-2026-10-03-r4',
+    })
+    expect(JSON.stringify(manager.getDeliveryDiagnostics())).not.toContain('must-not-be-exported')
+    expect(shape?.transportTopLevelKeys).toContain('results')
+    expect(shape?.firstResults).toHaveLength(3)
+    expect(shape?.firstResults.map((result) => result.hasNativeObservationId)).toEqual([true, false, true])
+    expect(shape?.firstResults[0]).toMatchObject({ status: 'accepted', canonicalStatus: 'canonicalized' })
+    expect(shape?.firstResults[0].observationIdPrefix).toHaveLength(16)
+    expect(manager.getDeliveryDiagnostics().recentResponseShapes).toHaveLength(1)
+
+    await enqueueHundred()
+    submitSpy().mockImplementation(async (request, options?: InvokeOptions) => {
+      const body = { success: true, batchId: request.batchId, accepted: 100, duplicate: 0, rejected: 0, errors: [], serverTimestamp: '' }
+      options?.onResponseBody?.(body)
+      return body
+    })
+    await manager.process()
+    const last = manager.getDeliveryDiagnostics().lastBatch
+    expect(last?.responseShape).toMatchObject({ transportHasResults: false, transportResultCount: null, responseHasResults: false, canonicalCreated: null, responseContractVersion: null, deploymentRevision: null, firstResults: [] })
+    expect(last?.requestDurationMonotonicMs).toBeGreaterThanOrEqual(0)
+    expect(last?.maxEventLoopLagMs).toBeGreaterThanOrEqual(0)
+  })
+
   it('replays a batch the backend accepted but whose response was lost, receiving duplicates only', async () => {
     await enqueueHundred()
     const backend = new FakeBackend()
@@ -228,7 +270,7 @@ describe('ObservationBatchManager 100-observation lifecycle', () => {
     await enqueueHundred()
     const backend = new FakeBackend()
     submitSpy().mockImplementation(async (request) => backend.accept(request))
-    vi.spyOn(observationQueue, 'markAcknowledged').mockRejectedValueOnce(new Error('disk I/O error'))
+    vi.spyOn(observationQueue, 'acknowledgeClaims').mockRejectedValueOnce(new Error('disk I/O error'))
     const manager = new ObservationBatchManager({ retryBaseMs: 0, retryMaxMs: 0 }, online)
 
     await manager.process()
@@ -246,8 +288,7 @@ describe('ObservationBatchManager 100-observation lifecycle', () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(start)
     const ids = await enqueueHundred()
-    const records = await observationQueue.getPending(100)
-    await observationQueue.markInFlight(records.map((record) => record.queueId), 'crashed-batch')
+    await observationQueue.claimPending(100, 'crashed-batch')
     const backend = new FakeBackend()
     const upload = submitSpy().mockImplementation(async (request) => backend.accept(request))
 
@@ -277,12 +318,10 @@ describe('ObservationBatchManager 100-observation lifecycle', () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(start)
     await enqueueHundred()
-    const stale = await observationQueue.getPending(100)
-    await observationQueue.markInFlight(stale.map((record) => record.queueId), 'stale-batch')
+    await observationQueue.claimPending(100, 'stale-batch')
     vi.setSystemTime(new Date(start.getTime() + 45_000))
     await observationQueue.enqueueMany(Array.from({ length: 20 }, () => createSyntheticObservation()))
-    const fresh = await observationQueue.getPending(100)
-    await observationQueue.markInFlight(fresh.map((record) => record.queueId), 'fresh-batch')
+    await observationQueue.claimPending(100, 'fresh-batch')
     vi.setSystemTime(new Date(start.getTime() + 70_000))
     vi.spyOn(authenticationService, 'isAuthenticated').mockResolvedValue(false)
     const manager = new ObservationBatchManager({}, online)
