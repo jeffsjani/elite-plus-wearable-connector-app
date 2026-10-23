@@ -58,7 +58,10 @@ android {
 android.applicationVariants.all { variant ->
     if (!pipelineDiagnostic && !connectionDiagnostic && variant.buildType.name in ["debug", "release"]) {
         variant.outputs.all {
-            outputFileName = "ElitePlus-Companion-Phase1-P1-2E-Activity-V2-E2E.apk"
+            outputFileName = companionVersion.versionCode == 70
+                && companionVersion.versionName == "1.0.0-phase1-p1-2f-apk-e2e-diagnostic"
+                ? "ElitePlus-Companion-Phase1-P1-2F-APK-E2E-Diagnostic-v70.apk"
+                : "ElitePlus-Companion-Phase1-P1-2E-Activity-V2-E2E.apk"
         }
     }
 }
