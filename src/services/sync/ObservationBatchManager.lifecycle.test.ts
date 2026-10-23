@@ -331,6 +331,13 @@ describe('ObservationBatchManager 100-observation lifecycle', () => {
   async function assertActiveSenderSerializes(trigger: 'foreground' | 'online' | 'retry-timer'): Promise<void> {
     const network = new MutableNetwork()
     const manager = new ObservationBatchManager({ requestTimeoutMs: 10_000, retryBaseMs: 0, retryMaxMs: 0 }, network)
+    const processCalls: Array<ReturnType<typeof manager.process>> = []
+    const originalProcess = manager.process.bind(manager)
+    vi.spyOn(manager, 'process').mockImplementation((...args) => {
+      const process = originalProcess(...args)
+      processCalls.push(process)
+      return process
+    })
     const foregroundListeners = new Set<() => void>()
     if (trigger === 'foreground') {
       vi.stubGlobal('document', {
@@ -398,6 +405,8 @@ describe('ObservationBatchManager 100-observation lifecycle', () => {
     await firstProcess
     await vi.waitFor(() => expect(deliveredBatches).toBe(2))
     manager.stop()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await Promise.all(processCalls)
 
     const sentIds = upload.mock.calls.flatMap(([request]) => request.observations.map(({ observationId }) => observationId))
     expect(maxActiveRequests).toBe(1)
