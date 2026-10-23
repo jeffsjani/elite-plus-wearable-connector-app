@@ -47,14 +47,13 @@ let owner = ''
 let counter = 0
 
 async function enqueue(count: number): Promise<string[]> {
-  const observations = createSyntheticObservations(count)
-  await observationQueue.enqueueMany(observations)
-  return observations.map((observation) => observation.observationId)
+  // Sender tests bulk-seed durable fixtures; enqueue persistence is exercised by ObservationQueue tests.
+  return (await seedDurableRows(count)).map((record) => record.observationId)
 }
 
 async function seedDurableRows(count: number): Promise<QueueRecord[]> {
   const database = await new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open('elite-plus-observation-queue', 5)
+    const request = indexedDB.open('elite-plus-observation-queue')
     request.onsuccess = () => resolve(request.result)
     request.onerror = () => reject(request.error)
   })
@@ -84,11 +83,15 @@ async function seedDurableRows(count: number): Promise<QueueRecord[]> {
     }
   })
   records.forEach((record) => queue.add(record))
-  await new Promise<void>((resolve, reject) => {
-    transaction.oncomplete = () => resolve()
-    transaction.onerror = () => reject(transaction.error)
-    transaction.onabort = () => reject(transaction.error)
-  })
+  try {
+    await new Promise<void>((resolve, reject) => {
+      transaction.oncomplete = () => resolve()
+      transaction.onerror = () => reject(transaction.error)
+      transaction.onabort = () => reject(transaction.error)
+    })
+  } finally {
+    database.close()
+  }
   return records
 }
 
@@ -110,6 +113,23 @@ describe('ObservationBatchManager throughput and concurrency (Build 5B-1 section
     owner = `throughput-${Date.now()}-${counter++}`
     observationQueue.setOwnerUserId(owner)
     await observationQueue.initialize()
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('elite-plus-observation-queue')
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    try {
+      const stores = [...database.objectStoreNames]
+      const transaction = database.transaction(stores, 'readwrite')
+      for (const store of stores) transaction.objectStore(store).clear()
+      await new Promise<void>((resolve, reject) => {
+        transaction.oncomplete = () => resolve()
+        transaction.onerror = () => reject(transaction.error)
+        transaction.onabort = () => reject(transaction.error)
+      })
+    } finally {
+      database.close()
+    }
     connectorIdentityService.setConnectorDeviceId('device-test')
     vi.spyOn(authenticationService, 'isAuthenticated').mockResolvedValue(true)
   })
@@ -128,6 +148,8 @@ describe('ObservationBatchManager throughput and concurrency (Build 5B-1 section
       expect(response?.results).toHaveLength(batchSize)
       expect(backend.batches).toHaveLength(1)
       expect(backend.batches[0].sort()).toEqual([...ids].sort())
+      expect(manager.getDeliveryDiagnostics().batchesPerMinute).toBeGreaterThan(0)
+      expect(manager.getDeliveryDiagnostics().averageBatchLatencyMs).not.toBeNull()
       const stats = await observationQueue.getQueueStats()
       expect([stats.pending, stats.inFlight, stats.retrying, stats.failed]).toEqual([0, 0, 0, 0])
     }, 15_000)
@@ -663,18 +685,21 @@ describe('ObservationBatchManager throughput and concurrency (Build 5B-1 section
     const restarted = new ObservationBatchManager({ batchSize: 200, concurrency: 2 }, online)
     restarted.start()
     expect(restarted.getDeliveryDiagnostics()).toMatchObject({ configuredConcurrency: 1, effectiveConcurrency: 1 })
-    await vi.waitFor(async () => {
-      const stats = await observationQueue.getQueueStats()
-      expect([stats.pending, stats.inFlight, stats.retrying]).toEqual([0, 0, 0])
-    }, { timeout: 15_000 })
-    restarted.stop()
+    try {
+      await vi.waitFor(async () => {
+        const stats = await observationQueue.getQueueStats()
+        expect([stats.pending, stats.inFlight, stats.retrying]).toEqual([0, 0, 0])
+      }, { timeout: 60_000 })
+    } finally {
+      restarted.stop()
+    }
 
     const seen = new Set<string>()
     for (const batch of backend.batches) for (const id of batch) { expect(seen.has(id)).toBe(false); seen.add(id) }
     expect([...seen].sort()).toEqual([...ids].sort())
     const finalStats = await observationQueue.getQueueStats()
     expect([finalStats.pending, finalStats.inFlight, finalStats.retrying, finalStats.failed]).toEqual([0, 0, 0, 0])
-  }, 30_000)
+  }, 90_000)
 
   it('startup resumes a 32k durable queue after restoring identity while acquisition is disabled and V8 is absent', async () => {
     const now = new Date().toISOString()

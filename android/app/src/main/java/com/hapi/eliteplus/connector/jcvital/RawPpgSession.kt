@@ -53,6 +53,7 @@ internal class RawPpgSession(
         var minimumRawDecodedValue: Int? = null,
         var maximumRawDecodedValue: Int? = null,
         var estimatedBytes: Int = 0,
+        val sourceEnvelopeId: String? = null,
     )
 
     private data class LayoutDiagnostics(
@@ -127,7 +128,7 @@ internal class RawPpgSession(
         status = STATUS_STOPPING
     }
 
-    fun captureNotification(notification: ByteArray, receivedAt: String): RawPpgNotificationCapture? {
+    fun captureNotification(notification: ByteArray, receivedAt: String, sourceEnvelopeId: String? = null): RawPpgNotificationCapture? {
         if (status !in ACTIVE_STATUSES || notification.isEmpty()) return null
         val estimatedBytes = notification.size * RAW_PACKET_MULTIPLIER + PACKET_OVERHEAD_BYTES
         val completedChunk = if (bufferedPackets.isNotEmpty() &&
@@ -137,7 +138,7 @@ internal class RawPpgSession(
             recordParseError("PPG notification exceeds bounded chunk capacity", receivedAt, notification.size)
             return RawPpgNotificationCapture(null, completedChunk)
         }
-        val packet = Packet(nextPacketSequence++, receivedAt, notification.copyOf(), estimatedBytes = estimatedBytes)
+        val packet = Packet(nextPacketSequence++, receivedAt, notification.copyOf(), estimatedBytes = estimatedBytes, sourceEnvelopeId = sourceEnvelopeId)
         bufferedPackets.add(packet)
         bufferedEstimatedBytes += estimatedBytes
         bufferedWireBytes += notification.size
@@ -338,6 +339,7 @@ internal class RawPpgSession(
             "decoded153Summary" to layoutSummary(LENGTH_153),
             "decoded203Summary" to layoutSummary(LENGTH_203),
             "parseErrorCount" to parseErrorsInChunk,
+            "sourceEnvelopeIds" to bufferedPackets.mapNotNull { it.sourceEnvelopeId },
         )
         val chunk = RawPpgChunkFlush(summary, bufferedPackets.map { it.originalBytes.copyOf() })
         chunkCount++

@@ -1,0 +1,14 @@
+[
+  { "address": "E7:1B:D8:36:78:CF", "name": "JCV8B 3678CF", "serviceUuids": [], "connectable": true, "v8Candidate": true },
+  { "address": "A1:B2:C3:D4:E5:F6", "name": "JCV8B AC349E", "serviceUuids": [], "connectable": true, "v8Candidate": true },
+  { "address": "00:11:22:33:44:01", "name": " \u0000jcv8b\u00a0 AC349E\u0000 ", "serviceUuids": [], "connectable": true, "v8Candidate": true },
+  { "address": "00:11:22:33:44:02", "name": "PRO_V8", "serviceUuids": [], "connectable": true, "v8Candidate": true },
+  { "address": "00:11:22:33:44:03", "name": null, "serviceUuids": ["0000fff0-0000-1000-8000-00805f9b34fb"], "connectable": true, "v8Candidate": true },
+  { "address": "00:11:22:33:44:04", "name": "WHOOP 1234", "serviceUuids": [], "connectable": true, "v8Candidate": false },
+  { "address": "00:11:22:33:44:05", "name": "Bose Speaker", "serviceUuids": [], "connectable": true, "v8Candidate": false },
+  { "address": "00:11:22:33:44:06", "name": "Tile", "serviceUuids": [], "connectable": true, "v8Candidate": false },
+  { "address": "00:11:22:33:44:07", "name": null, "serviceUuids": [], "connectable": true, "v8Candidate": false },
+  { "address": "00:11:22:33:44:08", "name": "Bose V8", "serviceUuids": [], "connectable": true, "v8Candidate": false },
+  { "address": "00:11:22:33:44:09", "name": "JCV8BOTHER", "serviceUuids": [], "connectable": true, "v8Candidate": false },
+  { "address": "E7:1B:D8:36:78:CF", "name": null, "serviceUuids": [], "connectable": true, "v8Candidate": false }
+]

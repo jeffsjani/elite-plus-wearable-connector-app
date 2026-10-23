@@ -23,6 +23,12 @@ export interface JCVitalV8Device {
   connectable: boolean
   lastSeenAt: string
   advertisesJcvitalService: boolean
+  v8Candidate: boolean
+}
+
+/** Native classification is authoritative; JavaScript must not invent a second name/UUID policy. */
+export function isElitePlusV8Advertisement(device: Pick<JCVitalV8Device, 'v8Candidate'>): boolean {
+  return device.v8Candidate === true
 }
 
 export interface JCVitalV8DeviceInfo {
@@ -100,6 +106,8 @@ export interface JCVitalV8ParseErrorEvent {
 }
 
 export interface JCVitalV8HistoricalSyncResult {
+  sourceRecordEnvelopeIds?: string[]
+  sourceCallbackEnvelopeIds?: string[]
   syncId: string
   deviceId: string | null
   provider: 'JCVITAL'
@@ -116,12 +124,47 @@ export interface JCVitalV8HistoricalSyncResult {
   latestObservation: string | null
   partial: boolean
   completionStatus: CompletionStatus
+  nativeRequestAccepted?: boolean
+  nativeCommandQueued?: boolean
+  nativeCommandWritten?: boolean
   packetCount: number
   parseErrors: JCVitalV8ParseErrorEvent[]
   observations: NativeObservation[]
   /** Set for streamed HR history: observations arrived as jcvitalHistoricalHrChunk events and are [] here. */
   streamed?: boolean
   stream?: JCVitalV8HistoricalHrStreamStats
+}
+
+export interface JCVitalV8SleepCertificationResult {
+  acquisitionSessionId: string
+  outcome: 'COMPLETE' | 'FAILED'
+  acquisitionError: { code: string; message: string } | null
+  results: JCVitalV8HistoricalSyncResult[]
+}
+
+export interface WorkoutHistoryNativeObservation {
+  id: string
+  sourceEnvelopeId: string
+  sourceCallbackId: string
+  sourceIndex: number
+  sessionId: string
+  vendorDataType: '29'
+  metricType: 'WORKOUT_HISTORY_NATIVE_SOURCE'
+  vendorTimestamp: string | null
+  sdkRecord: string
+  semanticClassification: 'RESEARCH_NATIVE_ONLY'
+  semanticConfidence: 'UNKNOWN_VENDOR_SEMANTICS'
+  canonicalAuthority: 'NONE_UNTIL_SEMANTICS_CONFIRMED'
+}
+export interface WorkoutHistoryAcquisition extends Omit<JCVitalV8HistoricalSyncResult, 'observations'> {
+  observations: WorkoutHistoryNativeObservation[]
+  sourceCommandEnvelopeIds: string[]
+  sourceCommandAckEnvelopeIds: string[]
+  sourceNotificationEnvelopeIds: string[]
+  sourceParserOutcomeEnvelopeIds: string[]
+  retryCount: 0
+  canonicalAuthority: 'NONE_UNTIL_SEMANTICS_CONFIRMED'
+  deliveryDisposition: 'LOCAL_SOURCE_EVIDENCE_ONLY'
 }
 
 export interface JCVitalV8HistoricalHrStreamStats {
@@ -166,6 +209,16 @@ export interface JCVitalV8HistoricalHrChunk {
   emittedSampleCountTotal: number
   estimatedSerializedBytes: number
   observations: NativeObservation[]
+}
+
+export interface JCVitalV8HistoricalSyncLifecycleEvent {
+  syncId: string
+  vendorDataType: string
+  connectionGeneration: number
+  stage: 'REQUEST_ACCEPTED' | 'ACQUIRING' | 'NATIVE_COMMAND_QUEUED' | 'NATIVE_COMMAND_WRITTEN' | 'FAILED'
+  nativeRequestAccepted: boolean
+  nativeCommandQueued: boolean
+  nativeCommandWritten: boolean
 }
 
 export interface JCVitalV8NativeBreadcrumb {
@@ -226,6 +279,12 @@ export interface JCVitalV8LiveWorkoutSession {
 }
 
 export interface JCVitalV8WorkoutHeartRateEvent {
+  sourceEnvelopeId?: string
+  provenance?: {
+    sourceEnvelopeId?: string | null
+    sourceCallbackId?: string | null
+    sourceEnvelopeModelVersion?: string
+  }
   sessionId: string
   heartRate: number
   receivedAt: string
@@ -487,14 +546,336 @@ export interface JCVitalV8StateResult {
   deviceId: string | null
 }
 
+export interface SourceJournalScope {
+  accountId: string
+  deviceScopeId: string
+}
+
+export interface SourceJournalDiagnostics {
+  modelVersion: string
+  enabled: boolean
+  failedClosed: boolean
+  lastOutcome: string
+  refusedCount: number
+  totalEnvelopeCount: number
+  totalStoredBytes: number
+  maxBytes: number
+  maxEnvelopes: number
+  maxEntryBytes: number
+  retentionPolicy: string
+  rawStorage: string
+  recoveryAudit?: Record<string, unknown> | null
+  recoveryAuditHistory?: Array<Record<string, unknown>>
+  latestRecoveryAudit?: Record<string, unknown> | null
+}
+
+export interface SourceEnvelopeEntry {
+  sequence: number
+  envelopeId: string
+  callbackId: string | null
+  recordIndex: number | null
+  kind: string
+  receivedAt: string
+  timezone: string
+  envelopeJson: string | null
+  rawBytesBase64: string | null
+}
+
+export interface SourceJournalPage {
+  modelVersion: string
+  envelopes: SourceEnvelopeEntry[]
+  nextSequence: number
+  hasMore: boolean
+}
+
+export interface SourceJournalOutcome {
+  operation: string
+  status: string
+  receivedAt?: string
+}
+
+export interface RawPpgSavedEvidenceCandidate {
+  filename: string
+  sessionId: string | null
+  byteLength: number
+  sha256: string
+  packetCount: number
+  truncated: boolean
+  truncationOffset: number | null
+  matchesDocumentedShape: boolean
+  documentedShape: {
+    expectedPacketCount: number
+    expectedDataPackets: string
+    expectedStatusPackets: string
+    expectedSpoolBytes: number
+  }
+  journalSourceFiles: Array<Record<string, unknown>>
+}
+
+/** Offline/historical Raw PPG scope: persisted authenticated account; device optional (never the live capture scope). */
+export interface RawPpgSavedEvidenceScope {
+  accountId: string | null
+  deviceScopeId?: string | null
+}
+
+/** VC29 offline counters: inspection/export never issue BLE, network or acquisition. */
+export interface RawPpgOfflineCounters {
+  bleCommands: 0
+  networkRequests: 0
+  acquisitions: 0
+}
+
+/** VC29 one-shot physical certification attempt guard (restart-persistent, per account/device). */
+export interface RawPpgPhysicalCertificationStatus {
+  attempted: boolean
+  state: string | null
+  claim: Record<string, unknown> | null
+  captureAllowed: boolean
+  blockedReason: string | null
+}
+
+/** Live/terminal status event for the VC29 one-shot capture. Never contains glucose semantics. */
+export interface RawPpgPhysicalCertificationEvent {
+  certificationGroupId?: string | null
+  sessionId?: string | null
+  state: string
+  sourceStatus?: string | null
+  packetCount?: number | null
+  spoolBytes?: number | null
+  failedChecks?: string[] | null
+  failures?: string[] | null
+  terminal?: boolean
+  finalSnapshotPersisted?: boolean | null
+  [key: string]: unknown
+}
+
+export interface RawPpgPhysicalCertificationInspection extends Partial<RawPpgOfflineCounters> {
+  found: boolean
+  attempted: boolean
+  claim?: Record<string, unknown> | null
+  state?: string
+  sourceStatus?: string
+  certificationGroupId?: string
+  sessionId?: string
+  semanticClassification?: 'RESEARCH_NATIVE_ONLY'
+  canonicalAuthority?: 'NONE_UNTIL_SEMANTICS_CONFIRMED'
+  deliveryDisposition?: 'LOCAL_SOURCE_EVIDENCE_ONLY'
+  unit?: 'UNKNOWN_VENDOR_UNIT'
+  sampleRateHz?: null
+  samplingIntervalMs?: null
+  packetCount?: number
+  spoolFileName?: string
+  spoolByteLength?: number | null
+  spoolSha256?: string | null
+  failedChecks?: string | null
+  onDiskVerification?: 'VERIFIED' | 'MISMATCH'
+  verificationErrors?: string[]
+}
+
+export interface RawPpgPhysicalCertificationSpool extends RawPpgOfflineCounters {
+  fileName: string
+  byteLength: number
+  sha256: string
+  base64: string
+  byteEncoding: string
+}
+
+export const RAW_PPG_SAVED_EVIDENCE_FAILURE_CODES = [
+  'PPG_SPOOL_DIRECTORY_NOT_FOUND',
+  'PPG_SAVED_EVIDENCE_NOT_FOUND',
+  'PPG_SPOOL_FOUND_METADATA_MISSING',
+  'PPG_SPOOL_FOUND_JOURNAL_MISSING',
+  'PPG_JOURNAL_FOUND_SPOOL_MISSING',
+  'PPG_SCOPE_NOT_RESOLVED',
+  'PPG_MULTIPLE_CANDIDATES_AMBIGUOUS',
+  'PPG_SPOOL_TRUNCATED',
+  'PPG_SPOOL_SHAPE_MISMATCH',
+  'PPG_SOURCE_CHAIN_INCOMPLETE',
+  'PPG_INSPECTION_INTERNAL_ERROR',
+] as const
+export type RawPpgSavedEvidenceFailureCode = typeof RAW_PPG_SAVED_EVIDENCE_FAILURE_CODES[number]
+export const RAW_PPG_SAVED_EVIDENCE_OK_CODE = 'PPG_SAVED_EVIDENCE_FOUND_DIAGNOSTIC_ONLY'
+
+/** VC28 persisted saved-evidence diagnostic snapshot (written natively on every inspection, success or failure). */
+export interface RawPpgSavedEvidenceDiagnostic {
+  kind: 'RawPpgSavedEvidenceDiagnostic' | 'RawPpgSavedEvidenceBridgeFailure'
+  generatedAt: string
+  status: 'OK' | 'FAILED'
+  errorCode: RawPpgSavedEvidenceFailureCode | typeof RAW_PPG_SAVED_EVIDENCE_OK_CODE | string | null
+  errorMessage: string | null
+  failureStage: string | null
+  exceptionClass?: string | null
+  findings?: string[]
+  scopeResolved?: boolean
+  accountIdResolved?: boolean
+  deviceScopeIdResolved?: boolean
+  appFilesDirAccessible?: boolean
+  spoolDirectoryExists?: boolean
+  spoolDirectoryPath?: string | null
+  candidateSpoolCount?: number
+  candidateFilenames?: string[]
+  candidateByteSizes?: number[]
+  candidateSha256?: Array<string | null>
+  selectedSessionId?: string | null
+  rawPpgPacketStoreMetadataExists?: boolean
+  historicalRawPpgSessionExists?: boolean
+  journalRowsAssociatedWithPpgExist?: boolean
+  matchingBleNotificationCount?: number
+  matchingSdkCallbackCount?: number
+  matchingCommandRequestCount?: number
+  completeSourceChainConstructible?: boolean
+  sourceChainMissing?: string[]
+  certificationTransition?: 'NONE_DIAGNOSTIC_ONLY'
+  canonicalAuthority?: 'NONE_UNTIL_SEMANTICS_CONFIRMED'
+  [key: string]: unknown
+}
+
+export interface RawPpgSavedEvidenceInspection extends RawPpgSavedEvidenceDiagnostic {
+  operation: 'INSPECT_EXISTING_RAW_PPG_EVIDENCE'
+  bleCommandsIssued: 0
+  deviceConnectionsOpened: 0
+  acquisitionsStarted: 0
+  candidateCount: number
+  candidates: RawPpgSavedEvidenceCandidate[]
+  exactDocumentedShapeMatchCount: number
+  recommendedSessionId: string | null
+  found: boolean
+  diagnosticPersistenceError?: string | null
+}
+
+export interface RawPpgSavedEvidencePacket {
+  index: number
+  byteLength: number
+  sha256: string
+  opcode: string
+  dataTypeClassification: 'DATA_PACKET' | 'STATUS_PACKET' | 'UNKNOWN_OPCODE'
+  spoolRange: { lengthPrefixOffset: number; payloadOffset: number; payloadEndOffsetExclusive: number }
+  trailerByte: { offsetWithinPayload: number; checksumAlgorithm: 'CHECKSUM_ALGORITHM_NOT_PROVEN' }
+  sampleMeaning: 'NOT_INFERRED_FROM_BYTE_POSITION'
+  base64: string
+  sourceEnvelopeAncestry: Record<string, unknown>
+}
+
+export interface RawPpgSavedEvidenceCertification {
+  kind: 'RawPpgSavedCertification'
+  context: { scope: SourceJournalScope }
+  certificationGroupId: string
+  sessionId: string | null
+  deviceIdentity: { deviceModel: unknown; characteristicUuid: unknown }
+  firmwareVersion: unknown
+  sdkVersion: unknown
+  sourceSpool: {
+    filename: string; path: string; byteLength: number; sha256: string; byteEncoding: string
+    truncated: boolean; truncationOffset: number | null
+  }
+  packetCount: number
+  packetOrdering: string
+  packets: RawPpgSavedEvidencePacket[]
+  structuralConfirmation: {
+    expectedShapeConfirmed: boolean
+    expectedPacketCount: number
+    expectedDataPackets: string
+    expectedStatusPackets: string
+    expectedSpoolBytes: number
+    actualDataPacketCount: number
+    actualStatusPacketCount: number
+  }
+  sdkInterpretedSampleArray: { emitted: boolean; channel: string; note: string }
+  sampling: { sampleRateHz: null; samplingIntervalMs: null }
+  unit: 'UNKNOWN_VENDOR_UNIT'
+  glucoseIsolation: {
+    RAW_PPG_NOT_GLUCOSE: true
+    NO_GLUCOSE_CANONICAL_MAPPING: true
+    NO_GLUCOSE_INFERENCE: true
+    NO_CGM_SUBSTITUTION: true
+    vendorLabelDisclaimer: string
+  }
+  sourceEnvelopeJournal: {
+    sourceFiles: Array<Record<string, unknown>>
+    notificationEnvelopeCount: number
+    notificationEnvelopes: Array<Record<string, unknown>>
+  }
+  commandAncestry: {
+    statusOpcodeHex: string
+    dataOpcodeHex: string
+    vendorConstantNames: { statusOpcode: string; dataOpcode: string }
+  }
+  noTruncationRewriteOrNormalization: true
+  state: 'CERTIFIED' | 'NOT_CERTIFIED'
+  missingEvidence: string[]
+  sourceStatus: 'CERTIFIED_E2E_LOSSLESS_SOURCE' | null
+  semanticClassification: 'RESEARCH_NATIVE_ONLY' | null
+  canonicalAuthority: 'NONE_UNTIL_SEMANTICS_CONFIRMED'
+  deliveryDisposition: 'LOCAL_SOURCE_EVIDENCE_ONLY'
+  base44DeliveryRequired: false
+  generatedAt: string
+}
+
+export interface PhysicalSemanticNativeEvidence {
+  kind: 'activity' | 'activity_type25_anchor' | 'workout'
+  commands: Array<{ name: string; opcode: number; rawBytesBase64: string; allowed: boolean; writeAcknowledged: boolean }>
+  commandsAllowed: boolean
+  digitalWellnessBeforeSha256: string | null
+  digitalWellnessAfterSha256: string | null
+  digitalWellnessUnchanged: boolean | null
+  attemptId?: string | null
+  lastCompletedStage?: import('./PhysicalSemanticEvidence').TestStage
+  failureStage?: import('./PhysicalSemanticEvidence').FailureStage | null
+  errorCode?: string | null
+  errorMessage?: string | null
+  commandsIssued?: number
+  acquisitionStarted?: boolean
+  sessionClosed?: boolean
+  commandTypes?: string[]
+  callbacksReceived?: number
+  sourceEnvelopeIds?: string[]
+  diagnostics?: Record<string, unknown>
+}
+
 export interface JCVitalV8Plugin {
+  beginPhysicalSemanticTest(options: { kind: 'activity' | 'activity_type25_anchor' | 'workout'; attemptId?: string }): Promise<PhysicalSemanticNativeEvidence>
+  endPhysicalSemanticTest(): Promise<PhysicalSemanticNativeEvidence>
+  readPhysicalSemanticTestEvidence(options: SourceJournalScope & { kind: 'activity' | 'activity_type25_anchor' | 'workout' }): Promise<{ json: string | null }>
+  getPipelineDiagnosticSnapshot(): Promise<import('./V8PipelineDiagnostic').NativePipelineSnapshot>
+  /** Build 32B.1-D connection-diagnostic APK only; rejects with CONNECTION_DIAGNOSTIC_BUILD_REQUIRED otherwise. */
+  getConnectionDiagnosticSnapshot(): Promise<import('./ConnectionDiagnostic').NativeConnectionDiagnosticSnapshot>
+  readActivityCertificationSnapshot(options: SourceJournalScope): Promise<{ json: string | null }>
+  writeActivityCertificationSnapshot(options: SourceJournalScope & { json: string }): Promise<{ saved: boolean }>
+  readSleepCertificationSnapshot(options: SourceJournalScope): Promise<{ json: string | null }>
+  writeSleepCertificationSnapshot(options: SourceJournalScope & { json: string }): Promise<{ saved: boolean }>
+  readWorkoutCertificationSnapshot(options: SourceJournalScope): Promise<{ json: string | null }>
+  readWorkoutSourceEnvelope(options: SourceJournalScope & { envelopeId: string }): ReturnType<JCVitalV8Plugin['readSourceEnvelope']>
+  writeWorkoutCertificationSnapshot(options: SourceJournalScope & { json: string }): Promise<{ saved: boolean }>
+  syncWorkoutHistoryCertification(): Promise<WorkoutHistoryAcquisition>
+  /** Binding an identified transport enables notifications and resolves after the journaled SDK handshake. */
+  configureSourceJournal(options: {
+    accountId?: string | null; deviceScopeId?: string | null; enabled: boolean
+    maxBytes?: number; maxEnvelopes?: number; maxEntryBytes?: number
+  }): Promise<SourceJournalDiagnostics>
+  getSourceJournalDiagnostics(options: SourceJournalScope): Promise<SourceJournalDiagnostics>
+  /** Read-only global inventory; rejects unless storage is already open. Does not bind scope or recover. */
+  getJournalCapacityAnalysis(): Promise<import('./ConnectionDiagnostic').JournalCapacityAnalysis>
+  /** Build 32B.8: independent SELECT-only inspection of the retained database; no Bluetooth, scope or normal open. */
+  analyzeExistingJournalOffline(): Promise<import('./ConnectionDiagnostic').OfflineJournalInspection>
+  listSourceEnvelopes(options: SourceJournalScope & { afterSequence?: number; limit?: number }): Promise<SourceJournalPage>
+  exportSourceJournal(options: SourceJournalScope & { afterSequence?: number; limit?: number }): Promise<SourceJournalPage>
+  readSourceEnvelope(options: SourceJournalScope & { envelopeId: string }): Promise<{
+    envelopeId: string; sequence: number; envelopeJson: string; rawBytesBase64: string | null
+    sourceFile: {
+      fileId: string; path: string; sessionId: string; format: string
+      reservedBytes: number; actualBytes: number
+      available: boolean
+      integrityStatus: 'MISSING' | 'RESERVED_LENGTH_MISMATCH' | 'RESERVED_LENGTH_MATCH'
+    } | null
+  }>
+  initialize(): Promise<{ initialized: boolean; pluginName: string }>
   isAvailable(): Promise<{ available: boolean; enabled: boolean }>
   getPermissionStatus(): Promise<JCVitalV8PermissionResult>
   requestPermissions(): Promise<JCVitalV8PermissionResult>
   startScan(options?: { timeoutMs?: number }): Promise<void>
   stopScan(): Promise<void>
   getDiscoveredDevices(): Promise<{ devices: JCVitalV8Device[] }>
-  /** Resolves once the V8 is READY (GATT + notifications + first SDK round-trip). */
+  /** Resolves after GATT service identification, before notifications; bind the journal to reach READY. */
   connect(options: { deviceId: string }): Promise<JCVitalV8StateResult>
   disconnect(): Promise<JCVitalV8StateResult>
   getConnectionState(): Promise<JCVitalV8StateResult>
@@ -517,8 +898,10 @@ export interface JCVitalV8Plugin {
   syncHistoricalPpi(): Promise<JCVitalV8HistoricalSyncResult>
   syncHistoricalActivity(): Promise<JCVitalV8HistoricalSyncResult>
   syncDetailedActivity(): Promise<JCVitalV8HistoricalSyncResult>
+  syncActivityCertification(): Promise<{ acquisitionSessionId: string; results: JCVitalV8HistoricalSyncResult[] }>
   syncHistoricalSleepStages(): Promise<JCVitalV8HistoricalSyncResult>
   syncHistoricalSleepMovement(): Promise<JCVitalV8HistoricalSyncResult>
+  syncSleepCertification(): Promise<JCVitalV8SleepCertificationResult>
   syncHistoricalWorkouts(): Promise<JCVitalV8HistoricalSyncResult>
   getMonitoringConfiguration(): Promise<JCVitalV8MonitoringConfiguration>
   startWorkoutCapture(options?: { activityMode?: number }): Promise<JCVitalV8LiveWorkoutSession>
@@ -532,6 +915,28 @@ export interface JCVitalV8Plugin {
   startRawPpg(): Promise<JCVitalV8RawPpgSession>
   stopRawPpg(): Promise<JCVitalV8RawPpgSession>
   getRawPpgStatus(): Promise<JCVitalV8RawPpgSession>
+  /** Offline, read-only against app-private storage. 0 BLE commands, 0 device connection, 0 acquisition. */
+  inspectSavedRawPpgEvidence(options: RawPpgSavedEvidenceScope & { sessionId?: string }): Promise<RawPpgSavedEvidenceInspection>
+  /** Offline: last persisted saved-evidence diagnostic; requires no scope, READY state, BLE or network. */
+  readSavedRawPpgDiagnostic(): Promise<{ json: string | null }>
+  /** Offline, read-only. sessionId is required when multiple saved candidates exist. */
+  exportSavedRawPpgEvidence(options: RawPpgSavedEvidenceScope & { sessionId?: string }): Promise<RawPpgSavedEvidenceCertification>
+  /** Persists the CERTIFIED evidence so it survives app restart; 0 Base44, 0 enqueue, 0 delivery. */
+  finalizeSavedRawPpgCertification(options: RawPpgSavedEvidenceScope & { sessionId?: string }): Promise<RawPpgSavedEvidenceCertification>
+  readSavedRawPpgCertification(options: RawPpgSavedEvidenceScope): Promise<{ json: string | null }>
+  /**
+   * VC29: the ONE physical Raw PPG certification session (READY + authenticated scope only). Native journals
+   * session/spool/attempt/command request before the BLE write; rejects forever after one saved attempt.
+   */
+  captureRawPpgCertification(): Promise<RawPpgPhysicalCertificationEvent>
+  /** Offline: one-shot guard status for the persisted owner. 0 BLE, 0 network, 0 acquisition. */
+  getRawPpgCertificationStatus(options: RawPpgSavedEvidenceScope): Promise<RawPpgPhysicalCertificationStatus>
+  /** Offline: re-verifies the saved spool against the saved JSON and the journal raw bytes. */
+  inspectSavedRawPpgPhysicalCertification(options: RawPpgSavedEvidenceScope): Promise<RawPpgPhysicalCertificationInspection>
+  /** Offline: full saved certification JSON (never truncated). */
+  readSavedRawPpgPhysicalCertification(options: RawPpgSavedEvidenceScope): Promise<{ json: string | null; claim: Record<string, unknown> | null; deviceScopeId: string | null }>
+  /** Offline: the complete raw spool bytes (base64), its SHA-256 and byte length. */
+  exportRawPpgCertificationSpool(options: RawPpgSavedEvidenceScope): Promise<RawPpgPhysicalCertificationSpool>
 
   addListener(event: 'jcvitalScanResult', listener: (device: JCVitalV8Device) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalConnectionState', listener: (event: JCVitalV8ConnectionStateEvent) => void): Promise<PluginListenerHandle>
@@ -540,9 +945,11 @@ export interface JCVitalV8Plugin {
   addListener(event: 'jcvitalHeartRate', listener: (observation: JCVitalV8Observation) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalObservation', listener: (observation: NativeObservation) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalHistoricalHrChunk', listener: (chunk: JCVitalV8HistoricalHrChunk) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalHistoricalSyncLifecycle', listener: (event: JCVitalV8HistoricalSyncLifecycleEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalParseError', listener: (error: JCVitalV8ParseErrorEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalRawVendorData', listener: (event: JCVitalV8RawVendorDataEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalError', listener: (error: JCVitalV8ErrorEvent) => void): Promise<PluginListenerHandle>
+  addListener(event: 'sourceJournalOutcome', listener: (outcome: SourceJournalOutcome) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalWorkoutState', listener: (session: JCVitalV8LiveWorkoutSession) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalWorkoutPacket', listener: (packet: LiveWorkoutPacket) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalWorkoutHeartRate', listener: (event: JCVitalV8WorkoutHeartRateEvent) => void): Promise<PluginListenerHandle>
@@ -552,6 +959,7 @@ export interface JCVitalV8Plugin {
   addListener(event: 'jcvitalRawEcgChunk', listener: (chunk: JCVitalV8RawEcgChunk) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalRawEcgError', listener: (error: JCVitalV8RawEcgErrorEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalRawPpgStatus', listener: (session: JCVitalV8RawPpgSession) => void): Promise<PluginListenerHandle>
+  addListener(event: 'jcvitalRawPpgCertificationStatus', listener: (event: RawPpgPhysicalCertificationEvent) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalRawPpgChunk', listener: (chunk: JCVitalV8RawPpgChunk) => void): Promise<PluginListenerHandle>
   addListener(event: 'jcvitalRawPpgError', listener: (error: JCVitalV8RawPpgErrorEvent) => void): Promise<PluginListenerHandle>
   removeAllListeners(): Promise<void>

@@ -2,6 +2,7 @@ import type { User } from '@base44/sdk'
 import { getAccessToken } from '@base44/sdk'
 import { base44, mapBase44Error } from './Base44Client'
 import type { LocalUser } from './base44Types'
+import { physicalTestSideEffect } from '../diagnostics/PhysicalTestIsolation'
 
 function toLocalUser(user: User): LocalUser {
   return {
@@ -14,7 +15,7 @@ function toLocalUser(user: User): LocalUser {
 class AuthenticationService {
   async getCurrentUser(): Promise<LocalUser | null> {
     try {
-      return toLocalUser(await base44.auth.me())
+      return toLocalUser(await physicalTestSideEffect('base44', () => base44.auth.me()))
     } catch (error) {
       const mappedError = mapBase44Error(error)
       if (mappedError.code === 'AUTH_REQUIRED' || mappedError.status === 401) {
@@ -26,8 +27,8 @@ class AuthenticationService {
 
   async loginWithEmailPassword(email: string, password: string): Promise<LocalUser> {
     try {
-      await base44.auth.loginViaEmailPassword(email, password)
-      return toLocalUser(await base44.auth.me())
+      await physicalTestSideEffect('base44', () => base44.auth.loginViaEmailPassword(email, password))
+      return toLocalUser(await physicalTestSideEffect('base44', () => base44.auth.me()))
     } catch (error) {
       throw mapBase44Error(error)
     }
@@ -41,7 +42,7 @@ class AuthenticationService {
     if (!getAccessToken()) return false
 
     try {
-      return await base44.auth.isAuthenticated()
+      return await physicalTestSideEffect('base44', () => base44.auth.isAuthenticated())
     } catch {
       return false
     }

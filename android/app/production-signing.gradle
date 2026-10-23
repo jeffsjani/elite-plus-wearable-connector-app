@@ -1,0 +1,102 @@
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.PrivateKey
+import java.security.cert.X509Certificate
+
+def names = [
+    'ELITE_V8_KEYSTORE_PATH',
+    'ELITE_V8_KEYSTORE_PASSWORD',
+    'ELITE_V8_KEY_ALIAS',
+    'ELITE_V8_KEY_PASSWORD',
+]
+def userProperties = new Properties()
+def userPropertiesFile = new File(gradle.gradleUserHomeDir, 'gradle.properties')
+def repositoryPath = rootProject.projectDir.parentFile.canonicalFile.toPath()
+if (userPropertiesFile.isFile() && !userPropertiesFile.canonicalFile.toPath().startsWith(repositoryPath)) {
+    userPropertiesFile.withInputStream { userProperties.load(it) }
+}
+// Deliberately do not read project properties or command-line -P secrets.
+def credentials = names.collectEntries { name ->
+    [(name): System.getenv(name) ?: userProperties.getProperty(name)]
+}
+def complete = names.every { credentials[it] }
+
+android {
+    signingConfigs {
+        production {
+            if (complete) {
+                storeFile file(credentials.ELITE_V8_KEYSTORE_PATH)
+                storePassword credentials.ELITE_V8_KEYSTORE_PASSWORD
+                keyAlias credentials.ELITE_V8_KEY_ALIAS
+                keyPassword credentials.ELITE_V8_KEY_PASSWORD
+            }
+        }
+    }
+}
+
+def verifySigning = tasks.register('validateProductionSigning') {
+    group = 'verification'
+    description = 'Fail closed unless release signing uses an external, non-debug private key.'
+    doLast {
+        def missing = names.findAll { !credentials[it] }
+        if (missing) {
+            throw new GradleException("Production signing requires external inputs: ${missing.join(', ')}")
+        }
+        if (['pipelineDiagnostic', 'connectionDiagnostic', 'queueObservability'].any { project.hasProperty(it) }) {
+            throw new GradleException('Production distribution cannot enable Engineering diagnostic properties.')
+        }
+        def config = android.signingConfigs.production
+        def release = android.buildTypes.release
+        if (release.debuggable || release.signingConfig != config) {
+            throw new GradleException('Production release must be non-debuggable and use the production signing configuration.')
+        }
+        def store = config.storeFile.canonicalFile
+        if (store.toPath().startsWith(repositoryPath)) {
+            throw new GradleException('Production keystore must be outside the repository.')
+        }
+        if (!store.isFile()) throw new GradleException('External production keystore does not exist.')
+        def keyStore
+        def key
+        try {
+            keyStore = KeyStore.getInstance(store, config.storePassword.toCharArray())
+            key = keyStore.getKey(config.keyAlias, config.keyPassword.toCharArray())
+        } catch (Exception ignored) {
+            throw new GradleException('Cannot open the external signing key; verify secure inputs without logging secrets.')
+        }
+        def certificate = keyStore.getCertificate(config.keyAlias)
+        if (!(key instanceof PrivateKey) || !(certificate instanceof X509Certificate)) {
+            throw new GradleException('Production signing requires a private-key entry and X.509 certificate.')
+        }
+        def debugConfig = android.signingConfigs.debug
+        def debugCertificate = null
+        if (debugConfig.storeFile?.isFile()) {
+            def debugStore = KeyStore.getInstance(debugConfig.storeFile, debugConfig.storePassword.toCharArray())
+            debugCertificate = debugStore.getCertificate(debugConfig.keyAlias)
+        }
+        def fingerprint = { cert -> MessageDigest.getInstance('SHA-256').digest(cert.encoded).encodeHex().toString() }
+        if (config.keyAlias.equalsIgnoreCase('androiddebugkey')
+            || certificate.subjectX500Principal.name.toLowerCase(Locale.ROOT).contains('cn=android debug')
+            || (debugCertificate != null && fingerprint(certificate) == fingerprint(debugCertificate))) {
+            throw new GradleException('Android debug certificates are forbidden for production distribution.')
+        }
+        certificate.checkValidity()
+        logger.lifecycle('Production signing guard passed (external non-debug key; credentials not logged).')
+    }
+}
+
+def verifyWebAssets = tasks.register('validateConsumerWebAssets', Exec) {
+    group = 'verification'
+    description = 'Reject missing or Engineering web assets before production packaging.'
+    workingDir rootProject.projectDir.parentFile
+    commandLine 'node', 'scripts/assert-physical-acceptance-labels.mjs',
+        '--dist-dir', new File(project.projectDir, 'src/main/assets/public').absolutePath
+}
+
+// Unit tests/compilation remain available without signing secrets; every distribution path is guarded.
+tasks.configureEach {
+    if (name in ['assembleRelease', 'bundleRelease', 'packageRelease', 'packageReleaseBundle',
+                 'signReleaseBundle', 'validateSigningRelease']) {
+        dependsOn verifySigning
+        dependsOn verifyWebAssets
+    }
+}

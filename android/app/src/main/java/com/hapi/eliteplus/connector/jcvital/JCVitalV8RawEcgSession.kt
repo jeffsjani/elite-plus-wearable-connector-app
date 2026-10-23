@@ -10,6 +10,7 @@ class JCVitalV8RawEcgSession(
     data class AppendResult(
         val chunk: Map<String, Any?>?,
         val parseError: Map<String, Any?>?,
+        val preflushChunk: Map<String, Any?>? = null,
     )
 
     private data class BufferedPacket(
@@ -19,6 +20,7 @@ class JCVitalV8RawEcgSession(
         val raw: List<Int>,
         val samples: List<Int>,
         val estimatedFootprintBytes: Int,
+        val sourceEnvelopeId: String?,
     )
 
     var status: String = STATUS_IDLE
@@ -81,7 +83,7 @@ class JCVitalV8RawEcgSession(
         parseErrorCount++
     }
 
-    fun acceptNotification(notification: ByteArray, receivedAt: String): AppendResult {
+    fun acceptNotification(notification: ByteArray, receivedAt: String, sourceEnvelopeId: String? = null): AppendResult {
         if (status !in ACTIVE_STATUSES) {
             parseErrorCount++
             return AppendResult(null, error("ECG packet arrived while session is $status", receivedAt, notification))
@@ -118,13 +120,13 @@ class JCVitalV8RawEcgSession(
         }
 
         val estimatedFootprint = notification.size * RAW_PACKET_MULTIPLIER + decodedSamples.size * SAMPLE_OBJECT_ESTIMATE_BYTES + PACKET_OVERHEAD_BYTES
-        if (bufferedPackets.isNotEmpty() && (bufferedPackets.size >= MAX_CHUNK_PACKETS || bufferedEstimatedBytes + estimatedFootprint > MAX_CHUNK_ESTIMATED_BYTES)) {
+        val preflushChunk = if (bufferedPackets.isNotEmpty() && (bufferedPackets.size >= MAX_CHUNK_PACKETS || bufferedEstimatedBytes + estimatedFootprint > MAX_CHUNK_ESTIMATED_BYTES)) {
             flushChunk()
-        }
+        } else null
         if (estimatedFootprint > MAX_CHUNK_ESTIMATED_BYTES) {
             parseErrorCount++
             droppedPacketCount++
-            return AppendResult(null, error("ECG notification cannot fit in bounded chunk", receivedAt, notification))
+            return AppendResult(null, error("ECG notification cannot fit in bounded chunk", receivedAt, notification), preflushChunk)
         }
 
         val packet = BufferedPacket(
@@ -134,6 +136,7 @@ class JCVitalV8RawEcgSession(
             raw = notification.map { it.toInt() and 0xFF },
             samples = decodedSamples,
             estimatedFootprintBytes = estimatedFootprint,
+            sourceEnvelopeId = sourceEnvelopeId,
         )
         bufferedPackets += packet
         bufferedEstimatedBytes += estimatedFootprint
@@ -153,7 +156,7 @@ class JCVitalV8RawEcgSession(
         } else {
             null
         }
-        return AppendResult(chunk, parseError)
+        return AppendResult(chunk, parseError, preflushChunk)
     }
 
     fun flush(): Map<String, Any?>? = flushChunk()
@@ -251,6 +254,7 @@ class JCVitalV8RawEcgSession(
             "samples" to samples.toList(),
             "rawPacketBytes" to bufferedPackets.map { it.raw },
             "packetIds" to bufferedPackets.map { it.packetId },
+            "sourceEnvelopeIds" to bufferedPackets.mapNotNull { it.sourceEnvelopeId },
             "packetCount" to bufferedPackets.size,
             "sampleCount" to samples.size,
             "estimatedBytes" to bufferedWireBytes,

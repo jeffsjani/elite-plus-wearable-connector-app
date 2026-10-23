@@ -131,7 +131,7 @@ export interface PhysiologySourceContext {
 }
 
 export type PhysiologyMappingOutcome =
-  | { status: 'MAPPED'; key: PhysiologyMetricKey; observation: NativeObservationInput }
+  | { status: 'MAPPED'; key: PhysiologyMetricKey; observation: NativeObservationInput; sourceEnvelopeId?: string }
   | { status: 'NOT_DELIVERABLE' | 'INVALID'; key: PhysiologyMetricKey; reason: string }
 
 function sourcePrefix(deviceId: string): string { return `${JCVITAL_NATIVE_SOURCE.sourceConnector}:${JCVITAL_NATIVE_SOURCE.deviceModel}:${deviceId}` }
@@ -231,7 +231,9 @@ export async function mapPhysiologyObservation(ownerUserId: string, native: Nati
       },
     }
     const problems = validatePhysiologyObservation(observation)
-    return problems.length ? { status: 'INVALID', key: contract.key, reason: problems.join('; ') } : { status: 'MAPPED', key: contract.key, observation }
+    return problems.length ? { status: 'INVALID', key: contract.key, reason: problems.join('; ') }
+      : { status: 'MAPPED', key: contract.key, observation,
+        ...(native.provenance.sourceEnvelopeId ? { sourceEnvelopeId: native.provenance.sourceEnvelopeId } : {}) }
   }))
 }
 
@@ -239,7 +241,7 @@ export async function mapPhysiologyObservation(ownerUserId: string, native: Nati
 export function validatePhysiologyObservation(observation: NativeObservationInput): string[] {
   const problems: string[] = []
   if (!/^[0-9a-f]{64}$/.test(observation.observationId)) problems.push('observationId must be a SHA-256 hex digest')
-  if (observation.source !== JCVITAL_NATIVE_SOURCE.source || observation.sourceConnector !== JCVITAL_NATIVE_SOURCE.sourceConnector || observation.sourcePath !== JCVITAL_NATIVE_SOURCE.sourcePath) problems.push('source must be JCVITAL_NATIVE / DIRECT_BLE')
+  if (observation.source !== JCVITAL_NATIVE_SOURCE.source || observation.sourceConnector !== JCVITAL_NATIVE_SOURCE.sourceConnector || observation.sourcePath !== JCVITAL_NATIVE_SOURCE.sourcePath) problems.push('source connector or transport path is invalid')
   if (!isOpaqueJCVitalDeviceId(observation.deviceId)) problems.push('deviceId must be an opaque jcvital_device_ ID')
   if (!Number.isFinite(observation.valueNumber)) problems.push('valueNumber must be finite')
   if (!observation.observedAt || Number.isNaN(Date.parse(observation.observedAt))) problems.push('observedAt must be an ISO timestamp')

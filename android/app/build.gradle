@@ -1,6 +1,16 @@
 apply plugin: 'com.android.application'
 apply plugin: 'org.jetbrains.kotlin.android'
 
+def pipelineDiagnostic = project.hasProperty('pipelineDiagnostic')
+def connectionDiagnostic = project.hasProperty('connectionDiagnostic')
+def queueObservability = project.hasProperty('queueObservability')
+def companionVersion = new groovy.json.JsonSlurper().parse(file('../../companion-build.json'))
+if ([pipelineDiagnostic, connectionDiagnostic, queueObservability].count { it } > 1) {
+    throw new GradleException('Choose only one Engineering diagnostic build property.')
+}
+
+apply from: 'production-signing.gradle'
+
 android {
     namespace = "com.hapi.eliteplus.connector"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -8,13 +18,18 @@ android {
         applicationId "com.hapi.eliteplus.connector"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode companionVersion.versionCode
+        versionName companionVersion.versionName
+        buildConfigField "boolean", "PIPELINE_DIAGNOSTIC", "${pipelineDiagnostic}"
+        buildConfigField "boolean", "CONNECTION_DIAGNOSTIC", "${connectionDiagnostic}"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
              // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+        buildFeatures {
+            buildConfig = true
         }
     }
     compileOptions {
@@ -24,10 +39,26 @@ android {
     kotlinOptions {
         jvmTarget = '21'
     }
+    testOptions {
+        unitTests.includeAndroidResources = true
+    }
     buildTypes {
+        debug {
+            buildConfigField "boolean", "HEALTH_CONNECT_ENABLED", "true"
+        }
         release {
+            buildConfigField "boolean", "HEALTH_CONNECT_ENABLED", "false"
+            signingConfig signingConfigs.production
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+android.applicationVariants.all { variant ->
+    if (!pipelineDiagnostic && !connectionDiagnostic && variant.buildType.name in ["debug", "release"]) {
+        variant.outputs.all {
+            outputFileName = "ElitePlus-Companion-Phase1-P1-2E-Activity-V2-E2E.apk"
         }
     }
 }
@@ -45,9 +76,13 @@ dependencies {
     implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
     implementation project(':capacitor-android')
     implementation 'androidx.health.connect:connect-client:1.1.0'
+    implementation 'androidx.work:work-runtime:2.10.1'
+    implementation 'androidx.javascriptengine:javascriptengine:1.0.0'
     // JCVital Pro V8 native SDK (vendor/jcvital/android/sdk/v8sdk2.0.jar). Never add v8_v2.aar alongside it: same classes.
     implementation(files("libs/v8sdk2.0.jar"))
     testImplementation "junit:junit:$junitVersion"
+    testImplementation "org.robolectric:robolectric:4.14.1"
+    testImplementation 'androidx.work:work-testing:2.10.1'
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')

@@ -41,6 +41,24 @@ class JCVitalV8RawEcgSessionTest {
     }
 
     @Test
+    fun estimatedMemoryPreflushIsReturnedRatherThanDiscarded() {
+        val session = create().apply { start(); markRunning() }
+        val large = IntArray(1364) { it }
+        val first = session.acceptNotification(notification(1, *large), "t1", "raw-1")
+        val second = session.acceptNotification(notification(2, *large), "t2", "raw-2")
+        val third = session.acceptNotification(notification(3, *large), "t3", "raw-3")
+        assertNull(first.chunk)
+        assertNull(second.chunk)
+        assertNull(third.chunk)
+        val preflush = third.preflushChunk!!
+        assertEquals(2, preflush["packetCount"])
+        assertEquals(listOf("raw-1", "raw-2"), preflush["sourceEnvelopeIds"])
+        assertEquals(1, session.flush()!!["packetCount"])
+        assertEquals(3L, session.packetCount)
+        assertEquals(2L, session.chunksEmitted)
+    }
+
+    @Test
     fun startStopAndIdleStopBehavior() {
         val idle = create()
         assertEquals("IDLE", idle.status)

@@ -1,13 +1,23 @@
 {
   "name": "elite-plus-wearable-connector-app",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0-rc2",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build:wellness": "node scripts/build-wellness-runtime.mjs",
+    "build": "tsc -b && npm run build:wellness && vite build && node scripts/assert-physical-acceptance-labels.mjs",
+    "build:engineering": "tsc -b && npm run build:wellness && vite build --mode engineering && node scripts/assert-physical-acceptance-labels.mjs --engineering",
+    "sync:android": "npm run build && npx cap sync android",
+    "sync:android:engineering": "npm run build:engineering && npx cap sync android",
+    "build:connection-diagnostic": "tsc -b && npm run build:wellness && vite build --mode connection-diagnostic && node scripts/assert-physical-acceptance-labels.mjs --connection-diagnostic",
+    "build:activity-v2-verification": "tsc -b && npm run build:wellness && vite build --mode activity-v2-verification && node scripts/assert-physical-acceptance-labels.mjs --activity-v2-verification",
+    "sync:android:connection-diagnostic": "npm run build:connection-diagnostic && npx cap sync android",
+    "sync:android:activity-v2-verification": "npm run build:activity-v2-verification && npx cap sync android",
     "lint": "oxlint",
     "test": "vitest run",
+    "test:wellness": "npm run build:wellness && vitest run src/wellness --no-file-parallelism --maxWorkers=1",
+    "test:companion:web": "npm run build && node scripts/smoke-companion.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -30,7 +40,9 @@
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "^6.1.1",
     "fake-indexeddb": "^6.2.4",
+    "jsdom": "^30.1.2",
     "oxlint": "^1.81.0",
+    "playwright": "^1.56.1",
     "typescript": "~6.0.2",
     "vite": "^8.3.0",
     "vitest": "^3.2.4"

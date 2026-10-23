@@ -22,6 +22,9 @@ export interface ConnectorRegistrationResponse {
   registeredAt: string
   serverTimestamp: string
   sources: string[]
+  responseContractVersion?: string
+  deploymentRevision?: string
+  capabilities?: string[] | Record<string, unknown>
 }
 
 export interface ConnectorStatusRequest {
@@ -107,6 +110,7 @@ export interface ConnectorObservationResult {
   errorCode?: string | null
   canonicalStatus?: ObservationCanonicalStatus
   nativeObservationId?: string | null
+  canonicalTarget?: string | null
 }
 
 export interface ConnectorObservationsResponse {

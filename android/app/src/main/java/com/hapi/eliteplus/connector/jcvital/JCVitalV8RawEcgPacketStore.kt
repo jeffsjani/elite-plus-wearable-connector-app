@@ -5,18 +5,26 @@ import java.io.DataOutputStream
 import java.io.File
 import java.io.FileOutputStream
 
-/** Length-prefixed original notifications, written chunk-by-chunk to app cache. */
+/** Length-prefixed original notifications, synchronously written to persistent app-private storage. */
 class JCVitalV8RawEcgPacketStore private constructor(val file: File) : AutoCloseable {
-    private val output = DataOutputStream(BufferedOutputStream(FileOutputStream(file, false)))
+    private val stream = FileOutputStream(file, false)
+    private val output = DataOutputStream(BufferedOutputStream(stream))
+    var sourceFileId: String? = null
     var packetCount: Long = 0
         private set
     var byteCount: Long = 0
         private set
 
     init {
-        output.write(STORE_MAGIC)
-        output.flush()
-        byteCount += STORE_MAGIC.size
+        try {
+            output.write(STORE_MAGIC)
+            output.flush()
+            stream.fd.sync()
+            byteCount += STORE_MAGIC.size
+        } catch (error: Throwable) {
+            try { output.close() } catch (closeError: Throwable) { error.addSuppressed(closeError) }
+            throw error
+        }
     }
 
     @Synchronized
@@ -28,20 +36,27 @@ class JCVitalV8RawEcgPacketStore private constructor(val file: File) : AutoClose
             byteCount += Integer.BYTES + packet.size
         }
         output.flush()
+        stream.fd.sync()
     }
 
     @Synchronized
     override fun close() {
         output.flush()
+        stream.fd.sync()
         output.close()
     }
 
     companion object {
         private val STORE_MAGIC = byteArrayOf('J'.code.toByte(), 'C'.code.toByte(), 'V'.code.toByte(), '8'.code.toByte(), 'E'.code.toByte(), 'C'.code.toByte(), 'G'.code.toByte(), '1'.code.toByte())
 
-        fun create(cacheDirectory: File, sessionId: String): JCVitalV8RawEcgPacketStore {
-            val prefix = "jcvital-ecg-${sessionId.take(8)}-"
-            return JCVitalV8RawEcgPacketStore(File.createTempFile(prefix, ".bin", cacheDirectory))
+        fun create(directory: File, sessionId: String): JCVitalV8RawEcgPacketStore {
+            require(sessionId.matches(Regex("[A-Za-z0-9_-]+")))
+            val spool = File(directory, "jcvital-source-spool")
+            check(spool.isDirectory || spool.mkdirs()) { "Could not create source spool" }
+            val file = File(spool, "jcvital-ecg-$sessionId-${java.util.UUID.randomUUID()}.bin")
+            check(file.createNewFile()) { "Source spool collision" }
+            return try { JCVitalV8RawEcgPacketStore(file) }
+            catch (error: Throwable) { file.delete(); throw error }
         }
     }
 }

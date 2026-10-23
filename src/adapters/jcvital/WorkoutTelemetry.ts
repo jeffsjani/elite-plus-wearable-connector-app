@@ -48,6 +48,11 @@ export interface LiveWorkoutPacket {
   temperature: number | null
   spo2: number | null
   rawVendorPayload: Record<string, unknown>
+  provenance?: {
+    sourceEnvelopeId?: string
+    sourceCallbackId?: string
+    sourceEnvelopeModelVersion?: string
+  }
 }
 
 export interface WorkoutCadenceDiagnostics {

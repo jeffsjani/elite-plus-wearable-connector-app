@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-vi.mock('@base44/sdk', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@base44/sdk')>()),
-  getAccessToken: () => 'test-token',
-}))
+vi.mock('@base44/sdk', async (importOriginal) => {
+  const original = await importOriginal<typeof import('@base44/sdk')>()
+  return { ...original, createClient: vi.fn(original.createClient), getAccessToken: () => 'test-token' }
+})
 
 async function loadClient() {
   vi.resetModules()
@@ -14,6 +14,25 @@ async function loadClient() {
 
 describe('invokeConnectorFunction', () => {
   afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals() })
+
+  it('pins SDK/auth and connector requests to production despite local/staging environment overrides', async () => {
+    vi.stubEnv('VITE_BASE44_SERVER_URL', 'http://localhost:8000')
+    vi.stubEnv('VITE_BASE44_APP_BASE_URL', 'https://staging.example.invalid')
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ success: true }), { status: 200 }))
+    vi.stubGlobal('fetch', fetch)
+    const { invokeConnectorFunction } = await loadClient()
+    const { createClient } = await import('@base44/sdk')
+    expect(createClient).toHaveBeenLastCalledWith({
+      appId: '6a89a92c780c9ffa5ba886bc',
+      serverUrl: 'https://base44.app',
+      appBaseUrl: 'https://waves-elite-sync.base44.app',
+      analytics: { enabled: false },
+    })
+    for (const name of ['nativeConnectorRegister', 'nativeConnectorObservations']) {
+      await invokeConnectorFunction(name, {})
+      expect(fetch).toHaveBeenLastCalledWith(`https://waves-elite-sync.base44.app/functions/${name}`, expect.any(Object))
+    }
+  })
 
   it('maps an aborted hung fetch to TIMEOUT', async () => {
     vi.stubGlobal('fetch', (_url: string, init: RequestInit) => new Promise((_, reject) => {

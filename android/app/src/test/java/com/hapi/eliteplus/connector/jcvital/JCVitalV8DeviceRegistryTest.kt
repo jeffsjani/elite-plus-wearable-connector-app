@@ -57,9 +57,9 @@ class JCVitalV8DeviceRegistryTest {
     @Test
     fun ordersServiceAdvertisersThenStrongestSignal() {
         val registry = JCVitalV8DeviceRegistry()
-        upsert(registry, address = "00:00:00:00:00:01", name = "Phone", rssi = -40)
+        upsert(registry, address = "00:00:00:00:00:01", name = "JCV8B 123456", rssi = -40)
         upsert(registry, address = "00:00:00:00:00:02", name = "V8", rssi = -90, advertises = true)
-        upsert(registry, address = "00:00:00:00:00:03", name = "Speaker", rssi = -70)
+        upsert(registry, address = "00:00:00:00:00:03", name = "JCV8B ABCDEF", rssi = -70)
         assertEquals(listOf("00:00:00:00:00:02", "00:00:00:00:00:01", "00:00:00:00:00:03"), registry.all().map { it.id })
     }
 
@@ -77,9 +77,27 @@ class JCVitalV8DeviceRegistryTest {
         val registry = JCVitalV8DeviceRegistry()
         val map = upsert(registry, seenAt = 0L).device.toMap()
         assertEquals(
-            listOf("id", "name", "macAddress", "rssi", "bonded", "connectable", "lastSeenAt", "advertisesJcvitalService"),
+            listOf("id", "name", "macAddress", "rssi", "bonded", "connectable", "lastSeenAt", "advertisesJcvitalService", "v8Candidate"),
             map.keys.toList(),
         )
         assertEquals("1970-01-01T00:00:00.000Z", map["lastSeenAt"])
+        assertEquals(true, map["v8Candidate"])
+    }
+
+    @Test
+    fun classifiesAfterNamePopulationAndImmediatelyEmitsNewCandidates() {
+        val registry = JCVitalV8DeviceRegistry()
+        assertFalse(upsert(registry, name = null).shouldEmit)
+        assertTrue(registry.all().isEmpty())
+        assertTrue(upsert(registry, name = "JCV8B AC349E", seenAt = 1_100L).shouldEmit)
+        assertEquals("JCV8B AC349E", registry.all().single().name)
+        assertEquals(true, upsert(registry, name = null, seenAt = 2_100L).device.toMap()["v8Candidate"])
+    }
+
+    @Test
+    fun unrelatedNamedDevicesAreNotListedOrEmitted() {
+        val registry = JCVitalV8DeviceRegistry()
+        assertFalse(upsert(registry, name = "WHOOP 1234").shouldEmit)
+        assertTrue(registry.all().isEmpty())
     }
 }

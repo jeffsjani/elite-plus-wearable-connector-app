@@ -1,12 +1,13 @@
 import type { NativeObservationInput } from '../../services/base44/base44Types'
 import { BLUETOOTH_MAC_PATTERN, isOpaqueJCVitalDeviceId } from '../../services/storage/JCVitalDeviceIdentityService'
 import type { BatchDeliveryEvent, BatchDeliveryListener, BatchDeliveryOutcome } from '../../services/sync/ObservationBatchManager'
+import { nativeJcvitalConnector } from '../../models/wearableObservation'
 import { sha256Hex } from './HeartRateSeries'
 import type { JCVitalV8WorkoutHeartRateEvent } from './jcvitalV8Bridge'
 
 export const JCVITAL_NATIVE_SOURCE = {
   source: 'jcvital_native',
-  sourceConnector: 'JCVITAL_NATIVE',
+  sourceConnector: nativeJcvitalConnector,
   sourceProvider: 'JCVITAL',
   sourcePath: 'DIRECT_BLE',
   deviceModel: 'PRO_V8',
@@ -69,7 +70,7 @@ export function validateWorkoutHrObservation(observation: NativeObservationInput
   const problems: string[] = []
   if (!/^[0-9a-f]{64}$/.test(observation.observationId)) problems.push('observationId must be a SHA-256 hex digest')
   if (observation.source !== JCVITAL_NATIVE_SOURCE.source) problems.push('source must be jcvital_native')
-  if (observation.sourceConnector !== JCVITAL_NATIVE_SOURCE.sourceConnector) problems.push('sourceConnector must be JCVITAL_NATIVE')
+  if (observation.sourceConnector !== JCVITAL_NATIVE_SOURCE.sourceConnector) problems.push(`sourceConnector must be ${JCVITAL_NATIVE_SOURCE.sourceConnector}`)
   if (observation.sourcePath !== JCVITAL_NATIVE_SOURCE.sourcePath) problems.push('sourcePath must be DIRECT_BLE')
   if (observation.metric !== 'heartRate' || observation.metricType !== 'HEART_RATE') problems.push('metric must be heart rate')
   if (observation.unit !== 'bpm') problems.push('unit must be bpm')
@@ -137,7 +138,7 @@ export async function buildWorkoutHrObservation(
 
 export interface WorkoutHrQueue {
   getOwnerUserId(): string | null
-  enqueue(observation: NativeObservationInput): Promise<{ inserted: boolean; alreadyQueued: boolean }>
+  enqueue(observation: NativeObservationInput, sourceEnvelopeId?: string): Promise<{ inserted: boolean; alreadyQueued: boolean }>
 }
 
 /** Combines store initialization with observed enqueue health. */
@@ -404,7 +405,10 @@ export class WorkoutHrDeliveryService {
     if (validateWorkoutHrObservation(observation).length) { this.counters.invalid++; this.changed(); return true }
     this.counters.enqueueAttempts++
     try {
-      const result = await this.deps.queue.enqueue(observation)
+      const sourceEnvelopeId = item.event.provenance?.sourceEnvelopeId ?? item.event.sourceEnvelopeId
+      const result = sourceEnvelopeId
+        ? await this.deps.queue.enqueue(observation, sourceEnvelopeId)
+        : await this.deps.queue.enqueue(observation)
       this.recordEnqueueSuccess()
       if (result.inserted) this.counters.queued++
       else this.counters.alreadyQueued++

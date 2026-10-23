@@ -21,6 +21,9 @@ class JCVitalV8EventNormalizer {
         val sessionId: String?,
         val receiptMillis: Long,
         val timezone: String,
+        val sourceEnvelopeId: String? = null,
+        val sourceCallbackId: String? = null,
+        val sourceRecordEnvelopeIds: List<String> = emptyList(),
     )
 
     data class Event(val name: String, val payload: Map<String, Any?>)
@@ -111,12 +114,15 @@ class JCVitalV8EventNormalizer {
             null -> emptyList<Any?>()
             else -> return listOf(Event(EVENT_PARSE_ERROR, parseError(dataType, "Historical data is not an array", rawData, receipt)))
         }
-        return records.flatMap { rawRecord ->
+        return records.flatMapIndexed { recordIndex, rawRecord ->
             @Suppress("UNCHECKED_CAST")
-            val record = rawRecord as? Map<String, Any?> ?: return@flatMap listOf(
+            val record = rawRecord as? Map<String, Any?> ?: return@flatMapIndexed listOf(
                 Event(EVENT_PARSE_ERROR, parseError(dataType, "Historical record is not an object", rawRecord, receipt)),
             )
-            mapper(record, envelope, dataType, ctx, receipt).flatMap { observation ->
+            val recordContext = if (ctx.sourceRecordEnvelopeIds.isEmpty()) ctx else ctx.copy(
+                sourceEnvelopeId = ctx.sourceRecordEnvelopeIds.getOrNull(recordIndex),
+            )
+            mapper(record, envelope, dataType, recordContext, receipt).flatMap { observation ->
                 val hasValue = observation["value"] != null || (observation["values"] as? List<*>)?.isNotEmpty() == true
                 buildList {
                     add(Event(EVENT_OBSERVATION, observation))
@@ -408,10 +414,16 @@ class JCVitalV8EventNormalizer {
                 sequence == 0 -> linkedMapOf("record" to record)
                 else -> null
             },
-            "provenance" to linkedMapOf(
+            "provenance" to linkedMapOf<String, Any?>(
                 "sourceConnector" to "JCVITAL_NATIVE", "provider" to "JCVITAL",
                 "sourceRecordId" to sourceRecordId, "parserVersion" to PARSER_VERSION,
-            ),
+            ).apply {
+                if (ctx.sourceEnvelopeId != null) {
+                    put("sourceEnvelopeId", ctx.sourceEnvelopeId)
+                    put("sourceCallbackId", ctx.sourceCallbackId)
+                    put("sourceEnvelopeModelVersion", JCVitalV8SourceSnapshot.MODEL_VERSION)
+                }
+            },
         )
     }
 
@@ -476,7 +488,16 @@ class JCVitalV8EventNormalizer {
             "sessionId" to ctx.sessionId,
             "packetId" to fields["packetID"]?.toString(),
             "rawVendorPayload" to fields,
-        )
+        ).apply {
+            if (ctx.sourceEnvelopeId != null) {
+                put("provenance", mapOf(
+                    "sourceEnvelopeId" to ctx.sourceEnvelopeId,
+                    "sourceCallbackId" to ctx.sourceCallbackId,
+                    "sourceEnvelopeModelVersion" to JCVitalV8SourceSnapshot.MODEL_VERSION,
+                    "parserVersion" to PARSER_VERSION,
+                ))
+            }
+        }
 
     private fun Any?.asInt(): Int? = when (this) {
         is Number -> toInt()
@@ -495,6 +516,7 @@ class JCVitalV8EventNormalizer {
         const val EVENT_HEART_RATE = "jcvitalHeartRate"
         const val EVENT_OBSERVATION = "jcvitalObservation"
         const val EVENT_HISTORICAL_HR_CHUNK = "jcvitalHistoricalHrChunk"
+        const val EVENT_HISTORICAL_SYNC_LIFECYCLE = "jcvitalHistoricalSyncLifecycle"
         const val EVENT_PARSE_ERROR = "jcvitalParseError"
         const val EVENT_WORKOUT_STATE = "jcvitalWorkoutState"
         const val EVENT_WORKOUT_PACKET = "jcvitalWorkoutPacket"

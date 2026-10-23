@@ -6,6 +6,8 @@ import type {
   JCVitalV8MonitoringConfiguration,
 } from './jcvitalV8Bridge'
 import type { HistoricalHrStreamSummary } from './HistoricalHrStream'
+import type { PhysiologySyncReport } from './PhysiologyDelivery'
+import type { buildJCVitalCertification } from './JCVitalCertification'
 import { getBackendEnvironmentDiagnostics, type BackendEnvironmentDiagnostics } from '../../services/base44/base44Environment'
 
 export type HistoricalFeedKey = 'heartRate' | 'spo2' | 'temperature' | 'hrv' | 'ppi'
@@ -18,6 +20,7 @@ export interface HistoricalFeedRun {
   error: string | null
   /** Streamed HR: totals and first/last samples; result.observations then holds only those samples. */
   streamSummary?: HistoricalHrStreamSummary
+  certificationDelivery?: { completedAt: string; report: PhysiologySyncReport }
 }
 
 export interface MonitoringFeedRun {
@@ -160,6 +163,8 @@ function sampleDiagnostics(key: HistoricalFeedKey, result: JCVitalV8HistoricalSy
       maximumCelsius: values.length ? Math.max(...values) : null,
       medianCelsius: median(values),
       measurementLabel: 'wearable_temperature_c',
+      duplicateCount: result.recordsDeduplicated,
+      invalidOrNullCount: observations.filter((observation) => typeof observation.value !== 'number' || !Number.isFinite(observation.value) || observation.value <= 0).length,
       ...commonIntervals,
     }
   }
@@ -329,6 +334,7 @@ export function buildPhase3AValidationReport(options: {
   monitoringRun?: MonitoringFeedRun
   additionalFeedResults?: Record<string, unknown>
   backendEnvironment?: BackendEnvironmentDiagnostics
+  jcvitalCertification?: Awaited<ReturnType<typeof buildJCVitalCertification>>
 }) {
   const feeds = {
     heartRate: buildHistoricalFeedResult('heartRate', options.historicalRuns.heartRate),
@@ -354,6 +360,7 @@ export function buildPhase3AValidationReport(options: {
       completedAt: completions.at(-1) ?? null,
     },
     backendEnvironment: options.backendEnvironment ?? getBackendEnvironmentDiagnostics(),
+    jcvitalCertification: options.jcvitalCertification ?? null,
     feedResults: {
       heartRate: exportFeed(feeds.heartRate),
       spo2: exportFeed(feeds.spo2),

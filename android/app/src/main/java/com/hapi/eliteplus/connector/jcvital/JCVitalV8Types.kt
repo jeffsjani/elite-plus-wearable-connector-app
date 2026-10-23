@@ -37,6 +37,9 @@ data class JCVitalV8DiscoveredDevice(
     val lastSeenAt: Long,
     val advertisesJcvitalService: Boolean,
 ) {
+    val v8Candidate: Boolean
+        get() = ElitePlusV8Advertisement.isElitePlusV8Advertisement(name, advertisesJcvitalService)
+
     fun toMap(): Map<String, Any?> = linkedMapOf(
         "id" to id,
         "name" to name,
@@ -46,6 +49,7 @@ data class JCVitalV8DiscoveredDevice(
         "connectable" to connectable,
         "lastSeenAt" to JCVitalV8Time.isoUtc(lastSeenAt),
         "advertisesJcvitalService" to advertisesJcvitalService,
+        "v8Candidate" to v8Candidate,
     )
 }
 

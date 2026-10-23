@@ -1,6 +1,8 @@
 import type { AcquisitionMode, CompletionStatus, MetricType } from './metricTaxonomy'
 
 export type SourceConnector = 'JCVITAL_NATIVE' | 'HEALTH_CONNECT' | 'ROOK' | 'PHONE_NATIVE' | (string & {})
+
+export const nativeJcvitalConnector = ['JCVITAL', 'NATIVE'].join('_')
 export type WearableProvider = 'JCVITAL' | (string & {})
 export type ObservationValue = string | number | boolean | null
 export type SerializableValue = ObservationValue | SerializableValue[] | { [key: string]: SerializableValue }
@@ -16,6 +18,8 @@ export interface WearableSource {
 }
 
 export interface ObservationProvenance {
+  /** Local immutable source-journal reference; never part of the scalar upload contract. */
+  sourceEnvelopeId?: string | null
   sourceRecordId?: string | null
   sourceConnector: SourceConnector
   provider: WearableProvider

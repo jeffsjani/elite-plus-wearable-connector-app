@@ -4,10 +4,25 @@ export const MAX_QUEUE_CLAIM = 100
 
 export type QueueState = 'PENDING' | 'IN_FLIGHT' | 'RETRY_WAIT' | 'ACKNOWLEDGED' | 'FAILED_PERMANENT' | 'CANONICAL_RECOVERY_REQUIRED'
 
+export interface AcquisitionQueueProvenance {
+  syncId: string
+  acquisitionId: string
+  acquisitionRequestId: string
+  requestedMetric: string
+  connectionGeneration: number | null
+  acquisitionStartedAt: string
+  acquisitionCompletedAt: string | null
+  clientQueuedAt: string
+}
+
 export interface QueueRecord {
   queueId: string
   ownerUserId: string
   observationId: string
+  /** Local-only first journal association; never part of the upload payload. */
+  sourceEnvelopeId?: string
+  /** Local-only capture lineage; never part of the upload payload. */
+  acquisitionProvenance?: AcquisitionQueueProvenance
   payload: NativeObservationInput
   state: QueueState
   createdAt: string
@@ -53,6 +68,7 @@ export interface QueueStats {
   inFlight: number
   acknowledged: number
   oldestPendingAgeMs: number | null
+  oldestInFlightAgeMs?: number | null
   lastAttemptAt: string | null
   lastSuccessfulUploadAt: string | null
   warnings: string[]
@@ -61,6 +77,45 @@ export interface QueueStats {
   canonicalRecoveryRequired?: boolean
   lastCanonicalFailureBatchId?: string | null
   lastCanonicalFailureAt?: string | null
+}
+
+export interface QueueCompositionGroup {
+  key: string
+  count: number
+}
+
+export interface PendingQueueComposition {
+  totalPending: number
+  byMetric: QueueCompositionGroup[]
+  byVendorDataType: QueueCompositionGroup[]
+  bySyncId: QueueCompositionGroup[]
+  byAcquisitionId: QueueCompositionGroup[]
+  byRequestedMetric: QueueCompositionGroup[]
+  oldestPendingAt: string | null
+  newestPendingAt: string | null
+  oldestObservedAt: string | null
+  newestObservedAt: string | null
+  attemptCount: { zero: number; one: number; two: number; threePlus: number }
+  distinctObservationIds: number
+  duplicateObservationIdRows: number
+  currentV49SyncId: string | null
+  currentV49SyncPending: number | null
+  currentV49MetricPending: QueueCompositionGroup[] | null
+  currentV49FirstPosition: number | null
+  currentV49LastPosition: number | null
+  currentV49RowsAhead: number | null
+  heartRateRowsAheadCurrentV49: number | null
+  priorSyncPending: number | null
+}
+
+export interface PersistedProductionSyncReceipt {
+  ownerUserId: string
+  syncId: string
+  startedAt: string
+  completedAt: string | null
+  overallState: string
+  requestedMetricsJson: string
+  receiptJson: string
 }
 
 export interface EnqueueResult {
@@ -87,18 +142,31 @@ export interface ObservationQueueStore {
   readonly storeType: QueueStoreType
   readonly databaseName: string
   getSchemaVersion(): number | null
+  saveProductionSyncReceipt(receipt: PersistedProductionSyncReceipt): Promise<void>
+  loadLatestProductionSyncReceipt(ownerUserId: string): Promise<string | null>
+  listDiagnosticRecords?(ownerUserId: string): Promise<QueueRecord[]>
+  getPendingComposition(ownerUserId: string, currentV49SyncId: string | null): Promise<PendingQueueComposition>
   getRecord(ownerUserId: string, observationId: string): Promise<QueueRecord | null>
+  getPayloadJson(ownerUserId: string, observationId: string): Promise<string | null>
+  updateAcquisitionProvenance(ownerUserId: string, provenanceByObservationId: ReadonlyMap<string, AcquisitionQueueProvenance>): Promise<number>
   remove(ownerUserId: string, observationIds: string[]): Promise<void>
   initialize(): Promise<void>
-  enqueue(ownerUserId: string, observation: NativeObservationInput): Promise<EnqueueResult>
-  enqueueMany(ownerUserId: string, observations: NativeObservationInput[]): Promise<EnqueueResult[]>
+  /** Duplicate enqueue fills only a missing association; the journal retains every occurrence. */
+  enqueue(ownerUserId: string, observation: NativeObservationInput, sourceEnvelopeId?: string, provenance?: AcquisitionQueueProvenance): Promise<EnqueueResult>
+  enqueueMany(
+    ownerUserId: string,
+    observations: NativeObservationInput[],
+    sourceEnvelopeIds?: ReadonlyMap<string, string>,
+    provenanceByObservationId?: ReadonlyMap<string, AcquisitionQueueProvenance>,
+  ): Promise<EnqueueResult[]>
   getPending(ownerUserId: string, limit: number, now?: Date): Promise<QueueRecord[]>
   getNextRetryAt(ownerUserId: string, now?: Date): Promise<string | null>
   /**
    * Atomically selects up to `limit` eligible rows and marks them IN_FLIGHT under `batchId` in one transaction,
    * so two concurrent workers can never claim the same PENDING/RETRY_WAIT rows.
    */
-  claimPending(ownerUserId: string, limit: number, batchId: string, now?: Date): Promise<QueueRecord[]>
+  claimPending(ownerUserId: string, limit: number, batchId: string, now?: Date, observationIds?: readonly string[], ignoreRetryBackoff?: boolean): Promise<QueueRecord[]>
+  claimActivityCertification(ownerUserId: string, observationIds: readonly string[], batchId: string): Promise<QueueRecord[]>
   acknowledgeClaims(claims: QueueClaim[], ownerUserId: string): Promise<number>
   markCanonicalRecoveryRequired(claims: CanonicalRecoveryClaim[], ownerUserId: string, error: QueueErrorMetadata): Promise<number>
   getCanonicalRecoveryBatches(ownerUserId: string, limit: number): Promise<CanonicalRecoveryBatch[]>
@@ -109,5 +177,5 @@ export interface ObservationQueueStore {
   countStaleInFlight(ownerUserId: string, staleBefore: string): Promise<number>
   getQueueStats(ownerUserId: string, now?: Date): Promise<QueueStats>
   getOldestPendingAge(ownerUserId: string, now?: Date): Promise<number | null>
-  purgeAcknowledged(ownerUserId: string): Promise<number>
+  purgeAcknowledged(ownerUserId: string, observationIds?: readonly string[]): Promise<number>
 }

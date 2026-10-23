@@ -19,8 +19,14 @@
     /* Linting */
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "erasableSyntaxOnly": true,
-    "noFallthroughCasesInSwitch": true
+    "erasableSyntaxOnly": false,
+    "noFallthroughCasesInSwitch": true,
+    "paths": {
+      "@jcvital-panel": ["./src/adapters/jcvital/ElitePlusV8Panel.tsx"],
+      "@v8-physical-semantic-tests": ["./src/adapters/jcvital/V8PhysicalSemanticTests.tsx"],
+      "@engineering-surfaces": ["./src/EngineeringSurfaces.ts"],
+      "@connection-diagnostic-panel": ["./src/adapters/jcvital/ConnectionDiagnosticPanelStub.tsx"]
+    }
   },
   "include": ["src"]
 }

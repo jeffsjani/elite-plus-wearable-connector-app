@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
 
-    <uses-sdk tools:overrideLibrary="androidx.health.connect.client" />
+    <!-- Digital Wellness is API 29+ gated; preserve the certified Connector's API 24 install floor. -->
+    <uses-sdk tools:overrideLibrary="androidx.health.connect.client,androidx.javascriptengine" />
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" tools:node="remove" />
 
     <uses-permission android:name="android.permission.health.READ_HEART_RATE" />
     <uses-permission android:name="android.permission.health.READ_RESTING_HEART_RATE" />
@@ -31,11 +34,15 @@
 
     <application
         android:allowBackup="true"
+        android:fullBackupContent="@xml/source_journal_backup_rules"
+        android:dataExtractionRules="@xml/source_journal_data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
+        <service android:name="androidx.work.impl.foreground.SystemForegroundService" tools:node="remove" />
+        <service android:name="androidx.work.impl.background.systemalarm.SystemAlarmService" tools:node="remove" />
 
         <activity android:name=".HealthConnectRationaleActivity" android:exported="true">
             <intent-filter>

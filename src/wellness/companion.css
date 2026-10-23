@@ -1,0 +1,8 @@
+.companion nav { display: flex; flex-wrap: nowrap; gap: .25rem; margin: 1rem 0; }
+.companion nav button { flex: 1 1 auto; min-width: 0; white-space: nowrap; padding-inline: .25rem; font-size: .875rem; }
+.companion [aria-current="page"] { outline: 2px solid currentColor; }
+.companion section { margin: 1rem 0; }
+.companion section > button { margin: .3rem; }
+.companion dl { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; }
+.companion dd { margin: 0; overflow-wrap: anywhere; }
+.companion [hidden] { display: none !important; }

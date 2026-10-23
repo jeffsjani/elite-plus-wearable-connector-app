@@ -19,6 +19,27 @@ const TEST_MAC = 'E7:1B:D8:36:78:CF'
 const OPAQUE_ID = 'jcvital_device_3f2b8c1e-9a4d-4b6e-8f10-2c3d4e5f6a7b'
 const context = { deviceId: OPAQUE_ID, firmwareVersion: '0.0.8.8', sdkVersion: 'v8sdk2.0', vendorActivityMode: 0 }
 
+describe('local source-envelope links', () => {
+  it('leaves live HR observation IDs and the entire scalar transport payload unchanged', async () => {
+    const event = hr(1)
+    expect(await buildWorkoutHrObservation('user-1', { ...event, sourceEnvelopeId: 'envelope-live-1' }, context))
+      .toEqual(await buildWorkoutHrObservation('user-1', event, context))
+  })
+
+  it('passes the envelope association separately to the queue, not in the upload payload', async () => {
+    const harness = new Harness()
+    const enqueue = vi.spyOn(harness.deps.queue, 'enqueue')
+    const delivery = new WorkoutHrDeliveryService(harness.deps)
+    delivery.setContext({ bleAddress: TEST_MAC, firmwareVersion: context.firmwareVersion, sdkVersion: context.sdkVersion, vendorActivityMode: 0 })
+    delivery.setEnabled(true)
+    delivery.handleHeartRate({ ...hr(1), provenance: { sourceEnvelopeId: 'envelope-live-1', sourceCallbackId: 'callback-1' } })
+    await vi.waitFor(() => expect(enqueue).toHaveBeenCalled())
+    expect(enqueue.mock.calls[0]).toEqual([expect.not.objectContaining({ sourceEnvelopeId: expect.anything() }), 'envelope-live-1'])
+    expect(JSON.stringify(enqueue.mock.calls[0][0])).not.toContain('envelope-live-1')
+    delivery.dispose()
+  })
+})
+
 class MemoryStorage {
   readonly values = new Map<string, string>()
   getItem(key: string): string | null { return this.values.get(key) ?? null }

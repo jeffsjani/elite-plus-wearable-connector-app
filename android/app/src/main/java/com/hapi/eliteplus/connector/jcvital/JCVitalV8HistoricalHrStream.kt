@@ -133,7 +133,7 @@ class JCVitalV8HistoricalHrStream(
                 return true
             }
         }
-        for (raw in data) {
+        for ((recordIndex, raw) in data.withIndex()) {
             if (limitReached) break
             vendorRecordCount++
             @Suppress("UNCHECKED_CAST")
@@ -156,7 +156,10 @@ class JCVitalV8HistoricalHrStream(
             }
             if (take == 0) continue
             plannedSampleCount += take ?: values.size
-            records.add(SourceRecord(record, start, vendorRecordCount, ctx, receipt, take))
+            val recordContext = if (ctx.sourceRecordEnvelopeIds.isEmpty()) ctx else ctx.copy(
+                sourceEnvelopeId = ctx.sourceRecordEnvelopeIds.getOrNull(recordIndex),
+            )
+            records.add(SourceRecord(record, start, vendorRecordCount, recordContext, receipt, take))
             bufferedRecordCount++
         }
         return !limitReached
@@ -342,6 +345,9 @@ class JCVitalV8HistoricalHrStream(
             "sampleCount" to observations.size,
             "emittedSampleCountTotal" to emittedSampleCount,
             "observations" to observations,
+            "sourceEnvelopeIds" to observations.mapNotNull {
+                (it["provenance"] as? Map<*, *>)?.get("sourceEnvelopeId") as? String
+            }.distinct(),
         )
         val bytes = JCVitalV8JsonSize.estimate(chunk)
         chunk["estimatedSerializedBytes"] = bytes

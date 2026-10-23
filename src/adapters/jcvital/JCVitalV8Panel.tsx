@@ -1,7 +1,9 @@
 import { Component, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from 'react'
 import { Capacitor } from '@capacitor/core'
-import { Directory, Encoding, Filesystem } from '@capacitor/filesystem'
-import { Share } from '@capacitor/share'
+import { exportPpiCertificationFile, PPI_CERTIFICATION_FILENAME, saveValidationJson, serializeCertificationJson } from './CertificationJsonExport'
+import { sha256Hex } from './HeartRateSeries'
+import { PpiCertificationAttempt, type PpiAttemptRecord } from './PpiCertificationAttempt'
+import { connectAndBindJournal, startDiscovery } from './ConnectionLifecycle'
 import {
   JCVitalV8,
   type JCVitalV8Battery,
@@ -21,11 +23,13 @@ import {
   type JCVitalV8RawPpgSession,
   type JCVitalV8WorkoutErrorEvent,
   type JCVitalV8WorkoutHeartRateEvent,
+  type RawPpgPhysicalCertificationEvent,
+  type SourceJournalDiagnostics,
+  type SourceJournalScope,
 } from './jcvitalV8Bridge'
 import {
   buildHistoricalFeedResult,
   buildMonitoringFeedResult,
-  buildPhase3AValidationReport,
   type HistoricalFeedKey,
   type HistoricalFeedRun,
   type MonitoringFeedRun,
@@ -39,7 +43,11 @@ import {
 import { phase3bDisabledReason } from './Phase3BBridgeStatus'
 import { workoutStartDisabledReason, workoutStopDisabledReason } from './WorkoutCaptureGuard'
 import { rawEcgStartDisabledReason, rawEcgStopDisabledReason } from './RawEcgCaptureGuard'
-import { rawPpgStartDisabledReason, rawPpgStopDisabledReason } from './RawPpgCaptureGuard'
+import { rawPpgStopDisabledReason } from './RawPpgCaptureGuard'
+import { RawPpgSavedEvidenceService } from './RawPpgSavedEvidence'
+import { RawPpgSavedEvidenceControls } from './RawPpgSavedEvidenceView'
+import { RAW_PPG_LEGACY_START_DISABLED_REASON, RawPpgPhysicalCertificationService } from './RawPpgPhysicalCertification'
+import { RawPpgPhysicalCertificationControls } from './RawPpgPhysicalCertificationView'
 import { buildRawPpgValidation, createRawPpgUiCoalescer, EMPTY_RAW_PPG_CHUNK_SUMMARY, includeRawPpgChunk, mergeRawPpgSession, type RawPpgChunkSummary, type RawPpgUiUpdate } from './RawPpgDiagnostics'
 import { buildRawEcgValidation, EMPTY_RAW_ECG_CHUNK_SUMMARY, includeRawEcgChunk, type RawEcgChunkSummary } from './RawEcgDiagnostics'
 import {
@@ -56,23 +64,65 @@ import {
   type WorkoutHrDeliverySnapshot,
 } from './WorkoutHrDelivery'
 import { WORKOUT_HR_E2E_TEST_DURATION_MS, WorkoutHrDeliveryView, type QueueSelfTestOutcome } from './WorkoutHrDeliveryView'
-import { JCVitalPhysiologyDelivery, type PhysiologyDeliverySnapshot } from './PhysiologyDelivery'
+import { JCVitalPhysiologyDelivery, type PhysiologyDeliverySnapshot, type FocusedDeliveryOptions } from './PhysiologyDelivery'
 import { PhysiologyDeliveryView } from './PhysiologyDeliveryView'
 import { auditHistoricalResult, boundHistoricalResult } from './HistoricalResultBounds'
 import { chunkAsSyncResult, HistoricalHrStreamCollector, type HistoricalHrStreamSummary } from './HistoricalHrStream'
+import { CertificationDeliveryEvidence } from './JCVitalCertification'
+import { buildCertificationValidationExport, CERTIFICATION_BUILD, serializeCertificationValidationExport } from './CertificationValidationExport'
+import { PRIOR_SPO2_CERTIFICATION_IDS, SpO2Certification, type SpO2Inspection } from './SpO2Certification'
+import { TemperatureCertification, type TemperatureInspection } from './TemperatureCertification'
+import { Type42Certification, TYPE42_CERTIFICATION_SUCCESS, type Type42ConnectedContext } from './Type42Certification'
+import { Type42CertificationView } from './Type42CertificationView'
+import { Activity24_25Certification } from './Activity24_25Certification'
+import { Activity24_25CertificationView } from './Activity24_25CertificationView'
+import { canonicalizeAcquiredActivity, indexedDbActivityLedgerStore, JCVitalActivityCanonicalization } from './ActivityCanonicalization'
+import { SleepCertification } from './SleepCertification'
+import { SleepCertificationView } from './SleepCertificationView'
+import { WorkoutHistoryCertification } from './WorkoutHistoryCertification'
+import { WorkoutHistoryCertificationView } from './WorkoutHistoryCertificationView'
+import { PpiCertification, PPI_CERTIFICATION_SUCCESS, type PpiCertificationInspection } from './PpiCertification'
+import { copyPpiCertificationJson, readPpiCertificationJson, ppiSnapshotSavedStatus, NO_PPI_CERTIFICATION_GROUP_AVAILABLE, type PpiCertificationJson } from './PpiCertificationJson'
+import { PpiCertificationJsonView } from './PpiCertificationJsonView'
+import { PpiCertificationRecovery, PPI_RECOVERED_CERTIFICATION_FILENAME } from './PpiCertificationRecovery'
+import { PpiCertificationResume } from './PpiCertificationResume'
+import { ppiResumeFailureText, PPI_RESUME_BUTTON_LABEL, runPpiCertificationResume } from './PpiCertificationResumeAction'
 import { crashBreadcrumbs } from '../../services/diagnostics/CrashBreadcrumbs'
 import { observationQueue, type QueueDiagnostics } from '../../services/sync/ObservationQueue'
 import { observationBatchManager, type DeliveryDiagnostics } from '../../services/sync/ObservationBatchManager'
 import { connectorIdentityService } from '../../services/base44/ConnectorIdentityService'
+import { activityV2CapabilityStore } from '../../services/base44/ActivityV2Capability'
 import { getBackendEnvironmentDiagnostics } from '../../services/base44/base44Environment'
+import { installationIdentityService } from '../../services/storage/InstallationIdentityService'
 import { jcvitalDeviceIdentityService } from '../../services/storage/JCVitalDeviceIdentityService'
 import type { QueueStats } from '../../services/storage/ObservationQueueStore'
 import { QueueStoreError } from '../../services/storage/ObservationQueueStore'
+import { SourceCapabilityMatrix } from './SourceCapabilityMatrix'
+import { V8FullDataCoverageReportPanel } from './V8FullDataCoverageReportPanel'
+import { IS_ENGINEERING_BUILD } from '../../buildMode'
+import {
+  activityV2SourcesFromNative, enqueueActivityNativeTransportV2, selectSavedActivityV2VerificationSources,
+} from './ActivityNativeTransportV2Delivery'
+import type { ActivityDeviceContext } from './ActivityProductionCanonical'
 
 type ExportStatus = 'EXPORTING' | 'EXPORT SUCCESS' | 'EXPORT FAILED'
 
 /** Chunk events and the call result travel separately over the bridge; wait this long for the final chunk. */
 const FINAL_HR_CHUNK_WAIT_MS = 10_000
+
+const PHYSIOLOGY_CERTIFICATION_ACTIONS = [
+  { key: 'spo2', metric: 'spo2', label: 'SpO2', action: () => JCVitalV8.syncHistoricalSpo2() },
+  { key: 'temperature', metric: 'wearableTemperature', label: 'Wearable Temperature', action: () => JCVitalV8.syncHistoricalTemperature() },
+  { key: 'hrv', metric: 'hrv', label: 'HRV', action: () => JCVitalV8.syncHistoricalHrv() },
+  { key: 'hrv', metric: 'stress', label: 'Stress', action: () => JCVitalV8.syncHistoricalHrv() },
+  { key: 'hrv', metric: 'estimatedBp', label: 'Estimated BP', action: () => JCVitalV8.syncHistoricalHrv() },
+  { key: 'ppi', metric: 'ppi', label: 'PPI', action: () => JCVitalV8.syncHistoricalPpi() },
+] as const
+
+/** Reuses the shared ObservationBatchManager stage strings but presents the certification-specific wording requested for the temperature UI. */
+function temperatureStageLabel(stage: string): string {
+  return stage === 'Sending certification rows' ? 'Delivering 5 temperature observations' : stage
+}
 
 function errorText(error: unknown): string {
   const { code, message } = (error ?? {}) as { code?: string; message?: string }
@@ -104,7 +154,7 @@ export class PpgDiagnosticErrorBoundary extends Component<PpgDiagnosticErrorBoun
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
-    console.error('PPG diagnostics render failure', error.message, error.stack, info.componentStack)
+    if (IS_ENGINEERING_BUILD) console.error('PPG diagnostics render failure', error.message, error.stack, info.componentStack)
     this.props.onError({ message: error.message, stack: error.stack ?? info.componentStack })
   }
 
@@ -174,8 +224,41 @@ export function RawPpgDiagnosticsView({
   </>
 }
 
+const subscribeRawPpgCertification = (listener: (event: RawPpgPhysicalCertificationEvent) => void) =>
+  JCVitalV8.addListener('jcvitalRawPpgCertificationStatus', listener)
+
 /** Diagnostic panel for the JCVital Pro V8 native bridge (Android). Displays data only; nothing is queued for upload. */
-export function JCVitalV8Panel() {
+export function JCVitalV8Panel({ ownerUserId }: { ownerUserId: string }) {
+  const ownerRef = useRef(ownerUserId)
+  const connectionContext = useMemo(() => ({ accountId: ownerUserId, generation: 0 }), [ownerUserId])
+  ownerRef.current = ownerUserId
+  const sourceJournalScopeRef = useRef<SourceJournalScope | null>(null)
+  const rawPpgSavedEvidenceServiceRef = useRef<RawPpgSavedEvidenceService | null>(null)
+  if (!rawPpgSavedEvidenceServiceRef.current) {
+    // VC28: historical/offline scope. Never require the live capture scope (null after restart/disconnect).
+    rawPpgSavedEvidenceServiceRef.current = new RawPpgSavedEvidenceService(JCVitalV8, () => {
+      const live = sourceJournalScopeRef.current
+      return {
+        accountId: ownerRef.current || null,
+        deviceScopeId: live && live.accountId === ownerRef.current ? live.deviceScopeId : null,
+      }
+    })
+  }
+  const rawPpgPhysicalCertificationRef = useRef<RawPpgPhysicalCertificationService | null>(null)
+  if (!rawPpgPhysicalCertificationRef.current) {
+    // VC29: persisted account/device owner; inspection/export work after restart without a connected V8.
+    rawPpgPhysicalCertificationRef.current = new RawPpgPhysicalCertificationService(JCVitalV8, () => {
+      const live = sourceJournalScopeRef.current
+      return {
+        accountId: ownerRef.current || null,
+        deviceScopeId: live && live.accountId === ownerRef.current ? live.deviceScopeId : null,
+      }
+    })
+  }
+  const [sourceJournalDiagnostics, setSourceJournalDiagnostics] = useState<SourceJournalDiagnostics | null>(null)
+  const [sourceJournalError, setSourceJournalError] = useState<string | null>(null)
+  const [sourceJournalPage, setSourceJournalPage] = useState<string | null>(null)
+  const [sourceJournalExportCursor, setSourceJournalExportCursor] = useState(0)
   const [permission, setPermission] = useState<JCVitalV8PermissionResult | null>(null)
   const [state, setState] = useState<JCVitalV8ConnectionState>('DISCONNECTED')
   const [devices, setDevices] = useState<JCVitalV8Device[]>([])
@@ -235,6 +318,533 @@ export function JCVitalV8Panel() {
   const [staleRetryResult, setStaleRetryResult] = useState<string | null>(null)
   const [hrTestEndsAt, setHrTestEndsAt] = useState<number | null>(null)
   const hrTestTimerRef = useRef<number | null>(null)
+  const certificationDeliveryRef = useRef(new CertificationDeliveryEvidence())
+  const spo2CertificationRef = useRef(new SpO2Certification({
+    queue: observationQueue,
+    flush: (ids, options) => observationBatchManager.flushCertificationObservationIds(ids, options),
+  }))
+  const [spo2Inspection, setSpo2Inspection] = useState<SpO2Inspection[] | null>(null)
+  const [spo2CertificationRunning, setSpo2CertificationRunning] = useState(false)
+  const [spo2CertificationStage, setSpo2CertificationStage] = useState('')
+  const [spo2SavedIds, setSpo2SavedIds] = useState<string[]>([])
+  const [spo2CaptureCounts, setSpo2CaptureCounts] = useState<{ captured: number; queued: number | null } | null>(null)
+  const certificationActiveMetricRef = useRef<'spo2' | 'wearableTemperature' | null>(null)
+  const temperatureCertificationRef = useRef(new TemperatureCertification({
+    queue: observationQueue,
+    flush: (ids, options) => observationBatchManager.flushCertificationObservationIds(ids, options),
+  }))
+  const [temperatureInspection, setTemperatureInspection] = useState<TemperatureInspection[] | null>(null)
+  const [temperatureCertificationRunning, setTemperatureCertificationRunning] = useState(false)
+  const [temperatureCertificationStage, setTemperatureCertificationStage] = useState('')
+  const [temperatureSavedIds, setTemperatureSavedIds] = useState<string[]>([])
+  const [temperatureCaptureCounts, setTemperatureCaptureCounts] = useState<{ captured: number; queued: number | null } | null>(null)
+  const type42ContextRef = useRef<Type42ConnectedContext | null>(null)
+  type42ContextRef.current = sourceJournalScopeRef.current && info ? {
+    scope: sourceJournalScopeRef.current,
+    bleAddress: info.macAddress ?? info.deviceId,
+    firmwareVersion: info.firmwareVersion ?? null,
+    sdkVersion: info.sdkVersion,
+    ready: state === 'READY', physical: pluginAvailable === true, native: Capacitor.isNativePlatform(),
+  } : null
+  const type42CertificationRef = useRef(new Type42Certification({
+    queue: observationQueue,
+    acquire: () => JCVitalV8.syncHistoricalHrv(),
+    journal: JCVitalV8,
+    flush: (ids, options) => observationBatchManager.flushCertificationObservationIds(ids, options),
+    deliveryDiagnostics: () => observationBatchManager.getDeliveryDiagnostics(),
+    connectedContext: () => {
+      const context = type42ContextRef.current
+      if (!context || context.scope.accountId !== observationQueue.getOwnerUserId()) {
+        throw new Error('Connect the authenticated physical V8 to establish its source-journal scope.')
+      }
+      return context
+    },
+  }))
+  const [type42Status, setType42Status] = useState('')
+  const [type42Evidence, setType42Evidence] = useState<string | null>(null)
+  const [type42ExportLocation, setType42ExportLocation] = useState<string | null>(null)
+  function ppiConnectedContext() {
+    const context = type42ContextRef.current
+    if (!context || context.scope.accountId !== observationQueue.getOwnerUserId()) {
+      throw new Error('Connect the authenticated physical V8 to establish its source-journal scope.')
+    }
+    return context
+  }
+  const activityCanonical = useMemo(() => new JCVitalActivityCanonicalization({
+    owner: () => observationQueue.getOwnerUserId(),
+    resolveDeviceId: (bleAddress) => jcvitalDeviceIdentityService.resolve(bleAddress),
+    store: indexedDbActivityLedgerStore,
+  }), [])
+  async function retainActivityCanonical(results: readonly JCVitalV8HistoricalSyncResult[], context: Type42ConnectedContext) {
+    const reports = await canonicalizeAcquiredActivity(activityCanonical, context.scope, context, results)
+    const problems = reports.filter((report) => report.status !== 'CANONICALIZED')
+    if (problems.length) setMessage(`Activity canonicalization: ${problems.map((report) => report.reason).join('; ')}`)
+  }
+  function activityV2DeviceContext(
+    context: Type42ConnectedContext,
+    observations: readonly JCVitalV8HistoricalSyncResult['observations'][number][],
+  ): ActivityDeviceContext {
+    const native = observations.find((observation) => observation.source.deviceModel !== null) ?? observations[0]
+    return {
+      ownerUserId: context.scope.accountId,
+      deviceId: jcvitalDeviceIdentityService.resolve(context.bleAddress),
+      deviceModel: native?.source.deviceModel ?? null,
+      firmwareVersion: context.firmwareVersion,
+      sdkVersion: context.sdkVersion,
+    }
+  }
+  async function sendSavedActivityV2Verification(): Promise<string> {
+    const context = ppiConnectedContext()
+    const connectorDeviceId = connectorIdentityService.getConnectorDeviceId()
+    if (!connectorDeviceId) throw new Error('Connector registration is required before Activity v2 verification.')
+    const capabilityScope = {
+      ownerUserId: context.scope.accountId,
+      installId: installationIdentityService.getInstallId(),
+      connectorDeviceId,
+    }
+    if (!activityV2CapabilityStore.isEnabled(capabilityScope)) {
+      const decision = activityV2CapabilityStore.getDecision(capabilityScope)
+      throw new Error(`Activity v2 capability gate is closed (${decision.reason}).`)
+    }
+    const inspection = await activityCertificationRef.current.inspectSaved()
+    if (!inspection.group || inspection.status === 'ACTIVITY_CERTIFICATION_EVIDENCE_INVALID') {
+      throw new Error(inspection.reason ?? 'No verified saved Activity source evidence is available.')
+    }
+    const group = inspection.group
+    if (!group.type24 || !group.type25Group.length || !group.acquisitionResults) {
+      throw new Error('Saved Activity evidence does not contain both Type24 and Type25 source records.')
+    }
+    const savedNative = group.acquisitionResults.results.flatMap((result) => result.observations)
+    const sourceRecords = activityV2SourcesFromNative(savedNative)
+    const deviceContext = activityV2DeviceContext(context, savedNative)
+    const selected = await selectSavedActivityV2VerificationSources(
+      sourceRecords,
+      group.type24.sourceEnvelopeId,
+      group.type25Group.map((source) => source.sourceEnvelopeId),
+      deviceContext,
+    )
+    if (observationQueue.getOwnerUserId() !== capabilityScope.ownerUserId) {
+      throw new Error('Authenticated queue owner changed before Activity v2 verification.')
+    }
+    const enqueued = await enqueueActivityNativeTransportV2(
+      selected, deviceContext, observationQueue, activityV2CapabilityStore.isEnabled(capabilityScope),
+    )
+    if (enqueued.sourceRecordCount !== 2 || enqueued.payloadCount !== 18) {
+      throw new Error('Saved Activity v2 verification did not enqueue the bounded Type24/Type25 evidence.')
+    }
+    const response = await observationBatchManager.process()
+    const selectedIds = new Set(enqueued.payloads.map((payload) => payload.observationId))
+    const returned = response?.results?.filter((result) => selectedIds.has(result.observationId)) ?? []
+    return `Saved Activity v2 evidence queued: 2 source records, ${enqueued.payloadCount} observations `
+      + `(${enqueued.insertedCount} new, ${enqueued.duplicateCount} already queued); existing sender invoked. `
+      + `Selected IDs: ${[...selectedIds].map((id) => id.slice(0, 12)).join(', ')}. `
+      + `This sender response included ${returned.length}/${selectedIds.size} selected results.`
+  }
+  const activityCertificationRef = useRef(new Activity24_25Certification({
+    queue: observationQueue,
+    acquire: async () => {
+      const context = ppiConnectedContext()
+      const acquired = await JCVitalV8.syncActivityCertification()
+      await retainActivityCanonical(acquired.results, context)
+      return acquired
+    },
+    journal: JCVitalV8,
+    snapshotStore: JCVitalV8,
+    flush: (ids, options) => observationBatchManager.flushCertificationObservationIds(ids, options),
+    deliveryDiagnostics: () => observationBatchManager.getDeliveryDiagnostics(),
+    connectedContext: ppiConnectedContext,
+  }))
+  const sleepCertificationRef = useRef(new SleepCertification({
+    acquire: () => JCVitalV8.syncSleepCertification(),
+    journal: JCVitalV8,
+    snapshotStore: JCVitalV8,
+    connectedContext: ppiConnectedContext,
+    owner: () => observationQueue.getOwnerUserId(),
+  }))
+  const workoutHistoryCertificationRef = useRef(new WorkoutHistoryCertification({
+    acquire: () => JCVitalV8.syncWorkoutHistoryCertification(),
+    journal: JCVitalV8,
+    snapshotStore: JCVitalV8,
+    connectedContext: () => type42ContextRef.current,
+    owner: () => observationQueue.getOwnerUserId(),
+    contextStore: localStorage,
+  }))
+  const [ppiAttempt, setPpiAttempt] = useState<PpiAttemptRecord | null>(null)
+  const [ppiAttemptJson, setPpiAttemptJson] = useState<PpiCertificationJson | null>(null)
+  const [ppiAttemptStatus, setPpiAttemptStatus] = useState('')
+  const [ppiShareStatus, setPpiShareStatus] = useState('')
+  const [ppiAttemptShareStatus, setPpiAttemptShareStatus] = useState('')
+  const ppiAttemptRef = useRef(new PpiCertificationAttempt(() => localStorage, (record) => {
+    if (record.accountId === observationQueue.getOwnerUserId()) setPpiAttempt(record)
+  }))
+  const ppiCertificationRef = useRef(new PpiCertification({
+    queue: observationQueue,
+    acquire: () => JCVitalV8.syncHistoricalPpi(),
+    journal: JCVitalV8,
+    flush: (ids, options) => observationBatchManager.flushCertificationObservationIds(ids, options),
+    deliveryDiagnostics: () => observationBatchManager.getDeliveryDiagnostics(),
+    connectedContext: ppiConnectedContext,
+    attemptJournal: JCVitalV8,
+    attemptEvent: (stage, status, details, error) => ppiAttemptRef.current.event(stage, status, details, error),
+  }))
+  // Read-only: no acquire, enqueue, flush, or storage-write dependency is accepted.
+  const ppiRecoveryRef = useRef(new PpiCertificationRecovery({
+    queue: observationQueue, journal: JCVitalV8, connectedContext: ppiConnectedContext,
+  }))
+  const [ppiRecoveryEnvelopeId, setPpiRecoveryEnvelopeId] = useState('')
+  const [ppiRecoveryReport, setPpiRecoveryReport] = useState<string | null>(null)
+  const [ppiRecoveryStatus, setPpiRecoveryStatus] = useState('')
+  const [ppiRecoveryExportLocation, setPpiRecoveryExportLocation] = useState<string | null>(null)
+  const [ppiCertificationStatus, setPpiCertificationStatus] = useState('')
+  const [ppiCertificationEvidence, setPpiCertificationEvidence] = useState<string | null>(null)
+  const [ppiCertificationExportLocation, setPpiCertificationExportLocation] = useState<string | null>(null)
+  const ppiCurrentInspectionRef = useRef<PpiCertificationInspection | null>(null)
+  const [ppiJson, setPpiJson] = useState<PpiCertificationJson | null>(null)
+  const [ppiSnapshotStatus, setPpiSnapshotStatus] = useState<string | null>(null)
+  const [savedPpiAvailable, setSavedPpiAvailable] = useState(false)
+  const [ppiEvidenceOwner, setPpiEvidenceOwner] = useState(ownerUserId)
+  if (ppiEvidenceOwner !== ownerUserId) {
+    setPpiEvidenceOwner(ownerUserId)
+    setPpiJson(null)
+    setPpiSnapshotStatus(null)
+    setPpiCertificationStatus('')
+    setPpiCertificationEvidence(null)
+    setPpiCertificationExportLocation(null)
+    setSavedPpiAvailable(false)
+    setPpiAttempt(null)
+    setPpiAttemptJson(null)
+    setPpiAttemptStatus('')
+    setPpiShareStatus('')
+    setPpiAttemptShareStatus('')
+  }
+  useEffect(() => {
+    try {
+      setSavedPpiAvailable(ppiCertificationRef.current.hasSavedEvidence())
+    } catch (error) {
+      setPpiCertificationStatus(`Saved PPI lookup failed: ${errorText(error)}`)
+    }
+  }, [ownerUserId, ppiCertificationEvidence])
+
+  useEffect(() => {
+    sourceJournalScopeRef.current = null
+    const generation = connectionContext.generation
+    const reset = JCVitalV8.configureSourceJournal({ enabled: false })
+    void reset.then(() => {
+      if (ownerRef.current !== connectionContext.accountId || connectionContext.generation !== generation) return
+      setSourceJournalDiagnostics(null)
+      setInfo(null)
+    }).catch((error) => {
+      if (ownerRef.current !== connectionContext.accountId || connectionContext.generation !== generation) return
+      setSourceJournalError(`Journal scope reset failed: ${errorText(error)}`)
+    })
+    return () => {
+      connectionContext.generation++
+      sourceJournalScopeRef.current = null
+      void JCVitalV8.configureSourceJournal({ enabled: false }).catch((error) => {
+        crashBreadcrumbs.recordError('lastUnhandledJsError', error, 'Source journal scope cleanup')
+        if (IS_ENGINEERING_BUILD) console.error('Source journal scope cleanup failed', error)
+      })
+    }
+  }, [ownerUserId, connectionContext])
+
+  async function refreshSourceJournal(): Promise<void> {
+    const scope = sourceJournalScopeRef.current
+    if (!scope || scope.accountId !== ownerUserId) throw new Error('Connect a device to configure the authenticated source journal.')
+    setSourceJournalDiagnostics(await JCVitalV8.getSourceJournalDiagnostics(scope))
+    setSourceJournalError(null)
+  }
+
+  async function loadSourceJournalPage(): Promise<void> {
+    const scope = sourceJournalScopeRef.current
+    if (!scope || scope.accountId !== ownerUserId) throw new Error('Source journal scope is unavailable.')
+    const page = await JCVitalV8.exportSourceJournal({ ...scope, afterSequence: sourceJournalExportCursor, limit: 10 })
+    setSourceJournalPage(JSON.stringify(page, null, 2))
+    setSourceJournalExportCursor(page.hasMore ? page.nextSequence : 0)
+    await refreshSourceJournal()
+  }
+
+  async function captureType42Certification(): Promise<void> {
+    setBusy(true)
+    setActiveSync('certification:type42')
+    setType42Status('Acquiring type-42 history once')
+    setType42ExportLocation(null)
+    try {
+      const captured = await type42CertificationRef.current.capture()
+      if (!captured.group || captured.status === 'TYPE42_CERTIFICATION_EVIDENCE_INVALID') {
+        setType42Status(`${captured.status}: ${captured.reason ?? 'No complete source record.'}`)
+        return
+      }
+      setType42Evidence(JSON.stringify(captured.group, null, 2))
+      if (captured.status === TYPE42_CERTIFICATION_SUCCESS) {
+        setType42Status(captured.status)
+        return
+      }
+      const delivered = await type42CertificationRef.current.flushSaved((stage) => setType42Status(stage))
+      setType42Status(delivered.reason ? `${delivered.status}: ${delivered.reason}` : delivered.status)
+      setType42Evidence(JSON.stringify(delivered.group, null, 2))
+    } catch (error) {
+      setType42Status(`Type-42 certification stopped: ${errorText(error)}. Inspect saved evidence; do not reacquire.`)
+      crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, 'Grouped type-42 certification')
+    } finally {
+      setActiveSync(null)
+      setBusy(false)
+    }
+  }
+
+  async function inspectType42Certification(): Promise<void> {
+    setBusy(true)
+    try {
+      const inspected = await type42CertificationRef.current.inspectSaved()
+      setType42Status(inspected.reason ? `${inspected.status}: ${inspected.reason}` : inspected.status)
+      setType42Evidence(inspected.group ? JSON.stringify(inspected.group, null, 2) : null)
+    } catch (error) {
+      setType42Status(`Type-42 inspection failed: ${errorText(error)}`)
+    } finally { setBusy(false) }
+  }
+
+  async function exportType42Certification(): Promise<void> {
+    setBusy(true)
+    setType42ExportLocation(null)
+    try {
+      const json = await type42CertificationRef.current.exportSaved()
+      const filename = `jcvital-type42-certification-vc7-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+      setType42ExportLocation(await saveValidationJson(filename, json, 'JCVital type-42 grouped certification',
+        'Save or share type-42 source and native-only delivery evidence'))
+      setType42Status('EXPORT SUCCESS · durable type-42 source and exact delivery evidence')
+    } catch (error) {
+      setType42Status(`EXPORT FAILED: ${errorText(error)}`)
+    } finally { setBusy(false) }
+  }
+
+  async function capturePpiCertification(): Promise<void> {
+    const context = type42ContextRef.current
+    ppiAttemptRef.current.start(observationQueue.getOwnerUserId(), context?.scope.deviceScopeId ?? null, {
+      ready, physical: context?.physical ?? null, native: context?.native ?? null,
+      accountId: observationQueue.getOwnerUserId(), deviceScopeId: context?.scope.deviceScopeId ?? null,
+    })
+    setPpiAttemptJson(null)
+    let attemptOutcome = 'FAILED'
+    setBusy(true)
+    setActiveSync('certification:ppi')
+    setPpiCertificationStatus('Acquiring type-127 history once')
+    setPpiCertificationExportLocation(null)
+    setPpiSnapshotStatus(null)
+    setPpiJson(null)
+    try {
+      const captured = await ppiCertificationRef.current.capture()
+      ppiAttemptRef.current.event('CAPTURE_RESULT', 'INFO', { status: captured.status, reason: captured.reason,
+        certificationGroupId: captured.group?.certificationGroupId ?? null, delivered: captured.delivered })
+      attemptOutcome = captured.status
+      if (!captured.group || captured.status === 'PPI_CERTIFICATION_EVIDENCE_INVALID') {
+        setPpiCertificationStatus(`${captured.status}: ${captured.reason ?? 'No complete source record.'}`)
+        return
+      }
+      setPpiCertificationEvidence(JSON.stringify(captured.group, null, 2))
+      if (captured.status === PPI_CERTIFICATION_SUCCESS) {
+        await confirmPpiSnapshot(captured)
+        ppiCurrentInspectionRef.current = structuredClone(captured)
+        setPpiCertificationStatus(captured.reason ?? captured.status)
+        return
+      }
+      ppiCurrentInspectionRef.current = structuredClone(captured)
+      const delivered = await ppiCertificationRef.current.flushSaved((stage) => setPpiCertificationStatus(stage))
+      ppiAttemptRef.current.event('DELIVERY_INSPECTION_RESULT', 'INFO', { status: delivered.status, reason: delivered.reason,
+        certificationGroupId: delivered.group?.certificationGroupId ?? null, delivered: delivered.delivered })
+      attemptOutcome = delivered.status
+      if (delivered.status === PPI_CERTIFICATION_SUCCESS) await confirmPpiSnapshot(delivered)
+      if (delivered.group && delivered.status !== 'PPI_CERTIFICATION_EVIDENCE_INVALID') {
+        ppiCurrentInspectionRef.current = structuredClone(delivered)
+      }
+      setPpiCertificationStatus(delivered.reason ? `${delivered.status}: ${delivered.reason}` : delivered.status)
+      setPpiCertificationEvidence(delivered.group ? JSON.stringify(delivered.group, null, 2) : null)
+    } catch (error) {
+      attemptOutcome = 'FAILED'
+      ppiAttemptRef.current.event('OPERATOR_ACTION', 'FAILED', null, error)
+      setPpiCertificationStatus(`PPI certification stopped: ${errorText(error)}. Inspect saved evidence; do not reacquire.`)
+      crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, 'Grouped PPI certification')
+    } finally {
+      ppiAttemptRef.current.finish(attemptOutcome)
+      setActiveSync(null)
+      setBusy(false)
+    }
+  }
+
+  // VC16: replays the persisted last physical attempt via the unchanged VC15 service; never calls syncHistoricalPpi().
+  function createPpiCertificationResume(onEngineStage: (stage: string, status: string, error?: unknown) => void) {
+    return new PpiCertificationResume({
+      queue: observationQueue,
+      journal: JCVitalV8,
+      flush: (ids, options) => observationBatchManager.flushCertificationObservationIds(ids, options),
+      deliveryDiagnostics: () => observationBatchManager.getDeliveryDiagnostics(),
+      connectedContext: ppiConnectedContext,
+      attemptJournal: JCVitalV8,
+      attemptEvent: (stage, status, _details, error) => onEngineStage(stage, status, error),
+    })
+  }
+
+  async function resumePpiCertification(): Promise<void> {
+    setBusy(true)
+    setActiveSync('certification:ppi-resume')
+    setPpiCertificationStatus('Resuming PPI certification from last physical attempt (no acquisition)')
+    setPpiCertificationExportLocation(null)
+    setPpiSnapshotStatus(null)
+    setPpiJson(null)
+    const owner = observationQueue.getOwnerUserId()
+    try {
+      const result = await runPpiCertificationResume({
+        ownerUserId: () => observationQueue.getOwnerUserId(),
+        connectedContext: () => type42ContextRef.current,
+        createResume: createPpiCertificationResume,
+      })
+      if (owner !== observationQueue.getOwnerUserId()) throw new Error('PPI_RESUME_OWNER_CHANGED')
+      if (!result.ok) {
+        if (result.inspection?.group) setPpiCertificationEvidence(JSON.stringify(result.inspection.group, null, 2))
+        setPpiCertificationStatus(ppiResumeFailureText(result))
+        return
+      }
+      ppiCurrentInspectionRef.current = structuredClone(result.inspection)
+      setPpiCertificationEvidence(JSON.stringify(result.inspection.group, null, 2))
+      setPpiJson(result.json)
+      setPpiSnapshotStatus(result.snapshotStatus)
+      setPpiCertificationStatus(PPI_CERTIFICATION_SUCCESS)
+    } catch (error) {
+      setPpiCertificationStatus(`PPI RESUME FAILED · stage: UI · code: PPI_RESUME_UI_ERROR · message: ${errorText(error)}. No physical recapture was attempted.`)
+      crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, 'PPI certification resume')
+    } finally {
+      setActiveSync(null)
+      setBusy(false)
+    }
+  }
+
+  async function confirmPpiSnapshot(inspection: PpiCertificationInspection): Promise<void> {
+    if (!inspection.group) throw new Error(NO_PPI_CERTIFICATION_GROUP_AVAILABLE)
+    const key = ppiCertificationRef.current.verifySnapshotPersisted(inspection.group)
+    setPpiSnapshotStatus(ppiSnapshotSavedStatus(inspection, key, false))
+    const evidence = await readPpiCertificationJson(ppiCertificationRef.current, inspection)
+    setPpiJson(evidence)
+    setPpiSnapshotStatus(ppiSnapshotSavedStatus(inspection, key, true))
+  }
+
+  async function showPpiAttempt(copy = false): Promise<void> {
+    setBusy(true)
+    try {
+      const owner = observationQueue.getOwnerUserId()
+      if (copy && ppiAttemptJson && ppiEvidenceOwner === owner) {
+        setPpiAttemptStatus(await copyPpiCertificationJson(ppiAttemptJson))
+        return
+      }
+      const context = type42ContextRef.current
+      const record = ppiAttempt?.accountId === owner
+        && (!context || ppiAttempt.deviceScopeId === context.scope.deviceScopeId) ? ppiAttempt : null
+      if (!record && (!owner || !context || context.scope.accountId !== owner)) {
+        throw new Error('Reconnect the same authenticated device to read its saved PPI attempt diagnostic.')
+      }
+      const saved = record ?? ppiAttemptRef.current.read(owner!, context!.scope.deviceScopeId)
+      const json = serializeCertificationJson(saved)
+      const evidence = { json, characterCount: json.length, sha256: await sha256Hex(json) }
+      if (owner !== observationQueue.getOwnerUserId()) throw new Error('PPI_ATTEMPT_OWNER_CHANGED_DURING_VIEW')
+      setPpiAttemptJson(evidence)
+      setPpiAttemptStatus(copy ? await copyPpiCertificationJson(evidence) : 'PPI ATTEMPT DIAGNOSTIC AVAILABLE (NOT CERTIFICATION SUCCESS)')
+    } catch (error) {
+      setPpiAttemptStatus(`PPI attempt diagnostic unavailable: ${errorText(error)}`)
+    } finally { setBusy(false) }
+  }
+
+  async function showPpiCertificationJson(savedOnly = false, copy = false): Promise<void> {
+    setBusy(true)
+    if (!copy) setPpiJson(null)
+    try {
+      const current = ppiCurrentInspectionRef.current
+      const inspection = !savedOnly && current?.group?.ownerUserId === observationQueue.getOwnerUserId() ? current : null
+      const evidence = copy && ppiJson && ppiEvidenceOwner === observationQueue.getOwnerUserId()
+        ? ppiJson : await readPpiCertificationJson(ppiCertificationRef.current, inspection)
+      setPpiJson(evidence)
+      setPpiCertificationStatus(copy ? await copyPpiCertificationJson(evidence) : 'PPI CERTIFICATION JSON AVAILABLE')
+    } catch (error) {
+      setPpiCertificationStatus(`PPI JSON unavailable: ${errorText(error)}`)
+    } finally { setBusy(false) }
+  }
+
+  async function shareDisplayedPpiJson(attempt = false): Promise<void> {
+    const setStatus = attempt ? setPpiAttemptShareStatus : setPpiShareStatus
+    const evidence = attempt ? ppiAttemptJson : ppiJson
+    setBusy(true)
+    try {
+      if (ppiEvidenceOwner !== observationQueue.getOwnerUserId()) throw new Error('PPI_JSON_OWNER_CHANGED')
+      if (!evidence) throw new Error(attempt
+        ? 'Show Last PPI Certification Attempt before sharing its JSON.'
+        : 'Show PPI Certification JSON before sharing its JSON.')
+      const filename = attempt ? 'JCVital PPI certification attempt.json' : PPI_CERTIFICATION_FILENAME
+      const location = await saveValidationJson(filename, evidence.json,
+        attempt ? 'JCVital PPI certification attempt' : 'JCVital PPI grouped certification',
+        attempt ? 'Share / Save Last PPI Certification Attempt' : 'Share / Save PPI JSON')
+      setStatus(`PPI JSON SHARE / SAVE COMPLETE · SHA-256: ${evidence.sha256} · ${location}`)
+    } catch (error) {
+      setStatus(`PPI JSON SHARE / SAVE FAILED: ${errorText(error)}. Displayed JSON remains available.`)
+    } finally { setBusy(false) }
+  }
+
+  async function inspectPpiCertification(): Promise<void> {
+    setBusy(true)
+    try {
+      if (!ppiCertificationRef.current.hasSavedEvidence()) {
+        setPpiCertificationStatus(NO_PPI_CERTIFICATION_GROUP_AVAILABLE)
+        setPpiCertificationEvidence(null)
+        return
+      }
+      const inspected = await ppiCertificationRef.current.inspectSaved()
+      setPpiCertificationStatus(!inspected.group && !inspected.diagnostic ? NO_PPI_CERTIFICATION_GROUP_AVAILABLE
+        : inspected.reason ? `${inspected.status}: ${inspected.reason}` : inspected.status)
+      setPpiCertificationEvidence(inspected.group ? JSON.stringify(inspected.group, null, 2) : null)
+    } catch (error) {
+      setPpiCertificationStatus(`PPI inspection failed: ${errorText(error)}`)
+    } finally { setBusy(false) }
+  }
+
+  async function exportPpiCertification(): Promise<void> {
+    setBusy(true)
+    setPpiCertificationExportLocation(null)
+    try {
+      if (!ppiCertificationRef.current.hasSavedEvidence()) {
+        setPpiCertificationStatus(NO_PPI_CERTIFICATION_GROUP_AVAILABLE)
+        return
+      }
+      setPpiCertificationExportLocation(await exportPpiCertificationFile(ppiCertificationRef.current))
+      setPpiCertificationStatus('EXPORT SUCCESS · complete type-127 source and exact selected-slot delivery evidence')
+    } catch (error) {
+      setPpiCertificationStatus(`Export failed; saved evidence retained. ${errorText(error)}. Do not reacquire.`)
+      crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, 'Saved PPI certification export')
+    } finally { setBusy(false) }
+  }
+
+  async function findSavedPpiCertification(): Promise<void> {
+    setBusy(true)
+    setPpiRecoveryExportLocation(null)
+    try {
+      const recovered = await ppiRecoveryRef.current.recover({ sourceEnvelopeId: ppiRecoveryEnvelopeId.trim() || undefined })
+      setPpiRecoveryStatus(`${recovered.classification}${recovered.recoverySource ? ` · ${recovered.recoverySource}` : ''}`
+        + ` · certificationSuccess=${recovered.certificationSuccess} · ${recovered.reason}`)
+      const { group, ...report } = recovered
+      setPpiRecoveryReport(JSON.stringify({ ...report, group: group ? { certificationGroupId: group.certificationGroupId } : null }, null, 2))
+    } catch (error) {
+      setPpiRecoveryStatus(`Saved PPI discovery failed: ${errorText(error)}. Nothing was modified; do not reacquire.`)
+    } finally { setBusy(false) }
+  }
+
+  async function exportRecoveredPpiCertification(): Promise<void> {
+    setBusy(true)
+    setPpiRecoveryExportLocation(null)
+    try {
+      const json = await ppiRecoveryRef.current.exportRecovered({ sourceEnvelopeId: ppiRecoveryEnvelopeId.trim() || undefined })
+      setPpiRecoveryExportLocation(await saveValidationJson(PPI_RECOVERED_CERTIFICATION_FILENAME, json,
+        'JCVital PPI recovered certification', 'Save or share recovered PPI physical evidence'))
+      const parsed = JSON.parse(json) as { classification: string; recoverySource: string; certificationSuccess: boolean }
+      setPpiRecoveryStatus(`RECOVERY EXPORT · ${parsed.classification} · ${parsed.recoverySource} · certificationSuccess=${parsed.certificationSuccess}`)
+    } catch (error) {
+      setPpiRecoveryStatus(`Recovered PPI export failed: ${errorText(error)}. Nothing was modified; do not reacquire.`)
+      crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, 'Recovered PPI certification export')
+    } finally { setBusy(false) }
+  }
 
   useEffect(() => {
     const hrDelivery = new WorkoutHrDeliveryService({
@@ -250,16 +860,53 @@ export function JCVitalV8Panel() {
       queue: observationQueue,
       deliver: () => observationBatchManager.process(),
       subscribe: (listener) => observationBatchManager.subscribe(listener),
+      deliveryDiagnostics: () => observationBatchManager.getDeliveryDiagnostics(),
+      rememberCertification: (observations) => {
+        if (observations[0]?.vendorDataType === '68') { certificationActiveMetricRef.current = 'spo2'; spo2CertificationRef.current.remember(observations) }
+        else if (observations[0]?.vendorDataType === '59') { certificationActiveMetricRef.current = 'wearableTemperature'; temperatureCertificationRef.current.remember(observations) }
+      },
+      onCertificationQueued: (count) => {
+        if (certificationActiveMetricRef.current === 'spo2') {
+          setSpo2CaptureCounts((current) => current ? { ...current, queued: count } : current)
+          setSpo2CertificationStage(`${count} observations durably queued`)
+        } else if (certificationActiveMetricRef.current === 'wearableTemperature') {
+          setTemperatureCaptureCounts((current) => current ? { ...current, queued: count } : current)
+          setTemperatureCertificationStage(`Certification sample queued: ${count} observations durably queued`)
+        }
+      },
+      flushCertification: (ids, metric) => {
+        setBusy(false)
+        if (metric === 'spo2') { setSpo2CertificationStage('Temporarily prioritizing certification rows'); return spo2CertificationRef.current.flush(ids, setSpo2CertificationStage) }
+        if (metric === 'wearableTemperature') {
+          setTemperatureCertificationStage('Temporarily prioritizing certification rows')
+          return temperatureCertificationRef.current.flush(ids, (stage) => setTemperatureCertificationStage(temperatureStageLabel(stage)))
+        }
+        return observationBatchManager.flushCertificationObservationIds(ids)
+      },
       resolveDeviceId: (bleAddress) => jcvitalDeviceIdentityService.resolve(bleAddress),
     })
     physiologyRef.current = physiology
     const unsubscribePhysiology = physiology.onChange(() => setPhysiologySnapshot(physiology.getSnapshot()))
+    const unsubscribeCertification = observationBatchManager.subscribe((event) => {
+      certificationDeliveryRef.current.record(observationQueue.getOwnerUserId(), event)
+      if (observationQueue.getOwnerUserId()) {
+        try { spo2CertificationRef.current.record(event) } catch (error) {
+          crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, 'Persisting SpO2 certification evidence')
+          setMessage(errorText(error))
+        }
+        try { temperatureCertificationRef.current.record(event) } catch (error) {
+          crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, 'Persisting wearable temperature certification evidence')
+          setMessage(errorText(error))
+        }
+      }
+    })
     physiology.start()
     return () => {
       unsubscribe()
       hrDelivery.dispose()
       hrDeliveryRef.current = null
       unsubscribePhysiology()
+      unsubscribeCertification()
       physiology.dispose()
       physiologyRef.current = null
       if (hrTestTimerRef.current !== null) window.clearTimeout(hrTestTimerRef.current)
@@ -322,6 +969,9 @@ export function JCVitalV8Panel() {
       JCVitalV8.addListener('jcvitalBattery', setBattery),
       JCVitalV8.addListener('jcvitalHeartRate', setHeartRate),
       JCVitalV8.addListener('jcvitalError', setLastError),
+      JCVitalV8.addListener('sourceJournalOutcome', (outcome) => {
+        setSourceJournalError(`L0 preservation ${outcome.operation}: ${outcome.status}. Capture stopped; existing source evidence is retained.`)
+      }),
       JCVitalV8.addListener('jcvitalWorkoutState', (session) => {
         setWorkoutSession(session)
         hrDeliveryRef.current?.setContext({ bleAddress: session.deviceId, firmwareVersion: session.firmwareVersion, sdkVersion: session.sdkVersion, vendorActivityMode: session.vendorActivityMode })
@@ -414,11 +1064,12 @@ export function JCVitalV8Panel() {
     try { await action() } catch (error) { setMessage(errorText(error)) } finally { setBusy(false) }
   }
 
-  async function executeHistoricalSync(key: HistoricalFeedKey, action: () => Promise<JCVitalV8HistoricalSyncResult>): Promise<void> {
+  async function executeHistoricalSync(key: HistoricalFeedKey, action: () => Promise<JCVitalV8HistoricalSyncResult>, delivery: FocusedDeliveryOptions = {}): Promise<void> {
     const requestStartedAt = new Date().toISOString()
     const prefix = key === 'heartRate' ? 'HR' : key.toUpperCase()
     crashBreadcrumbs.record(`${prefix}_SYNC_STARTED`, { safeTest: false })
     setHistoricalRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: null, result: null, error: null } }))
+    let result: JCVitalV8HistoricalSyncResult
     try {
       const nativeResult = await action()
       crashBreadcrumbs.record(`${prefix}_SYNC_NATIVE_COMPLETE`, { completionStatus: nativeResult.completionStatus, packets: nativeResult.packetCount })
@@ -426,21 +1077,57 @@ export function JCVitalV8Panel() {
       const audit = auditHistoricalResult(nativeResult)
       crashBreadcrumbs.record(`${prefix}_NORMALIZED_COUNT`, { normalized: audit.normalizedObservations, estimatedNativeResultBytes: audit.estimatedNativeResultBytes, envelopeDuplicated: audit.rawPayloadEnvelopeDuplicated, estimatedDuplicatedEnvelopeBytes: audit.estimatedDuplicatedEnvelopeBytes })
       // Only first/last samples keep raw vendor payloads in React state and exports.
-      const result = boundHistoricalResult(nativeResult)
-      setHistoricalRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result, error: null } }))
-      const physiology = physiologyRef.current
-      // Delivery OFF: no mapping or queue work at all, preserving pre-5B-1 Sync behavior.
-      if (physiology?.isEnabled()) {
-        void physiology.deliverSyncResult(result).catch((error) => {
-          crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, prefix)
-          setMessage(errorText(error))
-        })
+      result = boundHistoricalResult(nativeResult)
+      if (delivery.deliveryMode === 'CERTIFICATION_DELIVER' && key === 'spo2') {
+        setSpo2CaptureCounts({ captured: result.observations.length, queued: null })
+        setSpo2CertificationStage(`${result.observations.length} observations captured; mapping and durably queueing`)
       }
+      if (delivery.deliveryMode === 'CERTIFICATION_DELIVER' && key === 'temperature') {
+        setTemperatureCaptureCounts({ captured: result.observations.length, queued: null })
+        setTemperatureCertificationStage(`Temperature observations normalized: ${result.observations.length} observations; mapping and durably queueing`)
+      }
+      setHistoricalRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result, error: null } }))
     } catch (error) {
       const text = errorText(error)
       crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, `${prefix} native sync`)
       setHistoricalRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result: null, error: text } }))
+      if (key === 'spo2' && delivery.deliveryMode === 'CERTIFICATION_DELIVER') setSpo2CertificationStage(`Capture failed or partial: ${text}`)
+      if (key === 'temperature' && delivery.deliveryMode === 'CERTIFICATION_DELIVER') setTemperatureCertificationStage(`Capture failed or partial: ${text}`)
       setMessage((current) => current ? `${current}; ${text}` : text)
+      return
+    }
+    const physiology = physiologyRef.current
+    if (delivery.deliveryMode === 'CERTIFICATION_DELIVER') {
+      try {
+        if (!physiology) throw new Error('Physiology delivery service unavailable; capture retained but not delivered.')
+        setMessage(`${delivery.certificationMetric}: captured; awaiting exact-ID certification delivery…`)
+        const report = await physiology.deliverSyncResult(result, delivery)
+        if (key === 'spo2') setSpo2CertificationStage(report.delivered
+          ? `${report.queued + report.alreadyQueued} durably queued; ${report.observations?.length ?? 0}/${report.observations?.length ?? 0} targeted samples delivered`
+          : report.reason ?? 'Captured and queued; backend delivery pending')
+        if (key === 'temperature') setTemperatureCertificationStage(report.delivered
+          ? '5/5 delivered. Export JSON and STOP for review.'
+          : report.reason ?? 'Captured and queued; backend delivery pending')
+        setPhysiologySnapshot(physiology.getSnapshot())
+        setHistoricalRuns((current) => ({
+          ...current,
+          [key]: { ...current[key]!, certificationDelivery: { completedAt: new Date().toISOString(), report } },
+        }))
+        setMessage(report.delivered
+          ? `${delivery.certificationMetric}: exact-ID delivery confirmed. Export JSON and STOP for review.`
+          : report.reason ?? 'Certification delivery unconfirmed. Export JSON and STOP for review.')
+      } catch (error) {
+        crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, `${prefix} certification delivery`)
+        setMessage(`Capture retained; certification delivery failed: ${errorText(error)}. Export JSON and STOP.`)
+        if (key === 'spo2') setSpo2CertificationStage(`Capture retained; delivery failed/pending: ${errorText(error)}. Inspect before retrying.`)
+        if (key === 'temperature') setTemperatureCertificationStage(`Capture retained; delivery failed/pending: ${errorText(error)}. Inspect before retrying.`)
+      }
+    } else if (delivery.deliveryMode !== 'CAPTURE_ONLY' && physiology?.isEnabled()) {
+      // Ordinary sync retains the existing opt-in master-toggle behavior.
+      void physiology.deliverSyncResult(result).catch((error) => {
+        crashBreadcrumbs.recordError('lastHistoricalDeliveryError', error, prefix)
+        setMessage(errorText(error))
+      })
     }
   }
 
@@ -511,24 +1198,127 @@ export function JCVitalV8Panel() {
     try { await executeHistoricalHrStream(maxValidSamples) } finally { setActiveSync(null); setBusy(false) }
   }
 
-  async function runSync(key: HistoricalFeedKey, action: () => Promise<JCVitalV8HistoricalSyncResult>): Promise<void> {
+  async function runSync(key: HistoricalFeedKey, action: () => Promise<JCVitalV8HistoricalSyncResult>, delivery: FocusedDeliveryOptions = {}): Promise<void> {
     setBusy(true)
-    setActiveSync(`phase3a:${key}`)
+    setActiveSync(delivery.deliveryMode === 'CERTIFICATION_DELIVER' ? `certification:${delivery.certificationMetric}` : `phase3a:${key}`)
     setMessage('')
-    try { await executeHistoricalSync(key, action) } finally { setActiveSync(null); setBusy(false) }
+    try { await executeHistoricalSync(key, action, delivery) } finally { setActiveSync(null); setBusy(false) }
   }
 
-  async function syncHrvAndPpi(): Promise<void> {
-    setBusy(true)
-    setActiveSync('phase3a:hrv-ppi')
-    setMessage('')
+  async function inspectPriorSpo2(): Promise<void> {
+    setSpo2CertificationRunning(true)
+    setSpo2CertificationStage('Inspecting queue')
     try {
-      await executeHistoricalSync('hrv', () => JCVitalV8.syncHistoricalHrv())
-      await executeHistoricalSync('ppi', () => JCVitalV8.syncHistoricalPpi())
-    } finally {
-      setActiveSync(null)
-      setBusy(false)
-    }
+      const inspection = await spo2CertificationRef.current.inspect()
+      setSpo2Inspection(inspection)
+      setSpo2SavedIds(spo2CertificationRef.current.snapshot().samples.flatMap((sample) => sample.observationId ? [sample.observationId] : []))
+      const found = inspection.filter((item) => item.status !== 'NOT_FOUND').length
+      setSpo2CertificationStage(found
+        ? `Found ${found}/5 certification observations/evidence. Do not reacquire SpO2.`
+        : 'FIRST VC3 ATTEMPT DID NOT LEAVE DURABLE EVIDENCE FOR THE FIVE CERTIFICATION IDS')
+    } catch (error) {
+      setSpo2Inspection(null)
+      setSpo2CertificationStage(`Inspection failed: ${errorText(error)}`)
+    } finally { setSpo2CertificationRunning(false) }
+  }
+
+  async function flushPriorSpo2(): Promise<void> {
+    setSpo2CertificationRunning(true)
+    try {
+      const known = await spo2CertificationRef.current.inspect()
+      const ids = known.some((item) => item.status !== 'NOT_FOUND') ? PRIOR_SPO2_CERTIFICATION_IDS
+        : spo2CertificationRef.current.snapshot().samples.flatMap((sample) => sample.observationId ? [sample.observationId] : []).slice(0, 5)
+      const report = await spo2CertificationRef.current.flush(ids, setSpo2CertificationStage)
+      const inspection = await spo2CertificationRef.current.inspect(ids)
+      setSpo2Inspection(inspection)
+      const delivered = spo2CertificationRef.current.snapshot().samples.filter((sample) =>
+        ids.some((id) => id === sample.observationId)
+        && ['DELIVERED_CANONICALIZED', 'DELIVERED_DUPLICATE'].includes(sample.deliveryState)).length
+      setSpo2CertificationStage(report.reason ?? `${delivered}/${ids.length} delivered. Export JSON and STOP.`)
+    } catch (error) {
+      setSpo2CertificationStage(`Targeted flush failed: ${errorText(error)}. Inspect; do not reacquire.`)
+    } finally { setSpo2CertificationRunning(false) }
+  }
+
+  async function captureTargetedSpo2(): Promise<void> {
+    setSpo2CertificationRunning(true)
+    try {
+      const inspection = await spo2CertificationRef.current.inspect()
+      setSpo2Inspection(inspection)
+      if (inspection.some((item) => item.status !== 'NOT_FOUND')) {
+        setSpo2CertificationStage('Prior observations/evidence found. Use Flush existing SpO2 certification rows; do not reacquire.')
+        return
+      }
+      const restored = spo2CertificationRef.current.snapshot().samples
+      if (restored.length) {
+        setSpo2CertificationStage('A prior certification sample is already recorded. Inspect/flush those exact IDs; do not reacquire.')
+        return
+      }
+      setSpo2CertificationStage('Capturing SpO2')
+      await runSync('spo2', () => JCVitalV8.syncHistoricalSpo2(), { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'spo2' })
+    } catch (error) {
+      setSpo2CertificationStage(`Capture/queue failed or pending: ${errorText(error)}. Inspect before retrying.`)
+    } finally { setSpo2CertificationRunning(false) }
+  }
+
+  /** First physical attempt for type-59 wearable temperature: no prior hardcoded ID list exists to recover. */
+  async function inspectPersistedTemperature(): Promise<void> {
+    setTemperatureCertificationRunning(true)
+    setTemperatureCertificationStage('Inspecting queue')
+    try {
+      const ids = temperatureCertificationRef.current.snapshot().samples.flatMap((sample) => sample.observationId ? [sample.observationId] : [])
+      if (!ids.length) {
+        setTemperatureInspection(null)
+        setTemperatureSavedIds([])
+        setTemperatureCertificationStage('No persisted wearable temperature certification evidence yet. Use Capture + Queue + Targeted Deliver Temperature.')
+        return
+      }
+      const inspection = await temperatureCertificationRef.current.inspect(ids)
+      setTemperatureInspection(inspection)
+      setTemperatureSavedIds(ids)
+      const found = inspection.filter((item) => item.status !== 'NOT_FOUND').length
+      setTemperatureCertificationStage(found
+        ? `Found ${found}/${ids.length} certification observations/evidence. Do not reacquire wearable temperature.`
+        : 'Persisted sample IDs found but Base44 reports no rows for them.')
+    } catch (error) {
+      setTemperatureInspection(null)
+      setTemperatureCertificationStage(`Inspection failed: ${errorText(error)}`)
+    } finally { setTemperatureCertificationRunning(false) }
+  }
+
+  async function flushPersistedTemperature(): Promise<void> {
+    setTemperatureCertificationRunning(true)
+    try {
+      const ids = temperatureCertificationRef.current.snapshot().samples.flatMap((sample) => sample.observationId ? [sample.observationId] : []).slice(0, 5)
+      if (!ids.length) { setTemperatureCertificationStage('No persisted wearable temperature certification IDs to flush.'); return }
+      const report = await temperatureCertificationRef.current.flush(ids, (stage) => setTemperatureCertificationStage(temperatureStageLabel(stage)))
+      const inspection = await temperatureCertificationRef.current.inspect(ids)
+      setTemperatureInspection(inspection)
+      const delivered = temperatureCertificationRef.current.snapshot().samples.filter((sample) =>
+        ids.some((id) => id === sample.observationId)
+        && ['DELIVERED_CANONICALIZED', 'DELIVERED_DUPLICATE'].includes(sample.deliveryState)).length
+      setTemperatureCertificationStage(report.reason ?? `${delivered}/${ids.length} delivered. Export JSON and STOP.`)
+    } catch (error) {
+      setTemperatureCertificationStage(`Targeted flush failed: ${errorText(error)}. Inspect; do not reacquire.`)
+    } finally { setTemperatureCertificationRunning(false) }
+  }
+
+  async function captureTargetedTemperature(): Promise<void> {
+    setTemperatureCertificationRunning(true)
+    try {
+      const restored = temperatureCertificationRef.current.snapshot().samples
+      if (restored.length) {
+        const ids = restored.flatMap((sample) => sample.observationId ? [sample.observationId] : []).slice(0, 5)
+        const inspection = await temperatureCertificationRef.current.inspect(ids)
+        setTemperatureInspection(inspection)
+        setTemperatureCertificationStage('A prior certification sample is already recorded. Inspect/flush those exact IDs; do not reacquire.')
+        return
+      }
+      setTemperatureCertificationStage('Capturing temperature')
+      await runSync('temperature', () => JCVitalV8.syncHistoricalTemperature(), { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'wearableTemperature' })
+    } catch (error) {
+      setTemperatureCertificationStage(`Capture/queue failed or pending: ${errorText(error)}. Inspect before retrying.`)
+    } finally { setTemperatureCertificationRunning(false) }
   }
 
   async function syncMonitoringConfiguration(): Promise<void> {
@@ -557,8 +1347,32 @@ export function JCVitalV8Panel() {
     const requestStartedAt = new Date().toISOString()
     setPhase3bRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: null, result: null, error: null } }))
     try {
+      const context = key === 'activity' || key === 'detailedActivity' ? ppiConnectedContext() : null
       const result = await action()
       setPhase3bRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result, error: null } }))
+      if (context) {
+        await retainActivityCanonical([result], context)
+        const connectorDeviceId = connectorIdentityService.getConnectorDeviceId()
+        const capabilityScope = {
+          ownerUserId: context.scope.accountId,
+          installId: installationIdentityService.getInstallId(),
+          connectorDeviceId: connectorDeviceId ?? '',
+        }
+        if (connectorDeviceId && activityV2CapabilityStore.isEnabled(capabilityScope)) {
+          if (observationQueue.getOwnerUserId() !== capabilityScope.ownerUserId) {
+            throw new Error('Authenticated queue owner changed before Activity v2 enqueue.')
+          }
+          const deviceContext = activityV2DeviceContext(context, result.observations)
+          const enqueued = await enqueueActivityNativeTransportV2(
+            activityV2SourcesFromNative(result.observations), deviceContext, observationQueue,
+            activityV2CapabilityStore.isEnabled(capabilityScope),
+          )
+          if (enqueued.payloadCount) {
+            await observationBatchManager.process()
+            setMessage(`Activity v2: ${enqueued.payloadCount} observations from ${enqueued.sourceRecordCount} saved source records entered the existing queue and sender.`)
+          }
+        }
+      }
     } catch (error) {
       const text = errorText(error)
       setPhase3bRuns((current) => ({ ...current, [key]: { requestStartedAt, requestCompletedAt: new Date().toISOString(), result: null, error: text } }))
@@ -647,17 +1461,17 @@ export function JCVitalV8Panel() {
     }
   }
 
-  async function startHrDeliveryTest(): Promise<void> {
+  async function startHrDeliveryTest(durationMs = WORKOUT_HR_E2E_TEST_DURATION_MS): Promise<void> {
     const delivery = hrDeliveryRef.current
     if (!delivery) return
     delivery.resetDiagnostics()
     delivery.setEnabled(true)
     if (!(await startWorkout())) return
-    setHrTestEndsAt(Date.now() + WORKOUT_HR_E2E_TEST_DURATION_MS)
+    setHrTestEndsAt(Date.now() + durationMs)
     hrTestTimerRef.current = window.setTimeout(() => {
       hrTestTimerRef.current = null
       void stopWorkout()
-    }, WORKOUT_HR_E2E_TEST_DURATION_MS)
+    }, durationMs)
   }
 
   async function stopWorkout(): Promise<void> {
@@ -782,13 +1596,24 @@ export function JCVitalV8Panel() {
         workouts: phase3bRuns.workouts,
       })
       const latestResponseShape = observationBatchManager.getDeliveryDiagnostics().recentResponseShapes.at(-1)
-      const payload = buildPhase3AValidationReport({
+      const ownerUserId = observationQueue.getOwnerUserId()
+      const context = hrDeliveryRef.current?.getContext()
+        ?? { deviceId: null, firmwareVersion: null, sdkVersion: null, vendorActivityMode: null }
+      const preservedQueueSamples = ownerUserId && observationQueue.getDiagnostics().queueStoreInitialized
+        ? await observationQueue.getPending(100) : []
+      const persistedSpo2 = ownerUserId ? spo2CertificationRef.current.snapshot() : { samples: [], inspection: [] }
+      const persistedTemperature = ownerUserId ? temperatureCertificationRef.current.snapshot() : { samples: [], inspection: [] }
+      const journalScope = sourceJournalScopeRef.current
+      const journalDiagnostics = journalScope
+        ? await JCVitalV8.getSourceJournalDiagnostics(journalScope) : null
+      const payload = await buildCertificationValidationExport({
         deviceInfo, historicalRuns, monitoringRun,
         backendEnvironment: getBackendEnvironmentDiagnostics({
           responseContractVersion: latestResponseShape?.responseContractVersion,
           deploymentRevision: latestResponseShape?.deploymentRevision,
         }),
         additionalFeedResults: {
+          sourceEnvelopeJournal: journalDiagnostics,
           ...phase3bFeedResults,
           workoutLiveValidation,
           ecgStartDiagnostics: rawEcgSession?.ecgStartDiagnostics ?? null,
@@ -797,28 +1622,26 @@ export function JCVitalV8Panel() {
           workoutHrDelivery: hrDeliverySnapshot ? { ...hrDeliverySnapshot, queueStats: deliveryQueueStats, queueDiagnostics, queueReadError, queueSelfTest, deliveryDiagnostics: observationBatchManager.getDeliveryDiagnostics(), staleSendingCount } : null,
           physiologyDelivery: physiologySnapshot ? { ...physiologySnapshot, deliveryDiagnostics: observationBatchManager.getDeliveryDiagnostics(), queueStats: deliveryQueueStats } : null,
         },
+      }, {
+        activity: phase3bRuns.activity, detailedActivity: phase3bRuns.detailedActivity,
+        sleep: sleepRun, workouts: phase3bRuns.workouts, ownerUserId,
+        physiologyContext: context, workoutContext: context, workoutSession, workoutPackets,
+        workoutParseErrorCount: workoutParseErrors.length, ppgSession: rawPpgSession, ppgChunks: rawPpgChunks,
+        preservedQueueSamples, deliveryEvidence: certificationDeliveryRef.current.snapshot(ownerUserId),
+        persistedSpo2Samples: persistedSpo2.samples, spo2QueueInspection: persistedSpo2.inspection,
+        persistedTemperatureSamples: persistedTemperature.samples, temperatureQueueInspection: persistedTemperature.inspection,
+        ...(ownerUserId && observationQueue.getDiagnostics().queueStoreInitialized ? {
+          readQueueRecord: (observationId: string) => {
+            if (observationQueue.getOwnerUserId() !== ownerUserId) throw new QueueStoreError('QUEUE_OWNER_MISSING', 'Account changed during certification export.')
+            return observationQueue.getRecord(observationId)
+          },
+        } : {}),
       })
       const filename = `jcvital-v8-phase3abc-validation-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
-      const json = JSON.stringify(payload, null, 2)
+      const json = serializeCertificationValidationExport(payload)
 
-      if (Capacitor.isNativePlatform()) {
-        const saved = await Filesystem.writeFile({ path: filename, data: json, directory: Directory.Cache, encoding: Encoding.UTF8 })
-        await Share.share({
-          title: 'JCVital V8 Phase 3A/3B/3C Validation',
-          text: filename,
-          files: [saved.uri],
-          dialogTitle: 'Save or share Phase 3A/3B/3C validation JSON',
-        })
-        setExportLocation(`${filename} · ${saved.uri}`)
-      } else {
-        const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }))
-        const anchor = document.createElement('a')
-        anchor.href = url
-        anchor.download = filename
-        anchor.click()
-        URL.revokeObjectURL(url)
-        setExportLocation(filename)
-      }
+      setExportLocation(await saveValidationJson(filename, json, 'JCVital V8 Phase 3A/3B/3C Validation',
+        'Save or share Phase 3A/3B/3C validation JSON'))
       setExportStatus('EXPORT SUCCESS')
     } catch (error) {
       setExportStatus('EXPORT FAILED')
@@ -837,6 +1660,27 @@ export function JCVitalV8Panel() {
     ppi: buildHistoricalFeedResult('ppi', historicalRuns.ppi),
     monitoringConfiguration: buildMonitoringFeedResult(monitoringRun),
   }), [historicalRuns, monitoringRun])
+  const connectDevice = async (device: JCVitalV8Device): Promise<void> => {
+    setInfo(null)
+    setBattery(null)
+    setHeartRate(null)
+    sourceJournalScopeRef.current = null
+    const connectionEpoch = connectionContext.generation
+    try {
+      const connected = await connectAndBindJournal(JCVitalV8, ownerUserId, device.id,
+        (address) => jcvitalDeviceIdentityService.resolve(address),
+        () => ownerRef.current === ownerUserId && connectionContext.generation === connectionEpoch)
+      sourceJournalScopeRef.current = connected.scope
+      setSourceJournalDiagnostics(connected.diagnostics)
+      setSourceJournalError(null)
+      setSourceJournalPage(null)
+      setSourceJournalExportCursor(0)
+      setInfo(connected.info)
+    } catch (error) {
+      setSourceJournalError(`SOURCE_JOURNAL_NOT_READY: ${errorText(error)}`)
+      throw error
+    }
+  }
   const phase3bDiagnostics = buildPhase3BFeedResults({
     activity: phase3bRuns.activity,
     detailedActivity: phase3bRuns.detailedActivity,
@@ -919,7 +1763,6 @@ export function JCVitalV8Panel() {
     rawEcgStatus: rawEcgSession?.status ?? 'IDLE',
     rawPpgStatus: rawPpgSession?.status ?? 'IDLE',
   }
-  const rawPpgStartReason = rawPpgStartDisabledReason(rawPpgGate)
   const rawPpgStopReason = rawPpgStopDisabledReason(rawPpgGate)
   const otherActiveMeasurement = activeSync ?? (realtime ? 'manual HR measurement' : null)
   const workoutStatus = workoutSession?.status ?? 'IDLE'
@@ -928,19 +1771,35 @@ export function JCVitalV8Panel() {
   const deliveryQueueHealth = effectiveQueueHealth(queueDiagnostics.queueStoreInitialized, hrDeliverySnapshot?.queueHealth ?? 'HEALTHY')
   return (
     <section className="wearables" aria-labelledby="jcvital-v8-title">
+      <SourceCapabilityMatrix />
+      <V8FullDataCoverageReportPanel />
       <div className="wearables-heading"><h2 id="jcvital-v8-title">JCVital Pro V8</h2><strong>{state}</strong></div>
       <p>Bluetooth: {permission ? `${permission.status}${permission.bluetoothEnabled ? '' : ' (Bluetooth off)'}` : 'Checking…'}</p>
       <div className="wearable-actions">
         <button type="button" disabled={busy} onClick={() => void run(async () => setPermission(await JCVitalV8.requestPermissions()))}>Allow Bluetooth</button>
-        <button type="button" disabled={busy || linked || state === 'SCANNING'} onClick={() => void run(async () => { setDevices([]); await JCVitalV8.startScan({ timeoutMs: 30000 }) })}>Start Scan</button>
+        <button type="button" disabled={busy || !ownerUserId || linked || state === 'SCANNING'} onClick={() => void run(async () => { setDevices([]); await startDiscovery(JCVitalV8, ownerUserId) })}>Start Scan</button>
         <button type="button" className="secondary" disabled={state !== 'SCANNING'} onClick={() => void run(() => JCVitalV8.stopScan())}>Stop Scan</button>
       </div>
       {!linked && devices.length > 0 && <ul className="jcvital-devices">
         {devices.map((device) => <li key={device.id}>
-          <button type="button" disabled={busy} onClick={() => void run(async () => { setInfo(null); setBattery(null); setHeartRate(null); await JCVitalV8.connect({ deviceId: device.id }); setInfo(await JCVitalV8.getDeviceInfo()) })}>Connect</button>
+          <button type="button" disabled={busy} onClick={() => void run(() => connectDevice(device))}>Connect</button>
           {' '}{device.name ?? 'Unnamed'} · {device.macAddress} · {device.rssi} dBm{device.advertisesJcvitalService ? ' · JCVital service' : ''}{device.bonded ? ' · bonded' : ''}
         </li>)}
       </ul>}
+      <details>
+        <summary>L0 source-envelope journal (local only)</summary>
+        <p>Append-only source preservation. No automatic eviction; storage pressure stops new capture. Scalar acknowledgements never remove source evidence.</p>
+        {sourceJournalDiagnostics && <p>
+          Scope envelopes: {sourceJournalDiagnostics.totalEnvelopeCount} · global limit: {sourceJournalDiagnostics.maxEnvelopes}
+          {' '}Scope bytes: {sourceJournalDiagnostics.totalStoredBytes} · global limit: {sourceJournalDiagnostics.maxBytes}
+          {' '}Status: {sourceJournalDiagnostics.lastOutcome}
+          {' '}Refused writes: {sourceJournalDiagnostics.refusedCount}
+        </p>}
+        {sourceJournalError && <p role="alert">{sourceJournalError}</p>}
+        <button type="button" disabled={busy || !sourceJournalScopeRef.current} onClick={() => void run(refreshSourceJournal)}>Refresh journal storage status</button>
+        <button type="button" disabled={busy || !sourceJournalScopeRef.current} onClick={() => void run(loadSourceJournalPage)}>Read next source-envelope page (10)</button>
+        {sourceJournalPage && <pre>{sourceJournalPage}</pre>}
+      </details>
       {linked && <div className="wearable-actions">
         <button type="button" disabled={busy || !ready} onClick={() => void run(async () => setInfo(await JCVitalV8.getDeviceInfo()))}>Device Info</button>
         <button type="button" disabled={busy || !ready} onClick={() => void run(async () => setBattery(await JCVitalV8.getBattery()))}>Battery</button>
@@ -961,11 +1820,154 @@ export function JCVitalV8Panel() {
       {battery && <p>Battery: {battery.level ?? '—'}%{battery.charging === null ? '' : battery.charging ? ' (charging)' : ' (not charging)'}</p>}
       {heartRate && <p>Heart rate: <strong>{heartRate.value} {heartRate.unit}</strong> · received {new Date(heartRate.receiptTimestamp).toLocaleTimeString()} · packet type {heartRate.vendorDataType}</p>}
       <h3>Data Sync</h3>
+      <p><strong>Certification export build:</strong> {CERTIFICATION_BUILD.schemaVersion}
+        {' '}(baseline {CERTIFICATION_BUILD.baselineCommit.slice(0, 7)}).
+        Baseline JSON must contain both certificationBuild and jcvitalCertification before any physical test.</p>
+      <p><strong>V8 certification gate:</strong> historical HR is already proven; its remaining durable
+        backlog is preserved and is not a blocker. Test one feed, export JSON, then STOP for review.
+        Order: SpO2, wearable temperature, type-42 HRV/stress/estimated BP, PPI, activity, detailed activity,
+        workout history, live workout HR, sleep. Reuse existing PPG evidence; ECG remains blocked.
+        No scaling or asynchronous canonicalization.</p>
+      <h4>Focused certification delivery (one selected metric only)</h4>
       <div className="wearable-actions">
-        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void runHistoricalHrStream()}>Sync HR</button>
-        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void runSync('spo2', () => JCVitalV8.syncHistoricalSpo2())}>Sync SpO2</button>
-        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void runSync('temperature', () => JCVitalV8.syncHistoricalTemperature())}>Sync Temperature</button>
-        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void syncHrvAndPpi()}>Sync HRV/PPI</button>
+        <button type="button" disabled={busy || spo2CertificationRunning} onClick={() => void inspectPriorSpo2()}>Inspect prior SpO2 certification IDs</button>
+        <button type="button" disabled={busy || spo2CertificationRunning || (!spo2SavedIds.length && !spo2Inspection?.some((item) => item.status !== 'NOT_FOUND'))}
+          onClick={() => void flushPriorSpo2()}>Flush existing SpO2 certification rows</button>
+        <button type="button" disabled={busy || spo2CertificationRunning || !ready || !spo2Inspection?.every((item) => item.status === 'NOT_FOUND')}
+          onClick={() => void captureTargetedSpo2()}>Capture + Queue + Targeted Deliver SpO2</button>
+      </div>
+      {spo2CertificationStage && <p role="status">{spo2CertificationStage}</p>}
+      {spo2CaptureCounts && <p>{spo2CaptureCounts.captured} observations captured
+        {' · '}{spo2CaptureCounts.queued === null ? 'Enqueue not yet confirmed' : `${spo2CaptureCounts.queued} observations durably queued`}</p>}
+      {spo2Inspection && <pre>{JSON.stringify(spo2Inspection, null, 2)}</pre>}
+      <h4>Focused certification delivery — wearable temperature (type 59)</h4>
+      <div className="wearable-actions">
+        <button type="button" disabled={busy || temperatureCertificationRunning} onClick={() => void inspectPersistedTemperature()}>Inspect persisted wearable temperature certification IDs</button>
+        <button type="button" disabled={busy || temperatureCertificationRunning || (!temperatureSavedIds.length && !temperatureInspection?.some((item) => item.status !== 'NOT_FOUND'))}
+          onClick={() => void flushPersistedTemperature()}>Flush existing wearable temperature certification rows</button>
+        <button type="button" disabled={busy || temperatureCertificationRunning || !ready}
+          onClick={() => void captureTargetedTemperature()}>Capture + Queue + Targeted Deliver Temperature</button>
+      </div>
+      {temperatureCertificationStage && <p role="status">{temperatureCertificationStage}</p>}
+      {temperatureCaptureCounts && <p>{temperatureCaptureCounts.captured} observations captured
+        {' · '}{temperatureCaptureCounts.queued === null ? 'Enqueue not yet confirmed' : `${temperatureCaptureCounts.queued} observations durably queued`}</p>}
+      {temperatureInspection && <pre>{JSON.stringify(temperatureInspection, null, 2)}</pre>}
+      <p>Elite+ V8 wearable temperature is skin-sensor temperature, not core/clinical/fever body
+        temperature. These explicit actions capture and await delivery for the selected metric without
+        changing the master toggle or other metric selections. Ordinary Sync buttons below retain their
+        existing capture-only behavior when the master toggle is off. Export JSON after completion and
+        STOP. For type 42, use the official grouped action below rather than the individual
+        metric certification controls.</p>
+      <Type42CertificationView
+        busy={busy || spo2CertificationRunning || temperatureCertificationRunning}
+        captureDisabledReason={!ready ? 'V8 not READY' : otherActiveMeasurement !== null
+          ? `${otherActiveMeasurement} active` : !sourceJournalScopeRef.current ? 'Journal scope unavailable' : null}
+        journalScopeAvailable={type42ContextRef.current !== null}
+        status={type42Status}
+        evidence={type42Evidence}
+        exportLocation={type42ExportLocation}
+        onCapture={() => void captureType42Certification()}
+        onInspect={() => void inspectType42Certification()}
+        onExport={() => void exportType42Certification()}
+      />
+      <Activity24_25CertificationView
+        service={activityCertificationRef.current}
+        busy={busy || spo2CertificationRunning || temperatureCertificationRunning}
+        captureDisabled={!ready || otherActiveMeasurement !== null || !type42ContextRef.current || !Capacitor.isNativePlatform() || pluginAvailable !== true}
+        onSendSavedActivityV2Verification={IS_ENGINEERING_BUILD ? sendSavedActivityV2Verification : undefined}
+        setBusy={setBusy}
+        setActiveSync={setActiveSync}
+        scopeKey={sourceJournalScopeRef.current ? `${ownerUserId}:${sourceJournalScopeRef.current.deviceScopeId}` : null}
+      />
+      <SleepCertificationView
+        service={sleepCertificationRef.current}
+        busy={busy || spo2CertificationRunning || temperatureCertificationRunning}
+        captureDisabled={!ready || otherActiveMeasurement !== null || !type42ContextRef.current || !Capacitor.isNativePlatform() || pluginAvailable !== true}
+        setBusy={setBusy}
+        setActiveSync={setActiveSync}
+        scopeKey={sourceJournalScopeRef.current ? `${ownerUserId}:${sourceJournalScopeRef.current.deviceScopeId}` : null}
+      />
+      <WorkoutHistoryCertificationView
+        service={workoutHistoryCertificationRef.current}
+        busy={busy || spo2CertificationRunning || temperatureCertificationRunning}
+        captureDisabled={!ready || otherActiveMeasurement !== null || !type42ContextRef.current || !Capacitor.isNativePlatform() || pluginAvailable !== true}
+        setBusy={setBusy}
+        setActiveSync={setActiveSync}
+        scopeKey={workoutHistoryCertificationRef.current.scopeKey()}
+      />
+      <section aria-label="PPI Certification">
+      <h4>PPI Certification</h4>
+      <p>Grouped physical certification (type 127). Viewing JSON requires no clipboard or file permissions.
+        File export is optional; use the full on-screen JSON for certification evidence.</p>
+      {savedPpiAvailable && <p role="status">Saved PPI certification available</p>}
+      <p>Inspection and export use saved evidence only, with no acquisition, enqueue, or Base44 request.
+        After restart, reconnect the same device only to establish journal scope; do not capture again.</p>
+      <p>Resume replays the last persisted physical PPI attempt from the connected journal: no syncHistoricalPpi()
+        call and no BLE history acquisition. On failure it reports the exact stage and never recaptures.</p>
+      <div className="wearable-actions">
+        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null || !type42ContextRef.current}
+          onClick={() => void capturePpiCertification()}>Capture + Queue + Targeted Deliver PPI</button>
+        <button type="button" disabled={busy} onClick={() => void resumePpiCertification()}>{PPI_RESUME_BUTTON_LABEL}</button>
+        <button type="button" disabled={busy} onClick={() => void inspectPpiCertification()}>Inspect Saved PPI Certification</button>
+        <button type="button" disabled={busy} onClick={() => void exportPpiCertification()}>Export PPI Certification JSON</button>
+        <button type="button" disabled={busy} onClick={() => void showPpiCertificationJson()}>Show PPI Certification JSON</button>
+        <button type="button" disabled={busy} onClick={() => void showPpiCertificationJson(false, true)}>Copy PPI Certification JSON</button>
+        <button type="button" disabled={busy || !ppiJson} onClick={() => void shareDisplayedPpiJson()}>Share / Save PPI JSON</button>
+        <button type="button" disabled={busy} onClick={() => void showPpiCertificationJson()}>Show Current PPI Certification JSON</button>
+        <button type="button" disabled={busy} onClick={() => void showPpiCertificationJson(true)}>Show Saved PPI Certification JSON</button>
+      </div>
+      {ppiCertificationStatus && <p role="status">{ppiCertificationStatus}</p>}
+      {ppiSnapshotStatus && <pre role="status">{ppiSnapshotStatus}</pre>}
+      {ppiCertificationExportLocation && <p>{ppiCertificationExportLocation}</p>}
+      {ppiShareStatus && <p role="status">{ppiShareStatus}</p>}
+      <PpiCertificationJsonView evidence={ppiJson} />
+      <section aria-label="PPI Certification Attempt Diagnostic">
+        <h5>PPI Certification Attempt Diagnostic</h5>
+        <p>Diagnostic only, never certification success. No automatic reacquisition.
+          After restart, reconnect the same device and show the last attempt.</p>
+        <div className="wearable-actions">
+          <button type="button" disabled={busy} onClick={() => void showPpiAttempt()}>Show Last PPI Certification Attempt</button>
+          <button type="button" disabled={busy} onClick={() => void showPpiAttempt(true)}>Copy Last PPI Certification Attempt</button>
+          <button type="button" disabled={busy || !ppiAttemptJson} onClick={() => void shareDisplayedPpiJson(true)}>Share / Save Last PPI Certification Attempt</button>
+        </div>
+        {ppiAttemptStatus && <p role="status">{ppiAttemptStatus}</p>}
+        {ppiAttemptShareStatus && <p role="status">{ppiAttemptShareStatus}</p>}
+        {ppiAttempt && <pre role="status" style={{ maxHeight: '30rem', overflow: 'auto', whiteSpace: 'pre-wrap' }}>
+          {serializeCertificationJson(ppiAttempt)}
+        </pre>}
+        <PpiCertificationJsonView evidence={ppiAttemptJson} label="Full PPI Certification Attempt JSON" />
+      </section>
+      {ppiCertificationEvidence && <details><summary>Saved PPI certification evidence</summary><pre>{ppiCertificationEvidence}</pre></details>}
+      </section>
+      <section aria-label="Read-Only Recovery Tools" style={{ borderTop: '2px solid', marginTop: '1.5rem', paddingTop: '1rem' }}>
+      <h4>Read-Only Recovery Tools</h4>
+      <p>Recovery is read-only: it lists only PPI certification keys and the connected owner/device L0 journal, and never
+        acquires, enqueues, sends, or rewrites a snapshot. With several journal candidates, enter one sourceEnvelopeId.</p>
+      <div className="wearable-actions">
+        <label>Candidate sourceEnvelopeId (optional){' '}
+          <input type="text" value={ppiRecoveryEnvelopeId} onChange={(event) => setPpiRecoveryEnvelopeId(event.target.value)} />
+        </label>
+        <button type="button" disabled={busy} onClick={() => void findSavedPpiCertification()}>Find Saved PPI Certification</button>
+        <button type="button" disabled={busy} onClick={() => void exportRecoveredPpiCertification()}>Export Recovered PPI Certification JSON</button>
+      </div>
+      {ppiRecoveryStatus && <p role="status">{ppiRecoveryStatus}</p>}
+      {ppiRecoveryExportLocation && <p>{ppiRecoveryExportLocation}</p>}
+      {ppiRecoveryReport && <details><summary>PPI saved-key and journal recovery report</summary><pre>{ppiRecoveryReport}</pre></details>}
+      </section>
+      <p>Individual metric certification controls below are diagnostics only, not the grouped type-42 or PPI physical certification paths.</p>
+      <div className="wearable-actions">
+        {PHYSIOLOGY_CERTIFICATION_ACTIONS.filter(({ metric }) => metric !== 'spo2' && metric !== 'wearableTemperature').map(({ key, metric, label, action }) =>
+          <button key={metric} type="button" disabled={busy || spo2CertificationRunning || temperatureCertificationRunning || !ready || otherActiveMeasurement !== null}
+            onClick={() => void runSync(key, action, { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: metric })}>
+            Certify {label} + Deliver
+          </button>)}
+      </div>
+      <div className="wearable-actions">
+        <button type="button" disabled title="Certification reuses existing HR evidence; do not reacquire full history.">Historical HR: preserved evidence only</button>
+        <button type="button" disabled={busy || spo2CertificationRunning || !ready || otherActiveMeasurement !== null} onClick={() => void runSync('spo2', () => JCVitalV8.syncHistoricalSpo2())}>Sync SpO2</button>
+        <button type="button" disabled={busy || temperatureCertificationRunning || !ready || otherActiveMeasurement !== null} onClick={() => void runSync('temperature', () => JCVitalV8.syncHistoricalTemperature())}>Sync Temperature</button>
+        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void runSync('hrv', () => JCVitalV8.syncHistoricalHrv())}>Sync HRV / Stress / Estimated BP (type 42)</button>
+        <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void runSync('ppi', () => JCVitalV8.syncHistoricalPpi())}>Sync PPI (type 127)</button>
         <button type="button" disabled={busy || !ready || otherActiveMeasurement !== null} onClick={() => void syncMonitoringConfiguration()}>Sync Automatic Monitoring / Configuration</button>
         <div className="diagnostic-control">
           <button type="button" disabled={phase3bDisabledReasons.activity !== null} onClick={() => void runPhase3BSync('activity', () => JCVitalV8.syncHistoricalActivity())}>Sync Activity</button>
@@ -980,10 +1982,10 @@ export function JCVitalV8Panel() {
           {phase3bDisabledReasons.sleep && <small>Disabled: {phase3bDisabledReasons.sleep}</small>}
         </div>
         <div className="diagnostic-control">
-          <button type="button" disabled={phase3bDisabledReasons.workouts !== null} onClick={() => void runPhase3BSync('workouts', () => JCVitalV8.syncHistoricalWorkouts())}>Sync Workouts</button>
-          {phase3bDisabledReasons.workouts && <small>Disabled: {phase3bDisabledReasons.workouts}</small>}
+          <p>VC25 workout history uses the dedicated one-shot certification controls above, not generic delivery sync.</p>
         </div>
-        <button type="button" className="secondary" disabled={!Object.keys(historicalRuns).length && !monitoringRun && !Object.keys(phase3bRuns).length && !sleepRun.stages && !sleepRun.movement && !workoutSession} onClick={() => void exportValidationReport()}>Export Phase 3A/3B/3C Validation JSON</button>
+        <button type="button" disabled={busy || hrDeliveryTestDisabledReason({ workoutStartReason, queueStoreInitialized: queueDiagnostics.queueStoreInitialized, queueHealth: deliveryQueueHealth, connectorRegistered }) !== null} onClick={() => void startHrDeliveryTest(180_000)}>Certify Live Workout HR (3 minutes)</button>
+        <button type="button" className="secondary" disabled={exportStatus === 'EXPORTING'} onClick={() => void exportValidationReport()}>Export Phase 3A/3B/3C Validation JSON</button>
       </div>
       <div className="phase3b-bridge-status">
         <strong>Phase 3B bridge</strong>
@@ -1035,13 +2037,28 @@ export function JCVitalV8Panel() {
           uiDiagnostics={rawPpgUiDiagnostics}
           renderErrors={rawPpgRenderErrors}
           now={rawPpgClock}
-          startDisabledReason={rawPpgStartReason}
+          startDisabledReason={RAW_PPG_LEGACY_START_DISABLED_REASON}
           stopDisabledReason={rawPpgStopReason}
           busy={busy}
           onStart={() => void startRawPpg()}
           onStop={() => void stopRawPpg()}
         />
       </PpgDiagnosticErrorBoundary>
+      <RawPpgPhysicalCertificationControls
+        key={`${ownerUserId}|${sourceJournalScopeRef.current?.deviceScopeId ?? ''}`}
+        service={rawPpgPhysicalCertificationRef.current}
+        scopeKey={`${ownerUserId}|${state}`}
+        gate={{
+          native: Capacitor.isNativePlatform(),
+          pluginAvailable,
+          ready,
+          authenticated: Boolean(ownerUserId),
+          busy,
+          otherActiveMeasurement: otherActiveMeasurement ?? (workoutActive ? 'workout capture' : null),
+        }}
+        subscribe={subscribeRawPpgCertification}
+      />
+      <RawPpgSavedEvidenceControls service={rawPpgSavedEvidenceServiceRef.current} disabled={busy} />
       <div className="wearable-actions">
         <div className="diagnostic-control">
           <button type="button" disabled={rawEcgStartReason !== null || busy} title={rawEcgStartReason ?? 'Start raw ECG capture'} onClick={() => void startRawEcg()}>Start ECG</button>
@@ -1167,3 +2184,5 @@ export function JCVitalV8Panel() {
     </section>
   )
 }
+
+export default JCVitalV8Panel

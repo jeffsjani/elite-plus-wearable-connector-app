@@ -4,20 +4,46 @@
   background: #f3f0e8;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
-* {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
 }
 
 html,
 body,
 #root {
-  min-width: 320px;
-  min-height: 100%;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   margin: 0;
 }
 
+html,
 body {
-  min-height: 100vh;
+  overflow-x: clip;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+#root {
+  min-height: 100dvh;
+}
+
+button {
+  min-height: 44px;
+  font-size: 1rem;
+}
+
+input,
+select {
+  min-height: 48px;
+  font-size: 1rem;
 }

@@ -6,7 +6,7 @@ import { connectorIdentityService } from '../../services/base44/ConnectorIdentit
 import { connectorObservationService } from '../../services/base44/ConnectorObservationService'
 import type { ConnectorObservationResult, ConnectorObservationsRequest, ConnectorObservationsResponse, NativeObservationInput } from '../../services/base44/base44Types'
 import { JCVitalDeviceIdentityService } from '../../services/storage/JCVitalDeviceIdentityService'
-import { ObservationBatchManager } from '../../services/sync/ObservationBatchManager'
+import { MAX_CONCURRENCY, ObservationBatchManager } from '../../services/sync/ObservationBatchManager'
 import { observationQueue } from '../../services/sync/ObservationQueue'
 import type { NetworkStatus } from '../../services/sync/NetworkStatus'
 import type { JCVitalV8HistoricalSyncResult } from './jcvitalV8Bridge'
@@ -14,6 +14,7 @@ import { mapPhysiologyObservation, PHYSIOLOGY_CONTRACTS, type PhysiologyMappingO
 import { JCVitalPhysiologyDelivery } from './PhysiologyDelivery'
 import { sha256Hex } from './HeartRateSeries'
 import { buildWorkoutHrObservation } from './WorkoutHrDelivery'
+import { buildJCVitalCertification, CertificationDeliveryEvidence } from './JCVitalCertification'
 
 const MAC = 'E7:1B:D8:36:78:CF'
 const OPAQUE_ID = 'jcvital_device_3f2b8c1e-9a4d-4b6e-8f10-2c3d4e5f6a7b'
@@ -81,6 +82,36 @@ async function mapOne(observation: NativeObservation): Promise<NativeObservation
 }
 
 describe('Build 5B-1 metric mapping', () => {
+  it('links type-42 siblings to one local envelope without changing scalar IDs, payloads or canonical policy', async () => {
+    const siblings = hrvRecord('2026.10.01 07:00:00', '2026-10-01T11:00:00.000Z')
+    const envelopeId = 'source-envelope-type42'
+    const original = (await Promise.all(siblings.map((item) => mapPhysiologyObservation('user-1', item, context)))).flat()
+    const linked = (await Promise.all(siblings.map((item) => mapPhysiologyObservation('user-1', {
+      ...item, provenance: { ...item.provenance, sourceEnvelopeId: envelopeId },
+    }, context)))).flat()
+    expect(mapped(linked)).toEqual(mapped(original))
+    expect(mapped(linked)).toHaveLength(4)
+    for (const outcome of linked) {
+      if (outcome.status === 'MAPPED') {
+        expect(outcome.sourceEnvelopeId).toBe(envelopeId)
+        expect(outcome.observation.rawSourceMetadata?.canonicalPolicy).toBe('NATIVE_ONLY')
+        expect(JSON.stringify(outcome.observation)).not.toContain(envelopeId)
+      }
+    }
+    expect(linked.filter((item) => item.status === 'MAPPED').map((item) => item.observation.metric))
+      .not.toContain('heartRate')
+  })
+
+  it('links every PPI slot including zeros without adding timing semantics or changing uploads', async () => {
+    const original = await mapPhysiologyObservation('user-1', ppiGroup, context)
+    const linked = await mapPhysiologyObservation('user-1', {
+      ...ppiGroup, provenance: { ...ppiGroup.provenance, sourceEnvelopeId: 'source-envelope-ppi' },
+    }, context)
+    expect(mapped(linked)).toEqual(mapped(original))
+    expect(mapped(linked).map((item) => item.valueNumber)).toEqual(ppiValues)
+    expect(linked.every((item) => item.status === 'MAPPED' && item.sourceEnvelopeId === 'source-envelope-ppi')).toBe(true)
+  })
+
   it('maps historical continuous HR with source timestamps and the 5-second interval', async () => {
     const [first, second] = await Promise.all(hrSeries('2026.10.01 08:00:00', '2026-10-01T12:00:00.000Z', [62, 64]).map(mapOne))
     expect(first).toMatchObject({
@@ -284,6 +315,9 @@ class FakeBase44 {
 
 const online: NetworkStatus = { isOnline: () => true, subscribe: () => () => undefined }
 let counter = 0
+let certificationSamples: NativeObservationInput[][]
+let enqueueFinished = false
+let certificationEvidenceWasPersistedAfterEnqueue: boolean[]
 
 describe('Build 5B-1 delivery through the Build 5A queue and batch sender', () => {
   let backend: FakeBase44
@@ -292,6 +326,23 @@ describe('Build 5B-1 delivery through the Build 5A queue and batch sender', () =
 
   async function syncAll(): Promise<void> { for (const feed of allFeeds()) await delivery.deliverSyncResult(feed) }
 
+  function attachDelivery(): JCVitalPhysiologyDelivery {
+    const identity = new JCVitalDeviceIdentityService(() => new TestStorage())
+    const nextDelivery = new JCVitalPhysiologyDelivery({
+      queue: observationQueue, deliver: () => manager.process(), subscribe: (listener) => manager.subscribe(listener), resolveDeviceId: (address) => identity.resolve(address),
+      deliveryDiagnostics: () => manager.getDeliveryDiagnostics(),
+      flushCertification: (ids) => manager.flushCertificationObservationIds(ids),
+      rememberCertification: (observations) => {
+        certificationSamples.push(observations)
+        certificationEvidenceWasPersistedAfterEnqueue.push(enqueueFinished)
+      },
+    })
+    nextDelivery.setContext({ bleAddress: MAC, firmwareVersion: '0.0.8.8', sdkVersion: 'v8sdk2.0' })
+    nextDelivery.setEnabled(true)
+    nextDelivery.start()
+    return nextDelivery
+  }
+
   beforeEach(async () => {
     Object.assign(globalThis, { localStorage: new TestStorage() })
     observationQueue.setOwnerUserId(`physiology-${Date.now()}-${counter++}`)
@@ -299,16 +350,32 @@ describe('Build 5B-1 delivery through the Build 5A queue and batch sender', () =
     connectorIdentityService.setConnectorDeviceId('device-test')
     vi.spyOn(authenticationService, 'isAuthenticated').mockResolvedValue(true)
     backend = new FakeBase44()
+    certificationSamples = []
+    enqueueFinished = false
+    certificationEvidenceWasPersistedAfterEnqueue = []
     manager = new ObservationBatchManager({ retryBaseMs: 0, retryMaxMs: 0, requestTimeoutMs: 50 }, online)
-    const identity = new JCVitalDeviceIdentityService(() => new TestStorage())
-    delivery = new JCVitalPhysiologyDelivery({
-      queue: observationQueue, deliver: () => manager.process(), subscribe: (listener) => manager.subscribe(listener), resolveDeviceId: (address) => identity.resolve(address),
-    })
-    delivery.setContext({ bleAddress: MAC, firmwareVersion: '0.0.8.8', sdkVersion: 'v8sdk2.0' })
-    delivery.setEnabled(true)
-    delivery.start()
+    delivery = attachDelivery()
   })
   afterEach(() => { delivery.dispose(); vi.restoreAllMocks() })
+
+  it('keeps envelope links local across durable enqueue and sends the unchanged scalar contract', async () => {
+    const siblings = hrvRecord('2026.10.01 07:00:00', '2026-10-01T11:00:00.000Z').map((item) => ({
+      ...item, provenance: { ...item.provenance, sourceEnvelopeId: 'source-envelope-type42' },
+    }))
+    const enqueue = vi.spyOn(observationQueue, 'enqueueMany')
+    vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => backend.accept(request))
+    await delivery.deliverSyncResult(syncResult('42', siblings))
+    const references = enqueue.mock.calls[0][1]
+    expect(references?.size).toBe(4)
+    expect([...references!.values()]).toEqual(Array(4).fill('source-envelope-type42'))
+    expect(backend.requests).toHaveLength(1)
+    expect(JSON.stringify(backend.requests)).not.toContain('source-envelope-type42')
+    expect(JSON.stringify(backend.requests)).not.toContain('sourceEnvelopeId')
+    expect(backend.requests[0].observations.map((item) => item.metric)).toEqual([
+      'hrvVendor', 'stressVendor', 'bloodPressureSystolicEstimated', 'bloodPressureDiastolicEstimated',
+    ])
+    expect(MAX_CONCURRENCY).toBe(1)
+  })
 
   it('does nothing while disabled', async () => {
     const upload = vi.spyOn(connectorObservationService, 'submitObservations')
@@ -316,6 +383,274 @@ describe('Build 5B-1 delivery through the Build 5A queue and batch sender', () =
     await syncAll()
     expect(upload).not.toHaveBeenCalled()
     expect((await observationQueue.getQueueStats()).pending).toBe(0)
+  })
+
+  it('keeps explicit CAPTURE_ONLY delivery off, regardless of the master toggle', async () => {
+    const upload = vi.spyOn(connectorObservationService, 'submitObservations')
+    for (const enabled of [false, true]) {
+      delivery.setEnabled(enabled)
+      const report = await delivery.deliverSyncResult(allFeeds()[1], { deliveryMode: 'CAPTURE_ONLY' })
+      expect(report).toMatchObject({ delivered: false, mapped: 0, reason: 'capture only' })
+      expect(delivery.isEnabled()).toBe(enabled)
+    }
+    expect(upload).not.toHaveBeenCalled()
+    expect(delivery.getSnapshot().metrics.spo2.captured).toBe(0)
+  })
+
+  it('durably queues a 160-row capture but targeted-delivers only the first five exact SpO2 IDs', async () => {
+    delivery.setEnabled(false)
+    const feed = syncResult('68', Array.from({ length: 160 }, (_, index) => native(
+      'SPO2', '68', 'Blood_oxygen', 97, `record-${index}`, new Date(Date.parse(RECEIPT) + index * 1800_000).toISOString(),
+    )))
+    vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => backend.accept(request))
+    const report = await delivery.deliverSyncResult(feed, { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'spo2' })
+    expect(report).toMatchObject({ delivered: true, mapped: 160, queued: 160 })
+    expect(report.observations).toHaveLength(5)
+    expect(backend.requests).toHaveLength(1)
+    expect(backend.requests[0].observations.map((row) => row.observationId)).toEqual(report.observations?.map((row) => row.observationId))
+    expect(await observationQueue.getQueueStats()).toMatchObject({ pending: 155, inFlight: 0, failed: 0 })
+    expect(delivery.getSnapshot().metrics.spo2).toMatchObject({ captured: 160, queued: 160, serverAccepted: 5, canonicalized: 5, canonicalFailed: 0 })
+    expect(delivery.isEnabled()).toBe(false)
+  })
+
+  it('queues all temperature observations but targets exactly five durable canonical rows', async () => {
+    delivery.setEnabled(false)
+    const observations = Array.from({ length: 6 }, (_, index) => native(
+      'WEARABLE_TEMPERATURE', '59', 'temperature', 32 + index / 10,
+      `2026.10.01 08:${String(index).padStart(2, '0')}:00`,
+      `2026-10-01T12:${String(index).padStart(2, '0')}:00.000Z`,
+    ))
+    const feed = syncResult('59', observations)
+    const originalEnqueueMany = observationQueue.enqueueMany.bind(observationQueue)
+    vi.spyOn(observationQueue, 'enqueueMany').mockImplementation(async (rows) => {
+      const result = await originalEnqueueMany(rows)
+      enqueueFinished = true
+      return result
+    })
+    vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => backend.accept(request))
+
+    const report = await delivery.deliverSyncResult(feed, { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'wearableTemperature' })
+
+    expect(report).toMatchObject({ delivered: true, mapped: 6, queued: 6, reason: null, certificationMetric: 'wearableTemperature' })
+    expect(report.observations).toHaveLength(5)
+    expect(certificationSamples).toHaveLength(1)
+    expect(certificationSamples[0]).toHaveLength(5)
+    expect(certificationEvidenceWasPersistedAfterEnqueue).toEqual([true])
+    expect(backend.requests).toHaveLength(1)
+    expect(backend.requests[0].observations).toHaveLength(5)
+    expect(backend.requests[0].observations.map((row) => row.observationId)).toEqual(certificationSamples[0].map((row) => row.observationId))
+    expect(backend.requests[0].observations.map((row) => row.valueNumber)).toEqual([32, 32.1, 32.2, 32.3, 32.4])
+    expect(backend.requests[0].observations.every((row) => row.acquisitionMode === 'HISTORICAL_SYNC' && row.vendorDerived === false)).toBe(true)
+    expect(await observationQueue.getQueueStats()).toMatchObject({ pending: 1, inFlight: 0, failed: 0, canonicalRecoveryRequired: false })
+    expect(MAX_CONCURRENCY).toBe(1)
+  })
+
+  it('does not report temperature certification delivered or send a partial sample below five rows', async () => {
+    delivery.setEnabled(false)
+    const feed = syncResult('59', Array.from({ length: 4 }, (_, index) => native(
+      'WEARABLE_TEMPERATURE', '59', 'temperature', 32 + index / 10,
+      `2026.10.01 08:${String(index).padStart(2, '0')}:00`,
+      `2026-10-01T12:${String(index).padStart(2, '0')}:00.000Z`,
+    )))
+    const upload = vi.spyOn(connectorObservationService, 'submitObservations')
+
+    const report = await delivery.deliverSyncResult(feed, { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'wearableTemperature' })
+
+    expect(report.delivered).toBe(false)
+    expect(report.reason).toContain('requires five valid observations')
+    expect(report.observations).toHaveLength(4)
+    expect(certificationSamples[0]).toHaveLength(4)
+    expect(upload).not.toHaveBeenCalled()
+    expect(await observationQueue.getQueueStats()).toMatchObject({ pending: 4, inFlight: 0 })
+  })
+
+  it('delivers only exact SpO2 IDs with master off and leaves all global selections unchanged', async () => {
+    delivery.setEnabled(false)
+    const before = delivery.getSnapshot()
+    const feed = syncResult('68', allFeeds().flatMap((result) => result.observations))
+    const owner = observationQueue.getOwnerUserId()!
+    const deviceContext = { ...context, deviceId: before.backendDeviceId }
+    const expected = (await Promise.all(feed.observations.filter((item) => item.vendorDataType === '68')
+      .map((item) => mapPhysiologyObservation(owner, item, deviceContext)))).flatMap(mapped)
+    vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => backend.accept(request))
+    const report = await delivery.deliverSyncResult(feed, { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'spo2' })
+    expect(report).toMatchObject({ delivered: true, mapped: 4, queued: 4, reason: null, certificationMetric: 'spo2' })
+    expect(report.observations?.map((item) => item.observationId)).toEqual(expected.map((item) => item.observationId))
+    expect(report.observations?.map((item) => item.sourceRecordId)).toEqual(expected.map((item) => item.sourceRecordId))
+    expect(report.observations?.every((item) => item.state === 'DELIVERED_CANONICALIZED' && item.queueState === null && item.queueDisposition === 'ACKNOWLEDGED_PURGED')).toBe(true)
+    expect([...backend.nativeObservations.values()]).toEqual(expected)
+    const snapshot = delivery.getSnapshot()
+    expect(snapshot.enabled).toBe(false)
+    expect(snapshot.enabledMetrics).toEqual(before.enabledMetrics)
+    expect(snapshot.metrics.spo2).toMatchObject({ captured: 4, queued: 4, serverAccepted: 4, canonicalized: 4, canonicalFailed: 0, failed: 0 })
+    expect(snapshot.lastNativeObservationIds.spo2).toMatch(/^native-/)
+    for (const key of before.enabledMetrics.filter((key) => key !== 'spo2')) expect(snapshot.metrics[key].captured).toBe(0)
+    expect(MAX_CONCURRENCY).toBe(1)
+    expect(manager.getDeliveryDiagnostics()).toMatchObject({ configuredConcurrency: 1, effectiveConcurrency: 1 })
+    expect(backend.requests.every((request) => request.observations.length <= 100)).toBe(true)
+    await delivery.deliverSyncResult(allFeeds()[2])
+    expect(backend.requests).toHaveLength(1)
+  })
+
+  it.each(['hrv', 'stress', 'estimatedBp'] as const)('scopes type-42 certification to %s, excluding its companions', async (metric) => {
+    delivery.setEnabled(false)
+    vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => backend.accept(request))
+    const report = await delivery.deliverSyncResult(allFeeds()[3], { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: metric })
+    const types = PHYSIOLOGY_CONTRACTS.filter((contract) => contract.key === metric).map((contract) => contract.metricType)
+    expect([...backend.nativeObservations.values()].every((row) => types.includes(row.metricType!))).toBe(true)
+    expect(report.delivered).toBe(true)
+    expect(report.observations?.every((item) => item.state === 'DELIVERED_NATIVE_ONLY')).toBe(true)
+    expect(delivery.isEnabled()).toBe(false)
+  })
+
+  it('does not persist a certification selection or alter disabled metric checkboxes', async () => {
+    delivery.setEnabled(false)
+    delivery.setMetricEnabled('spo2', false)
+    const before = delivery.getSnapshot().enabledMetrics
+    vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => backend.accept(request))
+    expect((await delivery.deliverSyncResult(allFeeds()[1], { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'spo2' })).delivered).toBe(true)
+    expect(delivery.getSnapshot().enabledMetrics).toEqual(before)
+    expect(delivery.isEnabled()).toBe(false)
+    expect((await delivery.deliverSyncResult(allFeeds()[1])).mapped).toBe(0)
+  })
+
+  it('waits for an already busy shared sender rather than reporting capture as delivery', async () => {
+    delivery.dispose()
+    manager = new ObservationBatchManager({ retryBaseMs: 0, retryMaxMs: 0, requestTimeoutMs: 5000 }, online)
+    delivery.start()
+    delivery.setEnabled(false)
+    const hrBacklog = mapped(await mapPhysiologyObservation(observationQueue.getOwnerUserId()!, allFeeds()[0].observations[0], {
+      ...context, deviceId: delivery.getSnapshot().backendDeviceId,
+    }))
+    await observationQueue.enqueueMany(hrBacklog)
+    let release: (() => void) | undefined
+    const held = new Promise<void>((resolve) => { release = resolve })
+    const submit = vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => {
+      if (request.observations[0].vendorDataType === '27') await held
+      return backend.accept(request)
+    })
+    const backlogPass = manager.process()
+    await vi.waitFor(() => expect(submit).toHaveBeenCalledTimes(1))
+    expect(submit.mock.calls[0][0].observations).toHaveLength(1)
+    let completed = false
+    const pending = delivery.deliverSyncResult(allFeeds()[1], { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'spo2' })
+      .then((report) => { completed = true; return report })
+    await vi.waitFor(() => expect(delivery.getSnapshot().metrics.spo2.queued).toBe(4))
+    expect(completed).toBe(false)
+    expect(delivery.getSnapshot().metrics.spo2.serverAccepted).toBe(0)
+    release!()
+    await backlogPass
+    expect((await pending).delivered).toBe(true)
+    expect(backend.requests.map((request) => request.observations[0].vendorDataType)).toEqual(['27', '68'])
+    expect(delivery.getSnapshot().metrics.spo2.serverAccepted).toBe(4)
+    expect(delivery.getSnapshot().metrics.heartRateHistory.serverAccepted).toBe(0)
+  })
+
+  it('reports QUEUED without claiming success when the sender is offline', async () => {
+    delivery.setEnabled(false)
+    vi.spyOn(online, 'isOnline').mockReturnValue(false)
+    const upload = vi.spyOn(connectorObservationService, 'submitObservations')
+    const report = await delivery.deliverSyncResult(allFeeds()[1], { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'spo2' })
+    expect(report.delivered).toBe(false)
+    expect(report.reason).toContain('No eligible certification rows')
+    expect(report.observations?.every((item) => item.state === 'QUEUED' && item.queueState === 'PENDING')).toBe(true)
+    expect(upload).not.toHaveBeenCalled()
+  })
+
+  it('keeps certification canonical failures in recovery and pauses the shared sender safely', async () => {
+    delivery.setEnabled(false)
+    backend.canonicalFailMetric = 'oxygenSaturation'
+    vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => backend.accept(request))
+    const report = await delivery.deliverSyncResult(allFeeds()[1], { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'spo2' })
+    expect(report.delivered).toBe(false)
+    expect(report.observations?.every((item) => item.state === 'CANONICAL_FAILED' && item.queueState === 'CANONICAL_RECOVERY_REQUIRED')).toBe(true)
+    expect(manager.getDeliveryDiagnostics()).toMatchObject({ queuePausedForCanonicalFailure: true, pauseReason: 'CANONICAL_RECOVERY_REQUIRED', effectiveConcurrency: 1 })
+    expect(delivery.getSnapshot().metrics.spo2).toMatchObject({ serverAccepted: 4, canonicalized: 0, canonicalFailed: 4, failed: 0 })
+    expect(await manager.process()).toBeNull()
+  })
+
+  it.each([null, 'native-existing'])('attributes duplicates and preserves only a returned native ID (%s)', async (nativeObservationId) => {
+    delivery.setEnabled(false)
+    vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => ({
+      ...backend.accept(request), accepted: 0, duplicate: request.observations.length,
+      results: request.observations.map(({ observationId }) => ({ observationId, status: 'duplicate', canonicalStatus: null, nativeObservationId })),
+    }))
+    const report = await delivery.deliverSyncResult(allFeeds()[1], { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'spo2' })
+    expect(report.delivered).toBe(true)
+    expect(report.observations?.every((item) => item.state === 'DELIVERED_DUPLICATE' && item.nativeObservationId === nativeObservationId)).toBe(true)
+    expect(delivery.getSnapshot().metrics.spo2).toMatchObject({ serverAccepted: 0, serverDuplicate: 4, canonicalized: 0, canonicalFailed: 0 })
+    expect(delivery.getSnapshot().lastNativeObservationIds.spo2).toBe(nativeObservationId)
+  })
+
+  it('exports capture, awaited exact delivery and final queue state separately, ignoring HR totals', async () => {
+    delivery.setEnabled(false)
+    const evidence = new CertificationDeliveryEvidence()
+    const unsubscribe = manager.subscribe((event) => evidence.record(observationQueue.getOwnerUserId(), event))
+    const feed = allFeeds()[1]
+    vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => backend.accept(request))
+    const report = await delivery.deliverSyncResult(feed, { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'spo2' })
+    unsubscribe()
+    const certification = await buildJCVitalCertification({
+      ownerUserId: observationQueue.getOwnerUserId(),
+      physiologyContext: { ...context, deviceId: delivery.getSnapshot().backendDeviceId }, workoutContext: { ...context, vendorActivityMode: null },
+      historicalRuns: { spo2: { requestStartedAt: RECEIPT, requestCompletedAt: RECEIPT, result: feed, error: null,
+        certificationDelivery: { completedAt: RECEIPT, report } } },
+      deliveryEvidence: evidence.snapshot(observationQueue.getOwnerUserId()), readQueueRecord: (id) => observationQueue.getRecord(id),
+    })
+    expect(certification.spo2.physicalCaptureStatus).toBe('CAPTURED')
+    for (const sample of certification.spo2.sampleObservations) {
+      expect(sample).toMatchObject({ deliveryState: 'DELIVERED_CANONICALIZED', queueState: null, queueDisposition: 'ACKNOWLEDGED_PURGED',
+        canonicalTarget: 'body.oxygen_saturation', vendorDataType: '68', unit: 'percent',
+        deliveryResult: { acknowledged: true, result: { observationId: sample.observationId, status: 'accepted', canonicalStatus: 'canonicalized' } } })
+      expect(sample.nativeObservationId).toMatch(/^native-/)
+      expect(report.observations?.some((item) => item.observationId === sample.observationId && item.sourceRecordId === sample.sourceRecordId)).toBe(true)
+    }
+    expect(certification.handoff.find((item) => item.METRIC === 'spo2')?.samples[0]).toMatchObject({
+      DELIVERY_STATE: 'DELIVERED_CANONICALIZED', QUEUE_STATE: null, QUEUE_DISPOSITION: 'ACKNOWLEDGED_PURGED', NATIVE_OBSERVATION_ID: expect.stringMatching(/^native-/),
+    })
+    expect(certification.baseline.deploymentRevision).toBe('nc-observations-5b1-results-2026-10-03-r4')
+    const withoutScreenEvidence = await buildJCVitalCertification({
+      ownerUserId: observationQueue.getOwnerUserId(),
+      physiologyContext: { ...context, deviceId: delivery.getSnapshot().backendDeviceId }, workoutContext: { ...context, vendorActivityMode: null },
+      historicalRuns: { spo2: { requestStartedAt: RECEIPT, requestCompletedAt: RECEIPT, result: feed, error: null,
+        certificationDelivery: { completedAt: RECEIPT, report } } },
+    })
+    expect(withoutScreenEvidence.spo2.sampleObservations.every((sample) =>
+      sample.deliveryResult?.result?.observationId === sample.observationId && sample.deliveryState === 'DELIVERED_CANONICALIZED')).toBe(true)
+  })
+
+  it('reports FAILED for an enqueue error without changing the master toggle', async () => {
+    delivery.setEnabled(false)
+    vi.spyOn(observationQueue, 'enqueueMany').mockRejectedValue(new Error('SQLite write failed'))
+    const report = await delivery.deliverSyncResult(allFeeds()[1], { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'spo2' })
+    expect(report).toMatchObject({ delivered: false, reason: 'SQLite write failed', queued: 0 })
+    expect(report.observations?.every((item) => item.state === 'FAILED' && item.deliveryResult === null && item.queueState === null)).toBe(true)
+    expect(delivery.isEnabled()).toBe(false)
+  })
+
+  it('reports exact certification rejections without a delivery success', async () => {
+    delivery.setEnabled(false)
+    vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => {
+      for (const row of request.observations) backend.rejectIds.add(row.observationId)
+      return backend.accept(request)
+    })
+    const report = await delivery.deliverSyncResult(allFeeds()[1], { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'spo2' })
+    expect(report.delivered).toBe(false)
+    expect(report.observations?.every((item) => item.state === 'REJECTED' && item.queueState === 'FAILED_PERMANENT'
+      && item.deliveryResult?.result?.status === 'rejected')).toBe(true)
+    expect(delivery.getSnapshot().metrics.spo2).toMatchObject({ serverRejected: 4, failed: 4, canonicalized: 0 })
+  })
+
+  it('does not turn acknowledgement without results[] into proven certification delivery', async () => {
+    delivery.setEnabled(false)
+    backend.legacy = true
+    vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => backend.accept(request))
+    const report = await delivery.deliverSyncResult(allFeeds()[1], { deliveryMode: 'CERTIFICATION_DELIVER', certificationMetric: 'spo2' })
+    expect(report.delivered).toBe(false)
+    expect(report.observations?.every((item) => item.state === 'QUEUED')).toBe(true)
+    expect(report.observations?.every((item) => ['PENDING', 'IN_FLIGHT', 'RETRY_WAIT'].includes(item.queueState ?? ''))).toBe(true)
+    expect(report.observations?.every((item) => item.deliveryResult?.result === null)).toBe(true)
+    expect(delivery.getSnapshot().metrics.spo2.canonicalized).toBe(0)
   })
 
   it('batches mixed metrics through nativeConnectorObservations at ≤100 per request', async () => {
@@ -405,22 +740,29 @@ describe('Build 5B-1 delivery through the Build 5A queue and batch sender', () =
     expect(delivery.getSnapshot().metrics.spo2).toMatchObject({ serverRejected: 1, failed: 1, uniqueObservationsDelivered: 3 })
   })
 
-  it('falls back to batch totals and errors[] when a legacy response has no results[]', async () => {
+  it('keeps a legacy response without results[] retryable instead of trusting batch totals', async () => {
+    delivery.dispose()
+    manager = new ObservationBatchManager({ retryBaseMs: 5_000, retryMaxMs: 5_000, requestTimeoutMs: 50 }, online)
+    delivery = attachDelivery()
     backend.legacy = true
     vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => {
       backend.rejectIds.add(request.observations[0].observationId)
       return backend.accept(request)
     })
-    await delivery.deliverSyncResult(allFeeds()[1])
-    const snapshot = delivery.getSnapshot()
-    expect(snapshot.metrics.spo2).toMatchObject({ serverAccepted: 3, serverRejected: 1, failed: 1, uniqueObservationsDelivered: 3, canonicalized: 0 })
-    expect(snapshot.outcomeCounts).toMatchObject({ DELIVERED: 3, REJECTED: 1 })
-    expect(snapshot.lastRejection).toMatchObject({ metric: 'spo2', reason: 'valueNumber out of range' })
+    const report = await delivery.deliverSyncResult(allFeeds()[1])
+    expect(report.queued).toBe(4)
+    expect(backend.requests).toHaveLength(1)
+    expect(delivery.getSnapshot().metrics.spo2).toMatchObject({ serverAccepted: 3, serverRejected: 0, uniqueObservationsDelivered: 0 })
+    expect((await observationQueue.getQueueStats()).retrying).toBe(4)
   })
 
   it('parses the production results[] shape into exact per-metric counters for mixed batches', async () => {
     const upload = vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => backend.accept(request))
     await syncAll()
+    await vi.waitFor(async () => {
+      const stats = await observationQueue.getQueueStats()
+      expect(stats.pending + stats.inFlight + stats.retrying + stats.failed).toBe(0)
+    })
 
     expect(upload.mock.calls.some(([request]) => new Set(request.observations.map((o) => o.metric)).size > 1)).toBe(true)
     const snapshot = delivery.getSnapshot()

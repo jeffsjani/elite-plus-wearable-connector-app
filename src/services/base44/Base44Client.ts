@@ -1,5 +1,6 @@
 import { Base44Error, createClient, getAccessToken } from '@base44/sdk'
 import type { Base44Client } from '@base44/sdk'
+import { physicalTestSideEffect } from '../diagnostics/PhysicalTestIsolation'
 import {
   ConnectorServiceError,
   type ConnectorErrorCode,
@@ -88,6 +89,14 @@ function abortedError(): ConnectorServiceError {
 }
 
 export async function invokeConnectorFunction<T>(
+  functionName: string,
+  payload: object,
+  options: InvokeOptions = {},
+): Promise<T> {
+  return physicalTestSideEffect('base44', () => invokeUnisolatedConnectorFunction<T>(functionName, payload, options))
+}
+
+async function invokeUnisolatedConnectorFunction<T>(
   functionName: string,
   payload: object,
   options: InvokeOptions = {},

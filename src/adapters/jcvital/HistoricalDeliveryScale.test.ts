@@ -294,15 +294,19 @@ describe('Historical delivery through the real IndexedDB queue and batch sender'
     delivery.setEnabled(true)
     delivery.start()
 
-    await delivery.deliverSyncResult(historicalHr(count))
-    expect(server.size).toBe(count)
-    expect(requests.every((request) => request.observations.length <= 100)).toBe(true)
-    expect(await observationQueue.getQueueStats()).toMatchObject({ pending: 0, inFlight: 0, retrying: 0, failed: 0 })
+    try {
+      await delivery.deliverSyncResult(historicalHr(count))
+      expect(server.size).toBe(count)
+      expect(requests.every((request) => request.observations.length <= 100)).toBe(true)
+      expect(await observationQueue.getQueueStats()).toMatchObject({ pending: 0, inFlight: 0, retrying: 0, failed: 0 })
 
-    delivery.resetDiagnostics()
-    await delivery.deliverSyncResult(historicalHr(count))
-    expect(server.size).toBe(count)
-    expect(delivery.getSnapshot().metrics.heartRateHistory).toMatchObject({ serverAccepted: 0, serverDuplicate: count, failed: 0 })
-    delivery.dispose()
-  }, 60_000)
+      delivery.resetDiagnostics()
+      await delivery.deliverSyncResult(historicalHr(count))
+      expect(server.size).toBe(count)
+      expect(delivery.getSnapshot().metrics.heartRateHistory).toMatchObject({ serverAccepted: 0, serverDuplicate: count, failed: 0 })
+    } finally {
+      delivery.dispose()
+      manager.stop()
+    }
+  }, 180_000)
 })

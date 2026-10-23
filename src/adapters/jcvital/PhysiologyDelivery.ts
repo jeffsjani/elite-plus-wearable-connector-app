@@ -1,5 +1,7 @@
 import type { ConnectorObservationResult, NativeObservationInput } from '../../services/base44/base44Types'
-import type { BatchDeliveryEvent, BatchDeliveryListener } from '../../services/sync/ObservationBatchManager'
+import type { BatchDeliveryEvent, BatchDeliveryListener, DeliveryDiagnostics } from '../../services/sync/ObservationBatchManager'
+import type { QueueRecord } from '../../services/storage/ObservationQueueStore'
+import { certificationDeliveryState, certificationQueueDisposition, type CertificationDeliveryResult, type CertificationDeliveryState, type CertificationQueueDisposition } from './CertificationDeliveryState'
 import { crashBreadcrumbs, type BreadcrumbDetail } from '../../services/diagnostics/CrashBreadcrumbs'
 import type { JCVitalV8HistoricalSyncResult } from './jcvitalV8Bridge'
 import {
@@ -13,11 +15,16 @@ import {
 export interface PhysiologyDeliveryDependencies {
   queue: {
     getOwnerUserId: () => string | null
-    enqueueMany: (observations: NativeObservationInput[]) => Promise<Array<{ inserted: boolean; alreadyQueued: boolean }>>
+    enqueueMany: (observations: NativeObservationInput[], sourceEnvelopeIds?: ReadonlyMap<string, string>) => Promise<Array<{ inserted: boolean; alreadyQueued: boolean }>>
+    getRecord?: (observationId: string) => Promise<QueueRecord | null>
   }
   /** One ObservationBatchManager pass (≤100 observations); null when nothing was sent. */
   deliver: () => Promise<unknown>
   subscribe: (listener: BatchDeliveryListener) => () => void
+  deliveryDiagnostics?: () => Pick<DeliveryDiagnostics, 'activeWorkerCount' | 'pauseReason'>
+  flushCertification?: (ids: readonly string[], metric: CertificationPhysiologyMetric) => Promise<{ reason: string | null }>
+  rememberCertification?: (observations: NativeObservationInput[]) => void
+  onCertificationQueued?: (count: number) => void
   resolveDeviceId: (bleAddress: string) => string
   breadcrumbs?: { record: (stage: string, detail?: BreadcrumbDetail) => void; recordError: (kind: 'lastHistoricalDeliveryError', error: unknown, context?: string) => void }
   /** Yields between processing chunks so the WebView stays responsive. */
@@ -56,13 +63,21 @@ export interface PhysiologyProgress {
   completedAt: string | null
 }
 
-export interface DeliverOptions {
+export type CertificationPhysiologyMetric = Exclude<PhysiologyMetricKey, 'heartRateHistory'>
+
+export type FocusedDeliveryOptions =
+  | { deliveryMode?: undefined; certificationMetric?: never }
+  | { deliveryMode: 'CAPTURE_ONLY'; certificationMetric?: never }
+  | { deliveryMode: 'CERTIFICATION_DELIVER'; certificationMetric: CertificationPhysiologyMetric }
+
+export type DeliverOptions = FocusedDeliveryOptions & {
   /** Diagnostic safe test: deliver only the first N valid observations, regardless of the delivery toggle. */
   maxObservations?: number
   /** Streamed chunks: map + enqueue only; the caller drains once via drainDeferred() after the final chunk. */
   deferDrain?: boolean
   /** Streamed chunks: total observations the native stream will send, for the chunk estimate. */
   expectedTotalObservations?: number
+  certificationSampleSize?: number
 }
 
 /** How one batch event's per-observation results were applied (counts only). */
@@ -99,7 +114,12 @@ export type PhysiologyDeliveryState =
 
 const DELIVERED_STATES = new Set<PhysiologyDeliveryState>(['DELIVERED_CANONICALIZED', 'DELIVERED_NATIVE_ONLY', 'DELIVERED_DUPLICATE', 'DELIVERED'])
 
-interface TrackedObservation { key: PhysiologyMetricKey; state: PhysiologyDeliveryState; nativeObservationId: string | null }
+interface TrackedObservation {
+  key: PhysiologyMetricKey
+  state: PhysiologyDeliveryState
+  nativeObservationId: string | null
+  certificationEvidence?: CertificationDeliveryResult
+}
 
 export interface PhysiologyMetricCounters {
   captured: number
@@ -152,6 +172,16 @@ export interface PhysiologySyncReport {
   alreadyQueued: number
   /** Non-deliverable (no-measurement placeholder) observations from this sync only; cumulative counters span prior syncs too. */
   notDeliverable: number
+  certificationMetric?: CertificationPhysiologyMetric
+  observations?: Array<{
+    observationId: string
+    sourceRecordId: string
+    state: CertificationDeliveryState
+    queueState: string | null
+    nativeObservationId: string | null
+    deliveryResult: CertificationDeliveryResult | null
+    queueDisposition: CertificationQueueDisposition
+  }>
 }
 
 function emptyCounters(): PhysiologyMetricCounters {
@@ -258,8 +288,20 @@ export class JCVitalPhysiologyDelivery {
    */
   async deliverSyncResult(result: JCVitalV8HistoricalSyncResult, options: DeliverOptions = {}): Promise<PhysiologySyncReport> {
     const report: PhysiologySyncReport = { delivered: false, reason: null, mapped: 0, queued: 0, alreadyQueued: 0, notDeliverable: 0 }
+    const certification = options.deliveryMode === 'CERTIFICATION_DELIVER'
     const safeTest = options.maxObservations !== undefined
-    if (!this.enabled && !safeTest) return { ...report, reason: 'physiology delivery disabled' }
+    if (options.deliveryMode === 'CAPTURE_ONLY') return { ...report, reason: 'capture only' }
+    if (!this.enabled && !safeTest && !certification) return { ...report, reason: 'physiology delivery disabled' }
+    if (certification && (safeTest || options.deferDrain)) throw new Error('Focused certification cannot use HR safe-test or streaming options.')
+    if (certification && !this.deps.flushCertification) throw new Error('Targeted certification flush is unavailable; no observations were enqueued.')
+    if (certification && options.certificationSampleSize !== undefined
+      && (!Number.isInteger(options.certificationSampleSize) || options.certificationSampleSize < 1 || options.certificationSampleSize > 5)) {
+      throw new Error('Focused certification sample must contain 1-5 observations.')
+    }
+    if (certification && options.certificationMetric === 'wearableTemperature'
+      && options.certificationSampleSize !== undefined && options.certificationSampleSize !== 5) {
+      throw new Error('Wearable temperature certification requires exactly five observations.')
+    }
     const owner = this.deps.queue.getOwnerUserId()
     if (!owner) { this.lastError = 'Queue owner is not authenticated.'; this.changed(); return { ...report, reason: this.lastError } }
     const prefix = breadcrumbPrefix(result.vendorDataType)
@@ -282,7 +324,9 @@ export class JCVitalPhysiologyDelivery {
     this.progress = progress
     if (!continuing) this.breadcrumbs.record(`${prefix}_DELIVERY_MAPPING_STARTED`, { normalized: natives.length, sourceRecords: result.recordGroupsReceived, safeTest, limit: safeTest ? limit : null, streamed: options.deferDrain === true })
     this.changed()
-    let pending: Array<{ key: PhysiologyMetricKey; observation: NativeObservationInput }> = []
+    let pending: Array<{ key: PhysiologyMetricKey; observation: NativeObservationInput; sourceEnvelopeId?: string }> = []
+    const certificationIds = new Map<string, string>()
+    const certificationSample: NativeObservationInput[] = []
     const flush = async (force: boolean) => {
       while (pending.length >= chunkSize || (force && pending.length)) {
         const chunk = pending.slice(0, chunkSize)
@@ -292,14 +336,36 @@ export class JCVitalPhysiologyDelivery {
         progress.largestChunk = Math.max(progress.largestChunk, chunk.length)
         if (progress.currentChunk === 1) this.breadcrumbs.record(`${prefix}_ENQUEUE_STARTED`, { chunkSize })
         this.breadcrumbs.record(`${prefix}_ENQUEUE_CHUNK_INDEX`, { chunk: progress.currentChunk, size: chunk.length, mappedSoFar: progress.mapped })
-        const results = await this.deps.queue.enqueueMany(chunk.map((item) => item.observation))
+        if (certification && this.deps.queue.getOwnerUserId() !== owner) throw new Error('Queue account changed during certification delivery.')
+        const sourceEnvelopeIds = new Map(chunk.flatMap((item) => item.sourceEnvelopeId
+          ? [[item.observation.observationId, item.sourceEnvelopeId] as const] : []))
+        const results = sourceEnvelopeIds.size
+          ? await this.deps.queue.enqueueMany(chunk.map((item) => item.observation), sourceEnvelopeIds)
+          : await this.deps.queue.enqueueMany(chunk.map((item) => item.observation))
         results.forEach((enqueued, index) => {
           const { key, observation } = chunk[index]
           if (enqueued.inserted) { this.counters[key].queued++; progress.queued++ }
           else { this.counters[key].alreadyQueued++; progress.alreadyQueued++ }
           const existing = this.tracked.get(observation.observationId)
-          if (!existing || !DELIVERED_STATES.has(existing.state)) this.tracked.set(observation.observationId, { key, state: 'QUEUED', nativeObservationId: null })
+          if (!existing || !DELIVERED_STATES.has(existing.state)) this.tracked.set(observation.observationId, {
+            key, state: 'QUEUED', nativeObservationId: null,
+            ...(certification ? { certificationEvidence: existing?.certificationEvidence ?? undefined } : {}),
+          })
         })
+        if (certification && this.deps.queue.getRecord) {
+          for (let index = 0; index < results.length; index++) {
+            if (results[index].inserted) continue
+            const id = chunk[index].observation.observationId
+            const row = await this.deps.queue.getRecord(id)
+            const entry = this.tracked.get(id)!
+            if (row?.state === 'ACKNOWLEDGED' && entry.state === 'QUEUED') entry.state = 'DELIVERED'
+            else if (row?.state === 'CANONICAL_RECOVERY_REQUIRED') entry.state = 'CANONICAL_FAILED'
+            else if (row?.state === 'FAILED_PERMANENT') entry.state = 'FAILED'
+          }
+        }
+        if (certification && this.deps.rememberCertification && certificationSample.length) {
+          this.deps.rememberCertification(certificationSample)
+        }
         this.changed()
         await (this.deps.yieldToEventLoop ?? defaultYield)()
       }
@@ -308,14 +374,21 @@ export class JCVitalPhysiologyDelivery {
       for (const native of natives) {
         if (progress.mapped >= limit) break
         const contract = findPhysiologyContract(native)
-        if (!contract || !this.enabledMetrics.has(contract.key)) continue
+        if (!contract || (certification ? contract.key !== options.certificationMetric : !this.enabledMetrics.has(contract.key))) continue
         for (const outcome of await mapPhysiologyObservation(owner, native, this.context, contract)) {
           if (progress.mapped >= limit) break
           const counters = this.counters[outcome.key]
           counters.captured++
-          if (outcome.status === 'MAPPED') { pending.push(outcome); progress.mapped++ }
+          if (outcome.status === 'MAPPED') {
+            pending.push(outcome); progress.mapped++
+            if (certification) certificationIds.set(outcome.observation.observationId, outcome.observation.sourceRecordId!)
+            if (certification && certificationSample.length < (options.certificationSampleSize ?? 5)) certificationSample.push(outcome.observation)
+          }
           else if (outcome.status === 'NOT_DELIVERABLE') { counters.notDeliverable++; progress.notDeliverable++ }
-          else { counters.invalid++; this.lastInvalidReason = `${outcome.key}: ${outcome.reason}` }
+          else {
+            counters.invalid++; this.lastInvalidReason = `${outcome.key}: ${outcome.reason}`
+            if (certification) report.reason = this.lastInvalidReason
+          }
         }
         if (pending.length >= chunkSize) await flush(false)
       }
@@ -327,25 +400,101 @@ export class JCVitalPhysiologyDelivery {
       progress.stage = 'FAILED'
       this.breadcrumbs.recordError('lastHistoricalDeliveryError', error, `${prefix} chunk ${progress.currentChunk}`)
       this.changed()
-      return { ...report, mapped: progress.mapped, queued: progress.queued, alreadyQueued: progress.alreadyQueued, notDeliverable: progress.notDeliverable, reason: this.lastError }
+      const failedReport = { ...report, mapped: progress.mapped, queued: progress.queued, alreadyQueued: progress.alreadyQueued, notDeliverable: progress.notDeliverable, reason: this.lastError }
+      return certification ? this.certificationReport(failedReport, options.certificationMetric, certificationIds, owner, 'FAILED') : failedReport
     }
     Object.assign(report, { mapped: progress.mapped, queued: progress.queued, alreadyQueued: progress.alreadyQueued, notDeliverable: progress.notDeliverable })
+    if (certification) this.deps.onCertificationQueued?.(report.queued + report.alreadyQueued)
+    const expectedCertificationCount = options.certificationSampleSize ?? 5
+    if (certification && options.certificationMetric === 'wearableTemperature'
+      && certificationSample.length !== expectedCertificationCount) {
+      report.reason = `Wearable temperature certification requires five valid observations; only ${certificationSample.length} were available. Valid observations remain durably queued; no targeted delivery was started.`
+    }
     this.lastSync = { vendorDataType: result.vendorDataType, syncId: result.syncId, at: new Date().toISOString(), mapped: report.mapped, queued: report.queued, notDeliverable: report.notDeliverable }
     if (options.deferDrain) {
       this.changed()
       return { ...report, delivered: true }
     }
-    if (report.queued || report.alreadyQueued) {
+    if ((report.queued || report.alreadyQueued) && !(certification && options.certificationMetric === 'wearableTemperature'
+      && certificationSample.length !== expectedCertificationCount)) {
       progress.stage = 'DELIVERING'
       this.changed()
       this.breadcrumbs.record(`${prefix}_BATCH_SEND_STARTED`, { queued: report.queued })
-      await this.drain()
+      if (certification) {
+        try {
+          if (this.deps.flushCertification) {
+            const selected = [...certificationIds.keys()].slice(0, options.certificationSampleSize ?? 5)
+            for (const id of certificationIds.keys()) if (!selected.includes(id)) certificationIds.delete(id)
+            const flushed = await this.deps.flushCertification(selected, options.certificationMetric)
+            if (flushed.reason) report.reason = flushed.reason
+          }
+        } catch (error) {
+          report.reason = error instanceof Error ? error.message : String(error)
+          this.breadcrumbs.recordError('lastHistoricalDeliveryError', error, `${prefix} certification drain`)
+        }
+      }
+      else await this.drain()
       this.breadcrumbs.record(`${prefix}_BATCH_SEND_DRAINED`, { delivered: this.getSnapshot().total.uniqueObservationsDelivered })
     }
     progress.stage = 'COMPLETE'
     progress.completedAt = new Date().toISOString()
     this.changed()
+    if (certification) {
+      const completed = await this.certificationReport(report, options.certificationMetric, certificationIds, owner)
+      if (options.certificationMetric === 'wearableTemperature') {
+        const exactResults = completed.observations ?? []
+        const validResults = exactResults.length === 5 && exactResults.every((item) => {
+          const result = item.deliveryResult?.result
+          return (result?.status === 'accepted' || result?.status === 'duplicate')
+            && result.canonicalStatus === 'canonicalized'
+            && (result.status !== 'accepted' || Boolean(result.nativeObservationId))
+            && (item.state === 'DELIVERED_CANONICALIZED' || item.state === 'DELIVERED_DUPLICATE')
+        })
+        if (!validResults) {
+          completed.delivered = false
+          completed.reason = completed.reason
+            ?? 'Temperature certification incomplete: require exact accepted/duplicate results, canonicalized status, and a NativeObservation ID for every accepted row.'
+        }
+      }
+      if (progress.mapped === 0) completed.reason = report.reason ?? 'No deliverable observations for the selected certification metric.'
+      if (!completed.delivered) {
+        this.lastError = completed.reason
+        this.emit()
+      } else {
+        this.lastError = null
+        this.emit()
+      }
+      return completed
+    }
     return { ...report, delivered: true }
+  }
+
+  private async certificationReport(
+    report: PhysiologySyncReport, metric: CertificationPhysiologyMetric, ids: Map<string, string>, owner: string,
+    fallback: CertificationDeliveryState = 'CAPTURED_NOT_DELIVERED',
+  ): Promise<PhysiologySyncReport> {
+    const observations: NonNullable<PhysiologySyncReport['observations']> = []
+    for (const [observationId, sourceRecordId] of ids) {
+      if (this.deps.queue.getOwnerUserId() !== owner) throw new Error('Queue account changed during certification delivery.')
+      const entry = this.tracked.get(observationId)
+      const row = await this.deps.queue.getRecord?.(observationId)
+      const trackedState = entry?.state === 'RETRYING' ? 'QUEUED' : entry?.state === 'DELIVERED' ? 'DELIVERY_UNKNOWN' : entry?.state
+      observations.push({
+        observationId, sourceRecordId,
+        state: certificationDeliveryState(entry?.certificationEvidence ?? null, row?.state ?? null, trackedState ?? fallback),
+        queueState: row?.state ?? null, nativeObservationId: entry?.nativeObservationId ?? row?.nativeObservationId ?? null,
+        deliveryResult: entry?.certificationEvidence ?? null,
+        queueDisposition: this.deps.queue.getRecord
+          ? certificationQueueDisposition(entry?.certificationEvidence ?? null, row?.state ?? null) : 'NOT_READ',
+      })
+    }
+    const delivered = !report.reason && observations.length > 0 && observations.every((item) =>
+      item.state === 'DELIVERED_CANONICALIZED' || item.state === 'DELIVERED_NATIVE_ONLY' || item.state === 'DELIVERED_DUPLICATE')
+    return {
+      ...report, delivered, certificationMetric: metric, observations,
+      reason: delivered ? null : report.reason ?? this.deps.deliveryDiagnostics?.().pauseReason
+        ?? `Certification delivery incomplete: ${[...new Set(observations.map((item) => item.state))].join(', ') || 'no mapped observations'}. Export JSON and STOP.`,
+    }
   }
 
   /** Completes a streamed sync whose chunks were enqueued with deferDrain. */
@@ -398,16 +547,16 @@ export class JCVitalPhysiologyDelivery {
       this.lastRejection = issue('rejected')
       return
     }
+    if (result.nativeObservationId) {
+      entry.nativeObservationId = result.nativeObservationId
+      this.lastNativeObservationIds[entry.key] = result.nativeObservationId
+    }
     if (result.status === 'duplicate') {
       counters.serverDuplicate++
       this.markDelivered(id, entry, 'DELIVERED_DUPLICATE')
       return
     }
     counters.serverAccepted++
-    if (result.nativeObservationId) {
-      entry.nativeObservationId = result.nativeObservationId
-      this.lastNativeObservationIds[entry.key] = result.nativeObservationId
-    }
     if (result.canonicalStatus === 'canonicalized') { counters.canonicalized++; this.markDelivered(id, entry, 'DELIVERED_CANONICALIZED') }
     else if (result.canonicalStatus === 'not_applicable') { counters.nativeOnly++; this.markDelivered(id, entry, 'DELIVERED_NATIVE_ONLY') }
     else if (result.canonicalStatus === 'failed') { counters.canonicalFailed++; this.lastCanonicalFailure = issue('accepted/canonical_failed'); entry.state = 'CANONICAL_FAILED' }
@@ -417,6 +566,17 @@ export class JCVitalPhysiologyDelivery {
   private handleBatch(event: BatchDeliveryEvent): void {
     const ours = event.observationIds.filter((id) => this.tracked.has(id))
     if (!ours.length) return
+    const exactResults = new Map((event.results ?? []).map((result) => [result.observationId, result]))
+    for (const id of ours) {
+      const entry = this.tracked.get(id)!
+      // Only explicit certification rows retain exact result evidence alongside their awaited report.
+      if ('certificationEvidence' in entry) entry.certificationEvidence = {
+        batchId: event.batchId, at: event.attemptedAt,
+        acknowledged: event.acknowledgedIds.includes(id) && !(event.canonicalFailedIds ?? []).includes(id),
+        outcome: (event.canonicalFailedIds ?? []).includes(id) ? 'CANONICAL_RECOVERY_REQUIRED' : event.outcome,
+        result: exactResults.get(id) ?? null,
+      }
+    }
     const handling: PhysiologyResultHandling = {
       batchId: event.batchId, at: event.attemptedAt, outcome: event.outcome, trackedObservations: ours.length,
       eventHasResults: Array.isArray(event.results), eventResultCount: Array.isArray(event.results) ? event.results.length : null,

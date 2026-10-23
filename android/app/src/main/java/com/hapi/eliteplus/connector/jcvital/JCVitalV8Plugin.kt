@@ -27,8 +27,16 @@ class JCVitalV8Plugin : Plugin() {
     private lateinit var manager: JCVitalV8Manager
     private var lastPermissionStatus: JCVitalV8PermissionStatus? = null
 
+    private val connectionTrace = JCVitalV8ConnectionTrace(true)
+
     override fun load() {
-        manager = JCVitalV8Manager(context) { name, payload -> notifyListeners(name, toJsObject(payload)) }
+        manager = JCVitalV8Manager(context, connectionTrace) { name, payload ->
+            if (connectionTrace.enabled && name == JCVitalV8EventNormalizer.EVENT_SCAN_RESULT) {
+                (payload["id"] as? String)?.let { connectionTrace.scanResultEmitted(it, hasListeners(name)) }
+            }
+            notifyListeners(name, toJsObject(payload))
+        }
+        connectionTrace.pluginLoaded()
     }
 
     override fun handleOnDestroy() {
@@ -36,8 +44,102 @@ class JCVitalV8Plugin : Plugin() {
     }
 
     @PluginMethod
+    fun initialize(call: PluginCall) {
+        if (!::manager.isInitialized) {
+            Log.e(TAG, "V8 native manager did not load")
+            call.reject("V8 native manager did not load", "SDK_INITIALIZATION_FAILED")
+            return
+        }
+        call.resolve(JSObject().put("initialized", true).put("pluginName", "JCVitalV8"))
+    }
+
+    @PluginMethod
     fun isAvailable(call: PluginCall) {
         call.resolve(JSObject().put("available", manager.isAvailable()).put("enabled", manager.isEnabled()))
+    }
+
+    @PluginMethod
+    fun configureSourceJournal(call: PluginCall) {
+        val owner = journalOwner(call)
+        val enabled = call.getBoolean("enabled")
+        if (enabled == null) {
+            call.reject("enabled is required", "SOURCE_JOURNAL_FAILED")
+            return
+        }
+        manager.configureSourceJournal(owner, journalDevice(call),
+            enabled, call.getLong("maxBytes"), call.getLong("maxEnvelopes"),
+            call.getInt("maxEntryBytes")) { result, error ->
+            if (error != null) call.reject(error.message ?: "SOURCE_JOURNAL_FAILED", "SOURCE_JOURNAL_FAILED")
+            else call.resolve(toJsObject(result!!))
+        }
+    }
+
+    private fun journalOwner(call: PluginCall): String? = call.getString("accountId")
+    private fun journalDevice(call: PluginCall): String? = call.getString("deviceScopeId")
+
+    private fun journalCall(call: PluginCall, operation: () -> Map<String, Any?>) {
+        try { call.resolve(toJsObject(operation())) }
+        catch (error: Exception) { call.reject(error.message ?: "SOURCE_JOURNAL_FAILED", "SOURCE_JOURNAL_FAILED") }
+    }
+
+    @PluginMethod
+    fun getSourceJournalDiagnostics(call: PluginCall) = journalCall(call) {
+        manager.sourceJournal.diagnostics(journalOwner(call), journalDevice(call))
+    }
+
+    @PluginMethod
+    fun getJournalCapacityAnalysis(call: PluginCall) = journalCall(call) {
+        manager.sourceJournal.capacityAnalysis()
+    }
+
+    @PluginMethod
+    fun analyzeExistingJournalOffline(call: PluginCall) = journalCall(call) {
+        JCVitalV8OfflineJournalInspector(context).inspect()
+    }
+
+    @PluginMethod
+    fun getPipelineDiagnosticSnapshot(call: PluginCall) = journalCall(call) {
+        manager.pipelineSnapshot()
+    }
+
+    @PluginMethod
+    fun listSourceEnvelopes(call: PluginCall) = journalCall(call) {
+        manager.sourceJournal.list(journalOwner(call), journalDevice(call),
+            call.getLong("afterSequence") ?: 0, call.getInt("limit") ?: 50)
+    }
+
+    @PluginMethod
+    fun readSourceEnvelope(call: PluginCall) = journalCall(call) {
+        manager.sourceJournal.read(journalOwner(call), journalDevice(call),
+            call.getString("envelopeId") ?: throw IllegalArgumentException("envelopeId is required"))
+    }
+
+    @PluginMethod
+    fun exportSourceJournal(call: PluginCall) = journalCall(call) {
+        manager.sourceJournal.list(journalOwner(call), journalDevice(call),
+            call.getLong("afterSequence") ?: 0, call.getInt("limit") ?: 50, includePayload = true)
+    }
+
+    @PluginMethod
+    fun readActivityCertificationSnapshot(call: PluginCall) = journalCall(call) {
+        manager.sourceJournal.readActivityCertification(journalOwner(call), journalDevice(call))
+    }
+
+    @PluginMethod
+    fun writeActivityCertificationSnapshot(call: PluginCall) = journalCall(call) {
+        manager.sourceJournal.writeActivityCertification(journalOwner(call), journalDevice(call),
+            call.getString("json") ?: throw IllegalArgumentException("json is required"))
+    }
+
+    @PluginMethod
+    fun readSleepCertificationSnapshot(call: PluginCall) = journalCall(call) {
+        manager.sourceJournal.readSleepCertification(journalOwner(call), journalDevice(call))
+    }
+
+    @PluginMethod
+    fun writeSleepCertificationSnapshot(call: PluginCall) = journalCall(call) {
+        manager.sourceJournal.writeSleepCertification(journalOwner(call), journalDevice(call),
+            call.getString("json") ?: throw IllegalArgumentException("json is required"))
     }
 
     @PluginMethod
@@ -48,16 +150,45 @@ class JCVitalV8Plugin : Plugin() {
     @PluginMethod
     override fun requestPermissions(call: PluginCall) {
         val status = permissionStatus()
+        connectionTrace.record("PERMISSION_REQUEST_INVOKED", mapOf("status" to status.name,
+            "aliasState" to getPermissionState(alias())?.toString()))
         if (status == JCVitalV8PermissionStatus.BLUETOOTH_UNAVAILABLE || getPermissionState(alias())?.toString() == "granted") {
+            connectionTrace.record("PERMISSION_REQUEST_RESOLVED_WITHOUT_PROMPT", mapOf("status" to status.name,
+                "bluetoothEnabled" to manager.isEnabled()))
             return call.resolve(permissionPayload())
         }
         Log.i(TAG, "requesting ${JCVitalV8Permissions.requiredPermissions(Build.VERSION.SDK_INT).joinToString()}")
+        connectionTrace.record("PERMISSION_PROMPT_SHOWN", mapOf("alias" to alias()))
         requestPermissionForAlias(alias(), call, "permissionsCallback")
     }
 
     @PermissionCallback
     private fun permissionsCallback(call: PluginCall) {
-        call.resolve(permissionPayload())
+        val payload = permissionPayload()
+        connectionTrace.record("PERMISSION_PROMPT_RESULT", mapOf("status" to payload.getString("status"),
+            "aliasState" to getPermissionState(alias())?.toString(), "bluetoothEnabled" to manager.isEnabled()))
+        call.resolve(payload)
+    }
+
+    @PluginMethod
+    fun getConnectionDiagnosticSnapshot(call: PluginCall) {
+        val android = JCVitalV8ConnectionDiagnosticState.read(context)
+        call.resolve(toJsObject(mapOf(
+            "android" to android,
+            "capacitorPermissionAlias" to alias(),
+            "capacitorAliasState" to getPermissionState(alias())?.toString(),
+            "normalizedPermissionStatus" to permissionStatus().name,
+            "connectionState" to manager.state.name,
+            "connectedDeviceId" to manager.connectedDeviceId(),
+            "jsListeners" to mapOf(
+                "jcvitalScanResult" to hasListeners(JCVitalV8EventNormalizer.EVENT_SCAN_RESULT),
+                "jcvitalConnectionState" to hasListeners(JCVitalV8EventNormalizer.EVENT_CONNECTION_STATE),
+                "jcvitalError" to hasListeners(JCVitalV8EventNormalizer.EVENT_ERROR),
+            ),
+            "registryDevices" to manager.discoveredDevices().size,
+            "trace" to connectionTrace.snapshot(),
+            "journalHandshake" to manager.journalHandshakeSnapshot(),
+        )))
     }
 
     @PluginMethod
@@ -190,6 +321,76 @@ class JCVitalV8Plugin : Plugin() {
         call.resolve(toJsObject(manager.rawPpgStatus()))
     }
 
+    // Offline saved-evidence controls: read-only against app-private storage. 0 BLE commands, 0 connections,
+    // 0 acquisitions, 0 network, 0 Base44, 0 enqueue, 0 delivery, 0 canonicalization.
+    /**
+     * PPG saved-evidence calls keep the exact native code/class instead of collapsing to SOURCE_JOURNAL_FAILED:
+     * reject(message, code, exception, data{errorCode, exceptionClass, errorMessage}).
+     */
+    private fun ppgEvidenceCall(call: PluginCall, operation: () -> Map<String, Any?>) {
+        try { call.resolve(toJsObject(operation())) }
+        catch (error: Exception) {
+            val code = (error as? RawPpgSavedEvidenceInspector.CodedException)?.code
+                ?: (error as? JCVitalV8SourceJournal.Failure)?.reason?.takeIf { it.startsWith("PPG_") }
+                ?: RawPpgSavedEvidenceDiagnostic.INSPECTION_INTERNAL_ERROR
+            val message = "$code: ${error.javaClass.simpleName}: ${error.message ?: "(no message)"}"
+            call.reject(message, code, error, JSObject().put("errorCode", code)
+                .put("exceptionClass", error.javaClass.name).put("errorMessage", message))
+        }
+    }
+
+    @PluginMethod
+    fun inspectSavedRawPpgEvidence(call: PluginCall) = ppgEvidenceCall(call) {
+        manager.inspectSavedRawPpgEvidence(journalOwner(call), journalDevice(call), call.getString("sessionId"))
+    }
+
+    @PluginMethod
+    fun readSavedRawPpgDiagnostic(call: PluginCall) = ppgEvidenceCall(call) { manager.readSavedRawPpgDiagnostic() }
+
+    @PluginMethod
+    fun exportSavedRawPpgEvidence(call: PluginCall) = ppgEvidenceCall(call) {
+        manager.exportSavedRawPpgEvidence(journalOwner(call), journalDevice(call), call.getString("sessionId"))
+    }
+
+    @PluginMethod
+    fun finalizeSavedRawPpgCertification(call: PluginCall) = ppgEvidenceCall(call) {
+        manager.finalizeSavedRawPpgCertification(journalOwner(call), journalDevice(call), call.getString("sessionId"))
+    }
+
+    @PluginMethod
+    fun readSavedRawPpgCertification(call: PluginCall) = ppgEvidenceCall(call) {
+        manager.readSavedRawPpgCertification(journalOwner(call), journalDevice(call))
+    }
+
+    // VC29 one-shot physical Raw PPG certification. Capture is the only BLE-issuing method here; it is gated on
+    // READY + authenticated scope and on the restart-persistent attempt claim. All other methods are offline.
+    @PluginMethod
+    fun captureRawPpgCertification(call: PluginCall) {
+        manager.captureRawPpgCertification { result, error ->
+            if (error != null) reject(call, error) else call.resolve(toJsObject(result!!))
+        }
+    }
+
+    @PluginMethod
+    fun getRawPpgCertificationStatus(call: PluginCall) = ppgEvidenceCall(call) {
+        manager.rawPpgCertificationStatus(journalOwner(call), journalDevice(call))
+    }
+
+    @PluginMethod
+    fun inspectSavedRawPpgPhysicalCertification(call: PluginCall) = ppgEvidenceCall(call) {
+        manager.inspectSavedRawPpgCertification(journalOwner(call), journalDevice(call))
+    }
+
+    @PluginMethod
+    fun readSavedRawPpgPhysicalCertification(call: PluginCall) = ppgEvidenceCall(call) {
+        manager.readSavedRawPpgPhysicalCertification(journalOwner(call), journalDevice(call))
+    }
+
+    @PluginMethod
+    fun exportRawPpgCertificationSpool(call: PluginCall) = ppgEvidenceCall(call) {
+        manager.exportRawPpgCertificationSpool(journalOwner(call), journalDevice(call))
+    }
+
     @PluginMethod
     fun syncHistoricalHeartRate(call: PluginCall) {
         val maxValidSamples = call.getInt("maxValidSamples")
@@ -234,13 +435,59 @@ class JCVitalV8Plugin : Plugin() {
     fun syncDetailedActivity(call: PluginCall) = resolveHistorical(call, manager::syncDetailedActivity)
 
     @PluginMethod
+    fun beginPhysicalSemanticTest(call: PluginCall) {
+        manager.beginPhysicalSemanticTest(call.getString("kind") ?: "", call.getString("attemptId")) { result, error ->
+            if (error != null) reject(call, error) else call.resolve(toJsObject(result ?: emptyMap()))
+        }
+    }
+
+    @PluginMethod
+    fun readPhysicalSemanticTestEvidence(call: PluginCall) = journalCall(call) {
+        mapOf("json" to manager.readPhysicalSemanticTestEvidence(
+            journalOwner(call), journalDevice(call), call.getString("kind") ?: ""))
+    }
+
+    @PluginMethod
+    fun endPhysicalSemanticTest(call: PluginCall) {
+        manager.endPhysicalSemanticTest { result, error ->
+            if (error != null) reject(call, error) else call.resolve(toJsObject(result ?: emptyMap()))
+        }
+    }
+
+    @PluginMethod
+    fun syncActivityCertification(call: PluginCall) = resolveHistorical(call, manager::syncActivityCertification)
+
+    @PluginMethod
     fun syncHistoricalSleepStages(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalSleepStages)
 
     @PluginMethod
     fun syncHistoricalSleepMovement(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalSleepMovement)
 
     @PluginMethod
+    fun syncSleepCertification(call: PluginCall) = resolveHistorical(call, manager::syncSleepCertification)
+
+    @PluginMethod
     fun syncHistoricalWorkouts(call: PluginCall) = resolveHistorical(call, manager::syncHistoricalWorkouts)
+
+    @PluginMethod
+    fun syncWorkoutHistoryCertification(call: PluginCall) = resolveHistorical(call, manager::syncWorkoutHistoryCertification)
+
+    @PluginMethod
+    fun readWorkoutCertificationSnapshot(call: PluginCall) = journalCall(call) {
+        manager.sourceJournal.readWorkoutCertification(journalOwner(call), journalDevice(call))
+    }
+
+    @PluginMethod
+    fun readWorkoutSourceEnvelope(call: PluginCall) = journalCall(call) {
+        manager.sourceJournal.readWorkoutSourceEnvelope(journalOwner(call), journalDevice(call),
+            call.getString("envelopeId") ?: throw IllegalArgumentException("envelopeId is required"))
+    }
+
+    @PluginMethod
+    fun writeWorkoutCertificationSnapshot(call: PluginCall) = journalCall(call) {
+        manager.sourceJournal.writeWorkoutCertification(journalOwner(call), journalDevice(call),
+            call.getString("json") ?: throw IllegalArgumentException("json is required"))
+    }
 
     @PluginMethod
     fun getMonitoringConfiguration(call: PluginCall) = resolveHistorical(call, manager::requestMonitoringConfiguration)
