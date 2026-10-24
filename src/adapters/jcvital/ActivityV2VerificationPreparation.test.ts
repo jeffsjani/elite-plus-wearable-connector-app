@@ -225,6 +225,30 @@ describe('prepareActivityV2Verification', () => {
     expect(exportSourceJournal.mock.calls.map(([request]) => request.afterSequence)).toEqual([0, 100, 200])
   })
 
+  it('exports 250 source envelopes as exact 100, 100, and 50 record pages', async () => {
+    configure(Array.from({ length: 250 }, (_, index) => fixture(`other-${index + 1}`, 'other', '2025-01-01')))
+
+    await prepareActivityV2Verification(scope, context)
+
+    const pages = await Promise.all(exportSourceJournal.mock.results.map(({ value }) => value as Promise<{
+      envelopes: Array<{ sequence: number }>
+      nextSequence: number
+      hasMore: boolean
+    }>))
+    expect(exportSourceJournal.mock.calls.map(([request]) => request)).toEqual([
+      { ...scope, afterSequence: 0, limit: 100 },
+      { ...scope, afterSequence: 100, limit: 100 },
+      { ...scope, afterSequence: 200, limit: 100 },
+    ])
+    expect(pages.map(({ envelopes }) => envelopes.map(({ sequence }) => sequence))).toEqual([
+      Array.from({ length: 100 }, (_, index) => index + 1),
+      Array.from({ length: 100 }, (_, index) => index + 101),
+      Array.from({ length: 50 }, (_, index) => index + 201),
+    ])
+    expect(pages.map(({ nextSequence }) => nextSequence)).toEqual([100, 200, 250])
+    expect(pages.map(({ hasMore }) => hasMore)).toEqual([true, true, false])
+  })
+
   it('returns cleanly for an empty journal whose terminal cursor is unchanged', async () => {
     configure([])
     await expect(prepareActivityV2Verification(scope, context)).resolves.toMatchObject({
