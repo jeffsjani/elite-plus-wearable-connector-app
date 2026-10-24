@@ -188,6 +188,13 @@ describe('ActivityV2ProductionVerification preview', () => {
     expect(report.observations).toHaveLength(14)
     expect(report.observations.map((entry: { observationId: string }) => entry.observationId))
       .toEqual(Array.from({ length: 14 }, (_, index) => `observation-${index}`))
+    expect(report.queue.TEST_OBSERVATION_COLLISION_COUNT).toBe(0)
+    expect(report.queue.TEST_OBSERVATION_IDS_ABSENT).toBe(14)
+    expect(report.queue.QUEUE_TOTAL).toBe(0)
+    expect(report.queue.QUEUE_PENDING).toBe(0)
+    expect(report.queue.PENDING_BY_OBSERVATION_TYPE).toEqual([])
+    expect(report.queue.PENDING_BY_OWNER).toEqual({ distinctCount: 0, counts: [] })
+    expect(report.queue.PENDING_BY_DEVICE).toEqual({ distinctCount: 0, counts: [] })
     const buttons = [...container.querySelectorAll('button')]
     const previewIndex = buttons.findIndex((button) => button.textContent?.includes('Preview Activity V2 E2E'))
     const verifyIndex = buttons.findIndex((button) => button.textContent?.includes('Verify Activity V2 E2E'))

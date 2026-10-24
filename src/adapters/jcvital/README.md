@@ -869,6 +869,14 @@ including payloads, capped at 25 candidates per type; the existing production
 mapping and qualification logic still selects the valid sources. Preview and
 Verify share that selection path, so neither enumerates unrelated journal rows.
 
+Activity V2 Preview also displays bounded queue-backlog aggregates from the
+already owner-scoped diagnostic queue read: state counts, oldest/newest pending
+times, top observation types and providers, redacted owner/device group counts,
+and available attempt/error/provenance markers. It never displays complete
+backlog rows and does not alter queue state. The normal Activity Verify sender
+continues to use the ordinary FIFO queue claim; this diagnostic does not make
+that sender target only the 14 Activity verification IDs.
+
 Limits are configurable through `maxBytes`, `maxEnvelopes`, and `maxEntryBytes`.
 Defaults are 64 MiB accounted storage, 100,000 envelopes, and 1 MiB per entry;
 limits apply globally across owners while diagnostic record counts are scoped.

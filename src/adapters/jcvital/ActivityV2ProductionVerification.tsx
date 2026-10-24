@@ -28,6 +28,7 @@ import { activityV2PreviewCanVerify } from './ActivityV2PreviewGate'
 import { classifyActivityV2Verification } from './ActivityV2VerificationResult'
 import type { ActivityDeviceContext } from './ActivityProductionCanonical'
 import type { SourceJournalScope } from './jcvitalV8Bridge'
+import { summarizeActivityV2QueueBacklog } from './ActivityV2QueueBacklogDiagnostic'
 
 const VERIFY_METRICS = [
   'DAILY_STEPS',
@@ -260,6 +261,7 @@ export function ActivityV2ProductionVerification({
       const queue = await readQueueSnapshot(ids)
       const queueConflict = queue.records.length > 0 || !idleQueue(queue.stats)
       report.queue = {
+        ...summarizeActivityV2QueueBacklog(queue.records),
         queueCountBefore: queue.counts.count,
         pendingCountBefore: queue.stats.pending,
         failedCountBefore: queue.stats.failed,
@@ -268,6 +270,8 @@ export function ActivityV2ProductionVerification({
         existingTestObservationStates: queue.matchingRecords.map((record) => ({
           observationId: record.observationId, state: record.state,
         })),
+        TEST_OBSERVATION_COLLISION_COUNT: queue.matchingRecords.length,
+        TEST_OBSERVATION_IDS_ABSENT: Math.max(0, ids.length - queue.matchingRecords.length),
         queueConflict,
       }
       const valid = currentCapability.capabilitySupported && currentCapability.productionDeliveryEnabled
