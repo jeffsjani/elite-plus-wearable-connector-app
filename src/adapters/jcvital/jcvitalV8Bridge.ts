@@ -589,6 +589,21 @@ export interface SourceJournalPage {
   hasMore: boolean
 }
 
+export interface RecentActivitySourceCandidates {
+  modelVersion: string
+  queryMode: 'TARGETED_RECENT_CANDIDATES'
+  perTypeLimit: number
+  includePayload: true
+  sortOrder: 'sequence_desc'
+  type24Candidates: RecentActivitySourceCandidate[]
+  type25Candidates: RecentActivitySourceCandidate[]
+}
+
+export type RecentActivitySourceCandidate = Omit<SourceEnvelopeEntry, 'envelopeJson'> & {
+  envelopeJson: string
+  sourceFile: null
+}
+
 export interface SourceJournalOutcome {
   operation: string
   status: string
@@ -862,6 +877,9 @@ export interface JCVitalV8Plugin {
   listSourceEnvelopes(options: SourceJournalScope & { afterSequence?: number; limit?: number }): Promise<SourceJournalPage>
   /** Same sequence cursor contract as listSourceEnvelopes, with envelope payloads included. */
   exportSourceJournal(options: SourceJournalScope & { afterSequence?: number; limit?: number }): Promise<SourceJournalPage>
+  getRecentActivitySourceCandidates(
+    options: SourceJournalScope & { perTypeLimit?: number },
+  ): Promise<RecentActivitySourceCandidates>
   readSourceEnvelope(options: SourceJournalScope & { envelopeId: string }): Promise<{
     envelopeId: string; sequence: number; envelopeJson: string; rawBytesBase64: string | null
     sourceFile: {

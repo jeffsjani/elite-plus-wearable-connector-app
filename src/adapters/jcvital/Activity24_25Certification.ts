@@ -283,8 +283,9 @@ function fields(snapshot: unknown): ObjectValue {
 
 export async function readActivitySourceEnvelope(
   journal: Pick<JCVitalV8Plugin, 'readSourceEnvelope'>, scope: SourceJournalScope, envelopeId: string, kind: string,
+  preloadedEntry?: Entry,
 ) {
-  const entry = await journal.readSourceEnvelope({ ...scope, envelopeId })
+  const entry = preloadedEntry ?? await journal.readSourceEnvelope({ ...scope, envelopeId })
   const json = object(JSON.parse(entry.envelopeJson))
   if (entry.envelopeId !== envelopeId || json.envelopeId !== envelopeId || json.kind !== kind
     || json.accountId !== scope.accountId || json.deviceScopeId !== scope.deviceScopeId
@@ -305,9 +306,11 @@ export async function verifyActivitySourceNotification(
 }
 
 export async function readActivitySource(
-  journal: Pick<JCVitalV8Plugin, 'readSourceEnvelope'>, scope: SourceJournalScope, id: string,
+  journal: Pick<JCVitalV8Plugin, 'readSourceEnvelope'>, scope: SourceJournalScope, id: string, preloadedEntry?: Entry,
 ): Promise<ActivitySource> {
-  const read = (envelopeId: string, kind: string) => readActivitySourceEnvelope(journal, scope, envelopeId, kind)
+  const read = (envelopeId: string, kind: string) => readActivitySourceEnvelope(
+    journal, scope, envelopeId, kind, envelopeId === id ? preloadedEntry : undefined,
+  )
   const record = await read(id, 'SDK_RECORD')
   const r = record.json
   if (!['24', '25'].includes(String(r.vendorDataType)) || r.acquisitionMode !== 'HISTORICAL_SYNC'

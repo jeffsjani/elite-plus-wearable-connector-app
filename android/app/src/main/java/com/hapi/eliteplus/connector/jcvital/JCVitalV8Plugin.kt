@@ -146,6 +146,15 @@ class JCVitalV8Plugin : Plugin() {
     }
 
     @PluginMethod
+    fun getRecentActivitySourceCandidates(call: PluginCall) = journalCall(call) {
+        manager.sourceJournal.getRecentActivitySourceCandidates(
+            journalOwner(call),
+            journalDevice(call),
+            call.getInt("perTypeLimit") ?: 25,
+        )
+    }
+
+    @PluginMethod
     fun readActivityCertificationSnapshot(call: PluginCall) = journalCall(call) {
         manager.sourceJournal.readActivityCertification(journalOwner(call), journalDevice(call))
     }

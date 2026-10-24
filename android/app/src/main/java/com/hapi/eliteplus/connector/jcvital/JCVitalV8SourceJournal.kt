@@ -13,7 +13,7 @@ import java.util.UUID
 
 /** Independent, append-only L0 journal. Scalar acknowledgement never touches this database. */
 internal class JCVitalV8SourceJournal(context: Context) : SQLiteOpenHelper(
-    context.applicationContext, "jcvital-source-envelope-v1.db", null, 1,
+    context.applicationContext, "jcvital-source-envelope-v1.db", null, 2,
 ) {
     private val outcomePrefs = context.applicationContext.getSharedPreferences("jcvital-source-journal-outcomes-v1", Context.MODE_PRIVATE)
     private val appContext = context.applicationContext
@@ -54,8 +54,9 @@ internal class JCVitalV8SourceJournal(context: Context) : SQLiteOpenHelper(
     }
 
     override fun onCreate(db: SQLiteDatabase) {
-        db.execSQL("CREATE TABLE envelopes(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,account TEXT NOT NULL,device TEXT NOT NULL,callback_id TEXT,record_index INTEGER,kind TEXT NOT NULL,received INTEGER NOT NULL,timezone TEXT NOT NULL,json TEXT NOT NULL,raw BLOB,bytes INTEGER NOT NULL)")
+        db.execSQL("CREATE TABLE envelopes(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,account TEXT NOT NULL,device TEXT NOT NULL,callback_id TEXT,record_index INTEGER,kind TEXT NOT NULL,received INTEGER NOT NULL,timezone TEXT NOT NULL,json TEXT NOT NULL,acquisition_mode TEXT,vendor_data_type TEXT,raw BLOB,bytes INTEGER NOT NULL)")
         db.execSQL("CREATE INDEX envelopes_owner_sequence ON envelopes(account,device,sequence)")
+        db.execSQL("CREATE INDEX envelopes_activity_candidates ON envelopes(account,device,kind,acquisition_mode,vendor_data_type,sequence DESC)")
         db.execSQL("CREATE TABLE source_files(id TEXT PRIMARY KEY,account TEXT NOT NULL,device TEXT NOT NULL,path TEXT NOT NULL UNIQUE,session_id TEXT NOT NULL,kind TEXT NOT NULL,bytes INTEGER NOT NULL DEFAULT 0)")
         db.execSQL("CREATE TABLE journal_totals(singleton INTEGER PRIMARY KEY CHECK(singleton=1),envelopes INTEGER NOT NULL,bytes INTEGER NOT NULL)")
         db.execSQL("INSERT INTO journal_totals VALUES(1,0,0)")
@@ -64,7 +65,29 @@ internal class JCVitalV8SourceJournal(context: Context) : SQLiteOpenHelper(
         db.execSQL("CREATE TRIGGER file_totals_update AFTER UPDATE OF bytes ON source_files BEGIN UPDATE journal_totals SET bytes=bytes+new.bytes-old.bytes WHERE singleton=1; END")
     }
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        throw Failure("UNSUPPORTED_SCHEMA_UPGRADE")
+        if (oldVersion != 1 || newVersion != 2) throw Failure("UNSUPPORTED_SCHEMA_UPGRADE")
+        db.execSQL("ALTER TABLE envelopes ADD COLUMN acquisition_mode TEXT")
+        db.execSQL("ALTER TABLE envelopes ADD COLUMN vendor_data_type TEXT")
+        val update = db.compileStatement(
+            "UPDATE envelopes SET acquisition_mode=?,vendor_data_type=? WHERE sequence=?",
+        )
+        db.rawQuery("SELECT sequence,json FROM envelopes WHERE kind='SDK_RECORD'", null).use { cursor ->
+            while (cursor.moveToNext()) {
+                val envelope = JSONObject(cursor.getString(1))
+                val acquisitionMode = envelope.optString("acquisitionMode").takeUnless { it == "null" }
+                val vendorDataType = envelope.optString("vendorDataType").takeUnless { it == "null" }
+                update.clearBindings()
+                if (acquisitionMode == null) update.bindNull(1) else update.bindString(1, acquisitionMode)
+                if (vendorDataType == null) update.bindNull(2) else update.bindString(2, vendorDataType)
+                update.bindLong(3, cursor.getLong(0))
+                update.executeUpdateDelete()
+            }
+        }
+        update.close()
+        db.execSQL(
+            "CREATE INDEX envelopes_activity_candidates ON envelopes(" +
+                "account,device,kind,acquisition_mode,vendor_data_type,sequence DESC)",
+        )
     }
     override fun onOpen(db: SQLiteDatabase) {
         super.onOpen(db)
@@ -1132,10 +1155,13 @@ internal class JCVitalV8SourceJournal(context: Context) : SQLiteOpenHelper(
     }
 
     private fun insert(db: SQLiteDatabase, owner: Scope, id: String, callbackId: String?, index: Int?, kind: String, received: Long, timezone: String, json: String, raw: ByteArray? = null) {
+        val envelope = if (kind == "SDK_RECORD") JSONObject(json) else null
         val values = ContentValues().apply {
             put("id", id); put("account", owner.accountId); put("device", owner.deviceScopeId)
             put("callback_id", callbackId); put("record_index", index); put("kind", kind)
             put("received", received); put("timezone", timezone); put("json", json); put("raw", raw)
+            put("acquisition_mode", envelope?.optString("acquisitionMode")?.takeUnless { it == "null" })
+            put("vendor_data_type", envelope?.optString("vendorDataType")?.takeUnless { it == "null" })
             put("bytes", json.toByteArray(Charsets.UTF_8).size.toLong() + (raw?.size ?: 0) + 1024)
         }
         db.insertOrThrow("envelopes", null, values)
@@ -1375,6 +1401,53 @@ internal class JCVitalV8SourceJournal(context: Context) : SQLiteOpenHelper(
         val hasMore = readableDatabase.rawQuery("SELECT 1 FROM envelopes WHERE account=? AND device=? AND sequence>? LIMIT 1",
             arrayOf(owner.accountId, owner.deviceScopeId, next.toString())).use { it.moveToFirst() }
         return mapOf("modelVersion" to MODEL_VERSION, "envelopes" to items, "nextSequence" to next, "hasMore" to hasMore)
+    }
+
+    @Synchronized
+    fun getRecentActivitySourceCandidates(
+        accountId: String?,
+        deviceScopeId: String?,
+        perTypeLimit: Int,
+    ): Map<String, Any?> {
+        val owner = owner(accountId, deviceScopeId)
+        require(perTypeLimit in 1..25) { "perTypeLimit must be between 1 and 25" }
+        return mapOf(
+            "modelVersion" to MODEL_VERSION,
+            "queryMode" to "TARGETED_RECENT_CANDIDATES",
+            "perTypeLimit" to perTypeLimit,
+            "includePayload" to true,
+            "sortOrder" to "sequence_desc",
+            "type24Candidates" to recentActivityCandidates(owner, "24", perTypeLimit),
+            "type25Candidates" to recentActivityCandidates(owner, "25", perTypeLimit),
+        )
+    }
+
+    private fun recentActivityCandidates(owner: Scope, vendorDataType: String, limit: Int): List<Map<String, Any?>> {
+        val candidates = ArrayList<Map<String, Any?>>(limit)
+        readableDatabase.rawQuery(
+            "SELECT sequence,id,callback_id,record_index,kind,received,timezone,json,raw FROM envelopes " +
+                "WHERE account=? AND device=? AND kind='SDK_RECORD' " +
+                "AND acquisition_mode='HISTORICAL_SYNC' AND vendor_data_type=? " +
+                "ORDER BY sequence DESC LIMIT ?",
+            arrayOf(owner.accountId, owner.deviceScopeId, vendorDataType, limit.toString()),
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                val raw = if (cursor.isNull(8)) null else cursor.getBlob(8)
+                candidates.add(linkedMapOf(
+                    "sequence" to cursor.getLong(0),
+                    "envelopeId" to cursor.getString(1),
+                    "callbackId" to cursor.getString(2),
+                    "recordIndex" to if (cursor.isNull(3)) null else cursor.getInt(3),
+                    "kind" to cursor.getString(4),
+                    "receivedAt" to JCVitalV8Time.isoUtc(cursor.getLong(5)),
+                    "timezone" to cursor.getString(6),
+                    "envelopeJson" to cursor.getString(7),
+                    "rawBytesBase64" to raw?.let { Base64.encodeToString(it, Base64.NO_WRAP) },
+                    "sourceFile" to null,
+                ))
+            }
+        }
+        return candidates
     }
 
     @Synchronized

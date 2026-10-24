@@ -860,8 +860,14 @@ Journal pages use an exclusive `afterSequence` lower bound (`sequence >
 afterSequence`) and return records in ascending sequence order. `nextSequence`
 is the last sequence in a non-empty page; pass it unchanged for the next page.
 An empty terminal page retains its requested cursor and has `hasMore = false`.
-Catalog pages omit envelope JSON, so source preparation that needs to inspect
-saved records must use the payload-bearing export operation.
+Generic journal consumers that need the full payload-bearing inventory continue
+to use `exportSourceJournal` with that cursor contract. Activity V2 Preview and
+Verify instead use the read-only `getRecentActivitySourceCandidates` query,
+scoped to one account/device and filtered to `SDK_RECORD`,
+`HISTORICAL_SYNC`, and vendor types 24/25. It returns each type newest-first,
+including payloads, capped at 25 candidates per type; the existing production
+mapping and qualification logic still selects the valid sources. Preview and
+Verify share that selection path, so neither enumerates unrelated journal rows.
 
 Limits are configurable through `maxBytes`, `maxEnvelopes`, and `maxEntryBytes`.
 Defaults are 64 MiB accounted storage, 100,000 envelopes, and 1 MiB per entry;

@@ -170,6 +170,13 @@ export function ActivityV2ProductionVerification({
         reason: currentCapability.reason,
         productionDeliveryEnabled: currentCapability.productionDeliveryEnabled,
       },
+      ACTIVITY_SOURCE_QUERY_MODE: 'TARGETED_RECENT_CANDIDATES',
+      TYPE24_CANDIDATES_READ: 0,
+      TYPE25_CANDIDATES_READ: 0,
+      TYPE24_SELECTED_INDEX: null,
+      TYPE25_SELECTED_INDEX: null,
+      TYPE24_SELECTED_SOURCE_ID: null,
+      TYPE25_SELECTED_SOURCE_ID: null,
       type24: null,
       type25: null,
       sourceSelectionWarnings: [],
@@ -193,6 +200,13 @@ export function ActivityV2ProductionVerification({
       if (observationQueue.getOwnerUserId() !== ownerUserId) throw new Error('Production queue owner does not match the authenticated owner.')
       const context: ActivityDeviceContext = { ownerUserId, ...device }
       const prepared = await prepareActivityV2Verification(scope, context)
+      report.ACTIVITY_SOURCE_QUERY_MODE = prepared.sourceQueryMode
+      report.TYPE24_CANDIDATES_READ = prepared.type24CandidatesRead
+      report.TYPE25_CANDIDATES_READ = prepared.type25CandidatesRead
+      report.TYPE24_SELECTED_INDEX = prepared.type24SelectedIndex
+      report.TYPE25_SELECTED_INDEX = prepared.type25SelectedIndex
+      report.TYPE24_SELECTED_SOURCE_ID = prepared.type24?.source.sourceEnvelopeId ?? null
+      report.TYPE25_SELECTED_SOURCE_ID = prepared.type25?.source.sourceEnvelopeId ?? null
       report.sourceSelectionWarnings = prepared.warnings
       report.type24FailureReason = prepared.type24FailureReason
       report.type25FailureReason = prepared.type25FailureReason

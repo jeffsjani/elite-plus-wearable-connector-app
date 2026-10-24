@@ -14,7 +14,11 @@ import type {
   ActivityDeviceContext,
   ActivitySourceRecord,
 } from './ActivityProductionCanonical'
-import { JCVitalV8, type SourceJournalScope } from './jcvitalV8Bridge'
+import {
+  JCVitalV8,
+  type RecentActivitySourceCandidate,
+  type SourceJournalScope,
+} from './jcvitalV8Bridge'
 
 const VERIFY_METRICS = [
   'DAILY_STEPS',
@@ -30,6 +34,7 @@ type RecordEnvelope = {
   vendorDataType?: string
   acquisitionMode?: string
   sourceDate?: string | null
+  candidateEntry: RecentActivitySourceCandidate
 }
 
 export interface ActivityV2SelectedSource {
@@ -65,6 +70,11 @@ export interface ActivityV2PreparedVerification {
   type24FailureReason: string | null
   type25FailureReason: string | null
   selectionValid: boolean
+  sourceQueryMode: 'TARGETED_RECENT_CANDIDATES'
+  type24CandidatesRead: number
+  type25CandidatesRead: number
+  type24SelectedIndex: number | null
+  type25SelectedIndex: number | null
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -130,62 +140,57 @@ function makeSelectedSource(
   }
 }
 
-function paginationDiagnostic(
-  requestedCursor: number,
-  page: { envelopes?: Array<{ sequence?: unknown }>; nextSequence?: unknown; hasMore?: unknown },
-): string {
-  const records = Array.isArray(page.envelopes) ? page.envelopes : []
-  return JSON.stringify({
-    requestedCursor,
-    returnedRecordCount: records.length,
-    firstSequence: records[0]?.sequence ?? null,
-    lastSequence: records.at(-1)?.sequence ?? null,
-    returnedNextCursor: page.nextSequence ?? null,
-    hasMore: page.hasMore ?? null,
+function validateCandidates(
+  candidates: readonly RecentActivitySourceCandidate[],
+  type: '24' | '25',
+  scope: SourceJournalScope,
+): RecordEnvelope[] {
+  if (candidates.length > MAX_SOURCE_CANDIDATES_PER_TYPE) {
+    throw new Error(`Targeted Activity query returned more than ${MAX_SOURCE_CANDIDATES_PER_TYPE} Type${type} candidates.`)
+  }
+  let previousSequence = Number.POSITIVE_INFINITY
+  const seenIds = new Set<string>()
+  return candidates.map((candidate) => {
+    if (!Number.isSafeInteger(candidate.sequence) || candidate.sequence >= previousSequence
+      || !candidate.envelopeId || seenIds.has(candidate.envelopeId) || candidate.kind !== 'SDK_RECORD'
+      || typeof candidate.envelopeJson !== 'string') {
+      throw new Error(`Targeted Type${type} candidates were malformed, duplicated, or not newest-first.`)
+    }
+    previousSequence = candidate.sequence
+    seenIds.add(candidate.envelopeId)
+    const envelope = JSON.parse(candidate.envelopeJson) as Record<string, unknown>
+    if (envelope.kind !== 'SDK_RECORD' || envelope.envelopeId !== candidate.envelopeId
+      || envelope.accountId !== scope.accountId || envelope.deviceScopeId !== scope.deviceScopeId
+      || envelope.vendorDataType !== type || envelope.acquisitionMode !== 'HISTORICAL_SYNC') {
+      throw new Error(`Targeted Type${type} source ${candidate.envelopeId} failed its identity or query-scope check.`)
+    }
+    return {
+      envelopeId: candidate.envelopeId,
+      kind: candidate.kind,
+      vendorDataType: type,
+      acquisitionMode: 'HISTORICAL_SYNC',
+      sourceDate: typeof envelope.sourceDate === 'string' ? envelope.sourceDate : null,
+      candidateEntry: candidate,
+    }
   })
 }
 
-async function savedActivityEnvelopes(scope: SourceJournalScope, journal: typeof JCVitalV8): Promise<RecordEnvelope[]> {
-  const entries: RecordEnvelope[] = []
-  const seenSequences = new Set<number>()
-  const seenEnvelopeIds = new Set<string>()
-  let afterSequence = 0
-  for (let pageNumber = 0; pageNumber < 100; pageNumber++) {
-    const page = await journal.exportSourceJournal({ ...scope, afterSequence, limit: 100 })
-    const diagnostic = paginationDiagnostic(afterSequence, page)
-    if (!Array.isArray(page.envelopes) || page.envelopes.length > 100 || typeof page.hasMore !== 'boolean') {
-      throw new Error(`Saved Activity source journal returned a malformed page. ${diagnostic}`)
-    }
-    let previousSequence = afterSequence
-    for (const entry of page.envelopes) {
-      if (!Number.isSafeInteger(entry.sequence) || entry.sequence <= previousSequence
-        || !entry.envelopeId || seenSequences.has(entry.sequence) || seenEnvelopeIds.has(entry.envelopeId)) {
-        throw new Error(`Saved Activity source journal returned duplicate or unordered records. ${diagnostic}`)
-      }
-      previousSequence = entry.sequence
-      seenSequences.add(entry.sequence)
-      seenEnvelopeIds.add(entry.envelopeId)
-      if (entry.kind !== 'SDK_RECORD') continue
-      if (!entry.envelopeJson) {
-        throw new Error(`Saved Activity source journal omitted a source record payload. ${diagnostic}`)
-      }
-      const envelope = JSON.parse(entry.envelopeJson) as RecordEnvelope
-      if (envelope.kind !== 'SDK_RECORD' || envelope.envelopeId !== entry.envelopeId) {
-        throw new Error(`Saved source envelope ${entry.envelopeId} failed its identity check.`)
-      }
-      if (envelope.vendorDataType === '24' || envelope.vendorDataType === '25') entries.push(envelope)
-    }
-    const lastSequence = page.envelopes.at(-1)?.sequence ?? afterSequence
-    if (!Number.isSafeInteger(page.nextSequence) || page.nextSequence !== lastSequence) {
-      throw new Error(`Saved Activity source journal returned an invalid cursor. ${diagnostic}`)
-    }
-    if (!page.hasMore) return entries
-    if (!page.envelopes.length || page.nextSequence <= afterSequence) {
-      throw new Error(`Saved Activity source journal pagination did not advance. ${diagnostic}`)
-    }
-    afterSequence = page.nextSequence
+async function savedActivityEnvelopes(
+  scope: SourceJournalScope,
+  journal: typeof JCVitalV8,
+): Promise<{ entries: RecordEnvelope[]; type24CandidatesRead: number; type25CandidatesRead: number }> {
+  const response = await journal.getRecentActivitySourceCandidates({ ...scope, perTypeLimit: MAX_SOURCE_CANDIDATES_PER_TYPE })
+  if (response.queryMode !== 'TARGETED_RECENT_CANDIDATES' || response.perTypeLimit !== MAX_SOURCE_CANDIDATES_PER_TYPE
+    || response.includePayload !== true || response.sortOrder !== 'sequence_desc') {
+    throw new Error('Native Activity source query did not satisfy the targeted payload-bearing candidate contract.')
   }
-  throw new Error('Saved Activity source journal exceeded the 10,000-envelope verification read limit.')
+  const type24 = validateCandidates(response.type24Candidates, '24', scope)
+  const type25 = validateCandidates(response.type25Candidates, '25', scope)
+  return {
+    entries: [...type24, ...type25],
+    type24CandidatesRead: type24.length,
+    type25CandidatesRead: type25.length,
+  }
 }
 
 async function readCandidates(
@@ -201,7 +206,7 @@ async function readCandidates(
   const warnings: string[] = []
   for (const candidate of candidates.slice(0, MAX_SOURCE_CANDIDATES_PER_TYPE)) {
     try {
-      const source = await readActivitySource(journal, scope, candidate.envelopeId)
+      const source = await readActivitySource(journal, scope, candidate.envelopeId, candidate.candidateEntry)
       sources.push({ source: sourceRecord(source), envelope: candidate, sourceEnvelope: object(source.record) })
     } catch (error) {
       warnings.push(`${candidate.envelopeId}: ${describeError(error)}`)
@@ -215,17 +220,20 @@ export async function prepareActivityV2Verification(
   context: ActivityDeviceContext,
   journal: typeof JCVitalV8 = JCVitalV8,
 ): Promise<ActivityV2PreparedVerification> {
-  const envelopes = await savedActivityEnvelopes(scope, journal)
-  const dailyRead = await readCandidates(scope, envelopes, '24', journal)
+  const query = await savedActivityEnvelopes(scope, journal)
+  const dailyRead = await readCandidates(scope, query.entries, '24', journal)
   const warnings = [...dailyRead.warnings]
   let type24: ActivityV2SelectedSource | null = null
+  let type24SelectedIndex: number | null = null
   let type24FailureReason: string | null = null
-  for (const candidate of dailyRead.sources.filter(({ source }) => hasDailyEvidence(source))) {
+  const dailySelectionCandidates = dailyRead.sources.filter(({ source }) => hasDailyEvidence(source))
+  for (const [candidateIndex, candidate] of dailySelectionCandidates.entries()) {
     try {
       const prepared = await prepareActivityNativeTransportV2(candidate.source, context)
       if (prepared.payloads.length === VERIFY_METRICS.length
         && VERIFY_METRICS.every((metric) => prepared.payloads.some((payload) => payload.metric === metric))) {
         type24 = makeSelectedSource(candidate.source, candidate.envelope, candidate.sourceEnvelope, context)
+        type24SelectedIndex = candidateIndex
         break
       }
       type24FailureReason = 'Source did not prepare the exact four daily verification metrics.'
@@ -235,14 +243,17 @@ export async function prepareActivityV2Verification(
       warnings.push(`${candidate.source.sourceEnvelopeId}: ${type24FailureReason}`)
     }
   }
-  if (!type24) type24FailureReason ??= 'No persisted Type24 source contains the four required daily measurements.'
+  if (!type24) {
+    type24FailureReason ??= 'No valid Type24 source found: no persisted record contains the four required daily measurements.'
+  }
 
-  const detailRead = await readCandidates(scope, envelopes, '25', journal)
+  const detailRead = await readCandidates(scope, query.entries, '25', journal)
   warnings.push(...detailRead.warnings)
   let type25: ActivityV2SelectedSource | null = null
+  let type25SelectedIndex: number | null = null
   let type25Candidate: ActivityV2SelectedSource | null = null
   let type25FailureReason: string | null = null
-  for (const candidate of detailRead.sources) {
+  for (const [candidateIndex, candidate] of detailRead.sources.entries()) {
     try {
       const { payloads } = await prepareActivityNativeTransportV2(candidate.source, context)
       const epochs = payloads.filter((payload) => payload.metric === 'DETAILED_ACTIVITY_EPOCH')
@@ -264,6 +275,7 @@ export async function prepareActivityV2Verification(
       if (epochs.length === 10 && epochs[0].rawSourceMetadata?.type25IntegrityStatus === 'PASS'
         && epochs[0].rawSourceMetadata?.type25ArrayLength === 10) {
         type25 = type25Candidate
+        type25SelectedIndex = candidateIndex
         break
       }
       type25FailureReason = failureReason
@@ -279,7 +291,9 @@ export async function prepareActivityV2Verification(
       }
     }
   }
-  if (!type25) type25FailureReason ??= 'No persisted Type25 source passed the existing minute-segment integrity and device-scope policy.'
+  if (!type25) {
+    type25FailureReason ??= 'No qualified Type25 source found: no persisted record passed the existing minute-segment integrity and device-scope policy.'
+  }
 
   let payloads: Awaited<ReturnType<typeof prepareActivityNativeTransportV2Sources>>['payloads'] = []
   let selectionValid = false
@@ -296,5 +310,19 @@ export async function prepareActivityV2Verification(
         && payload.rawSourceMetadata?.activityTransportVersion === ACTIVITY_NATIVE_TRANSPORT_V2)
     if (!selectionValid) warnings.push('Prepared Activity v2 set differs from the bounded four-daily-plus-ten-minute verification contract.')
   }
-  return { type24, type25, type25Candidate, payloads, warnings, type24FailureReason, type25FailureReason, selectionValid }
+  return {
+    type24,
+    type25,
+    type25Candidate,
+    payloads,
+    warnings,
+    type24FailureReason,
+    type25FailureReason,
+    selectionValid,
+    sourceQueryMode: 'TARGETED_RECENT_CANDIDATES',
+    type24CandidatesRead: query.type24CandidatesRead,
+    type25CandidatesRead: query.type25CandidatesRead,
+    type24SelectedIndex,
+    type25SelectedIndex,
+  }
 }

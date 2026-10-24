@@ -72,6 +72,38 @@ class JCVitalV8SourceJournalTest {
     @Suppress("UNCHECKED_CAST")
     private fun items(export: Boolean = false, after: Long = 0, limit: Int = 100) =
         journal.list(account, device, after, limit, export)["envelopes"] as List<Map<String, Any?>>
+    @Suppress("UNCHECKED_CAST")
+    private fun candidates(type: String, limit: Int = 25): List<Map<String, Any?>> {
+        val result = journal.getRecentActivitySourceCandidates(account, device, limit)
+        return result["type${type}Candidates"] as List<Map<String, Any?>>
+    }
+    private fun insertActivityCandidate(
+        sequence: Long,
+        id: String,
+        ownerAccount: String = account,
+        ownerDevice: String = device,
+        type: String = "24",
+        acquisition: String = "HISTORICAL_SYNC",
+        kind: String = "SDK_RECORD",
+    ) {
+        val json = JSONObject()
+            .put("kind", kind)
+            .put("envelopeId", id)
+            .put("accountId", ownerAccount)
+            .put("deviceScopeId", ownerDevice)
+            .put("vendorDataType", type)
+            .put("acquisitionMode", acquisition)
+            .put("sdkSnapshot", JSONObject().put("payloadMarker", id))
+            .toString()
+        journal.writableDatabase.execSQL(
+            "INSERT INTO envelopes(sequence,id,account,device,callback_id,record_index,kind,received,timezone,json," +
+                "acquisition_mode,vendor_data_type,raw,bytes) VALUES(?,?,?,?,NULL,0,?,?,?,?,?,?,NULL,?)",
+            arrayOf(
+                sequence, id, ownerAccount, ownerDevice, kind, received, "UTC", json, acquisition, type,
+                json.toByteArray().size + 1024,
+            ),
+        )
+    }
 
     @Test fun handshakeInspectionDoesNotOpenOrCreateStorage() {
         assertFalse(context.getDatabasePath("jcvital-source-envelope-v1.db").exists())
@@ -1057,6 +1089,136 @@ class JCVitalV8SourceJournalTest {
         assertEquals(5, (exactBoundary["envelopes"] as List<*>).size)
         assertEquals(false, exactBoundary["hasMore"])
         assertEquals(final["nextSequence"], exactBoundary["nextSequence"])
+    }
+
+    @Test fun targetedActivityQueryFindsRecentCandidatesInTwentyThousandEnvelopeJournal() {
+        configure(maxBytes = 256_000_000, maxEnvelopes = 100_000)
+        val db = journal.writableDatabase
+        db.beginTransaction()
+        try {
+            db.execSQL(
+                """WITH RECURSIVE seq(n) AS (
+                    SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 19998
+                )
+                INSERT INTO envelopes(sequence,id,account,device,callback_id,record_index,kind,received,timezone,json,acquisition_mode,vendor_data_type,raw,bytes)
+                SELECT n,'unrelated-'||n,?,?,NULL,NULL,'SDK_RECORD',?,'UTC',
+                    '{"kind":"SDK_RECORD","vendorDataType":"99","acquisitionMode":"HISTORICAL_SYNC"}',
+                    'HISTORICAL_SYNC','99',NULL,1024
+                FROM seq""",
+                arrayOf(account, device, received),
+            )
+            insertActivityCandidate(19_999, "recent-type24", type = "24")
+            insertActivityCandidate(20_000, "recent-type25", type = "25")
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+
+        val result = journal.getRecentActivitySourceCandidates(account, device, 25)
+        val type24 = result["type24Candidates"] as List<*>
+        val type25 = result["type25Candidates"] as List<*>
+        assertEquals(20_000L, globalJournalMetrics().second)
+        assertEquals(1, type24.size)
+        assertEquals(1, type25.size)
+        assertEquals("recent-type24", (type24.single() as Map<*, *>)["envelopeId"])
+        assertEquals("recent-type25", (type25.single() as Map<*, *>)["envelopeId"])
+        assertTrue((type24.single() as Map<*, *>)["envelopeJson"] is String)
+        assertTrue((type25.single() as Map<*, *>)["envelopeJson"] is String)
+        assertEquals("TARGETED_RECENT_CANDIDATES", result["queryMode"])
+        assertEquals(true, result["includePayload"])
+        assertEquals("sequence_desc", result["sortOrder"])
+        val plan = db.rawQuery(
+            "EXPLAIN QUERY PLAN SELECT sequence FROM envelopes WHERE account=? AND device=? AND kind='SDK_RECORD' " +
+                "AND acquisition_mode='HISTORICAL_SYNC' AND vendor_data_type=? ORDER BY sequence DESC LIMIT ?",
+            arrayOf(account, device, "24", "25"),
+        ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.getString(3)) } }
+        assertTrue(plan.joinToString(" ").contains("envelopes_activity_candidates"))
+    }
+
+    @Test fun targetedActivityQueryReturnsAtMostTwentyFivePerTypeNewestFirst() {
+        configure()
+        for (sequence in 1L..60L) {
+            insertActivityCandidate(sequence, "activity-$sequence", type = if (sequence % 2L == 0L) "25" else "24")
+        }
+
+        val type24 = candidates("24")
+        val type25 = candidates("25")
+        assertEquals(25, type24.size)
+        assertEquals(25, type25.size)
+        assertEquals((59L downTo 11L step 2).toList(), type24.map { it["sequence"] })
+        assertEquals((60L downTo 12L step 2).toList(), type25.map { it["sequence"] })
+        assertEquals("activity-59", type24.first()["envelopeId"])
+        assertEquals("activity-60", type25.first()["envelopeId"])
+        assertTrue(type24.all { it["envelopeJson"] is String })
+        assertTrue(type25.all { it["envelopeJson"] is String })
+    }
+
+    @Test fun targetedActivityQueryIsScopedAndExcludesWrongModeAndKind() {
+        configure()
+        insertActivityCandidate(1, "scope-type24", type = "24")
+        insertActivityCandidate(2, "scope-type25", type = "25")
+        insertActivityCandidate(3, "other-device", ownerDevice = "opaque-device-B", type = "24")
+        insertActivityCandidate(4, "other-account", ownerAccount = "account-B", type = "25")
+        insertActivityCandidate(5, "wrong-mode", type = "24", acquisition = "REALTIME")
+        insertActivityCandidate(6, "wrong-kind", type = "25", kind = "SDK_CALLBACK")
+
+        assertEquals(listOf("scope-type24"), candidates("24").map { it["envelopeId"] })
+        assertEquals(listOf("scope-type25"), candidates("25").map { it["envelopeId"] })
+    }
+
+    @Test fun targetedActivityQueryRejectsInvalidLimitsAndReturnsEmptyPayloadLists() {
+        configure()
+        assertThrows(IllegalArgumentException::class.java) {
+            journal.getRecentActivitySourceCandidates(account, device, 0)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            journal.getRecentActivitySourceCandidates(account, device, 26)
+        }
+        val result = journal.getRecentActivitySourceCandidates(account, device, 1)
+        assertEquals(1, result["perTypeLimit"])
+        assertEquals(emptyList<Any>(), result["type24Candidates"])
+        assertEquals(emptyList<Any>(), result["type25Candidates"])
+    }
+
+    @Test fun schemaUpgradeIndexesExistingActivityMetadataWithoutChangingPayloads() {
+        journal.close()
+        context.deleteDatabase("jcvital-source-envelope-v1.db")
+        val legacy = android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(
+            context.getDatabasePath("jcvital-source-envelope-v1.db"), null,
+        )
+        legacy.execSQL(
+            "CREATE TABLE envelopes(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE," +
+                "account TEXT NOT NULL,device TEXT NOT NULL,callback_id TEXT,record_index INTEGER,kind TEXT NOT NULL," +
+                "received INTEGER NOT NULL,timezone TEXT NOT NULL,json TEXT NOT NULL,raw BLOB,bytes INTEGER NOT NULL)",
+        )
+        legacy.execSQL(
+            "CREATE TABLE source_files(id TEXT PRIMARY KEY,account TEXT NOT NULL,device TEXT NOT NULL," +
+                "path TEXT NOT NULL UNIQUE,session_id TEXT NOT NULL,kind TEXT NOT NULL,bytes INTEGER NOT NULL DEFAULT 0)",
+        )
+        legacy.execSQL(
+            "CREATE TABLE journal_totals(singleton INTEGER PRIMARY KEY,envelopes INTEGER NOT NULL,bytes INTEGER NOT NULL)",
+        )
+        legacy.execSQL("INSERT INTO journal_totals VALUES(1,1,1024)")
+        val expected = JSONObject()
+            .put("kind", "SDK_RECORD")
+            .put("envelopeId", "legacy-24")
+            .put("accountId", account)
+            .put("deviceScopeId", device)
+            .put("vendorDataType", "24")
+            .put("acquisitionMode", "HISTORICAL_SYNC")
+        legacy.execSQL(
+            "INSERT INTO envelopes(sequence,id,account,device,kind,received,timezone,json,bytes) " +
+                "VALUES(1,?,?,?,'SDK_RECORD',?,'UTC',?,1024)",
+            arrayOf("legacy-24", account, device, received, expected.toString()),
+        )
+        legacy.version = 1
+        legacy.close()
+        journal = JCVitalV8SourceJournal(context)
+        journal.configure(account, device, true, null, null, null)
+
+        val result = candidates("24", 1)
+        assertEquals("legacy-24", result.single()["envelopeId"])
+        assertEquals(expected.toString(), result.single()["envelopeJson"])
     }
 
     @Test fun fileManifestIsDurableOwnerScopedAndReservationsAreBounded() {

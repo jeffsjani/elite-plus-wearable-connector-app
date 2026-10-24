@@ -169,7 +169,7 @@ describe('Build 32A.1 engineering layout contracts (static; physical viewport ve
     expect(build.versionCode).toBe(build.previousVersionCode + 1)
     expect(gradle).toContain('versionCode companionVersion.versionCode')
     expect(gradle).toContain('versionName companionVersion.versionName')
-    expect(build.versionName).toContain('p1-2f-source-pagination-fix')
+    expect(build.versionName).toBe('1.0.0-phase1-p1-2f-targeted-activity-source-query')
     /*
     1-2E — BASE44 CAPABILITY HANDSHAKE DIAGNOSTIC
 The installed P1-2E APK shows:

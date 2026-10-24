@@ -136,6 +136,11 @@ describe('ActivityV2ProductionVerification preview', () => {
       type24FailureReason: null,
       type25FailureReason: null,
       selectionValid: true,
+      sourceQueryMode: 'TARGETED_RECENT_CANDIDATES',
+      type24CandidatesRead: 25,
+      type25CandidatesRead: 25,
+      type24SelectedIndex: 0,
+      type25SelectedIndex: 2,
     })
     container = document.createElement('div')
     document.body.appendChild(container)
@@ -172,6 +177,13 @@ describe('ActivityV2ProductionVerification preview', () => {
       (container.querySelector('textarea[aria-label="Activity v2 E2E preview report"]') as HTMLTextAreaElement | null)?.value ?? '',
     )
     expect(report.previewStatus).toBe('PASS')
+    expect(report.ACTIVITY_SOURCE_QUERY_MODE).toBe('TARGETED_RECENT_CANDIDATES')
+    expect(report.TYPE24_CANDIDATES_READ).toBe(25)
+    expect(report.TYPE25_CANDIDATES_READ).toBe(25)
+    expect(report.TYPE24_SELECTED_INDEX).toBe(0)
+    expect(report.TYPE25_SELECTED_INDEX).toBe(2)
+    expect(report.TYPE24_SELECTED_SOURCE_ID).toBe('type24-source')
+    expect(report.TYPE25_SELECTED_SOURCE_ID).toBe('type25-source')
     expect(report.expectedObservationCount).toBe(14)
     expect(report.observations).toHaveLength(14)
     expect(report.observations.map((entry: { observationId: string }) => entry.observationId))
