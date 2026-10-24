@@ -61,7 +61,10 @@ android.applicationVariants.all { variant ->
             outputFileName = companionVersion.versionCode == 71
                 && companionVersion.versionName == "1.0.0-phase1-p1-2f-source-pagination-fix"
                 ? "ElitePlus-Companion-Phase1-P1-2F-Source-Pagination-Fix-v71.apk"
-                : "ElitePlus-Companion-Phase1-P1-2E-Activity-V2-E2E.apk"
+                : companionVersion.versionCode == 72
+                    && companionVersion.versionName == "1.0.0-phase1-p1-2f-export-cursor-fix"
+                    ? "ElitePlus-Companion-Phase1-P1-2F-Export-Cursor-Fix-v72.apk"
+                    : "ElitePlus-Companion-Phase1-P1-2E-Activity-V2-E2E.apk"
         }
     }
 }

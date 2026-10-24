@@ -11,7 +11,32 @@ import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 import com.getcapacitor.annotation.Permission
 import com.getcapacitor.annotation.PermissionCallback
+import java.math.BigDecimal
 import org.json.JSONObject
+
+internal object JCVitalV8JournalArguments {
+    fun afterSequence(call: PluginCall): Long = exactLong(call, "afterSequence", 0L).also {
+        require(it >= 0) { "afterSequence must be non-negative" }
+    }
+
+    fun limit(call: PluginCall): Int = exactLong(call, "limit", 50L).let {
+        if (it !in 1L..100L) throw IllegalArgumentException("limit must be between 1 and 100")
+        it.toInt()
+    }
+
+    private fun exactLong(call: PluginCall, name: String, default: Long): Long {
+        if (!call.data.has(name)) return default
+        val value = call.data.opt(name)
+        val number = value as? Number ?: throw IllegalArgumentException("$name must be an integer")
+        return try {
+            BigDecimal(number.toString()).longValueExact()
+        } catch (_: NumberFormatException) {
+            throw IllegalArgumentException("$name must be an integer")
+        } catch (_: ArithmeticException) {
+            throw IllegalArgumentException("$name must be an integer")
+        }
+    }
+}
 
 @CapacitorPlugin(
     name = "JCVitalV8",
@@ -117,7 +142,7 @@ class JCVitalV8Plugin : Plugin() {
     @PluginMethod
     fun exportSourceJournal(call: PluginCall) = journalCall(call) {
         manager.sourceJournal.list(journalOwner(call), journalDevice(call),
-            call.getLong("afterSequence") ?: 0, call.getInt("limit") ?: 50, includePayload = true)
+            JCVitalV8JournalArguments.afterSequence(call), JCVitalV8JournalArguments.limit(call), includePayload = true)
     }
 
     @PluginMethod

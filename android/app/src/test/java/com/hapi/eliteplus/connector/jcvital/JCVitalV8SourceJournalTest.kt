@@ -2,6 +2,8 @@ package com.hapi.eliteplus.connector.jcvital
 
 import android.content.Context
 import android.util.Base64
+import com.getcapacitor.JSObject
+import com.getcapacitor.PluginCall
 import com.jstyle.blesdkv8.constant.BleConst
 import com.jstyle.blesdkv8.constant.DeviceKey
 import org.json.JSONObject
@@ -955,6 +957,64 @@ class JCVitalV8SourceJournalTest {
         assertEquals(2, second.size)
         assertNotEquals((first["envelopes"] as List<*>).first(), second.first())
         assertEquals(5, items().size)
+    }
+
+    @Test fun exportCursorIntegerFlowsFromCapacitorCallThroughParserIntoJournalQuery() {
+        configure()
+        repeat(250) { journal.appendRaw(byteArrayOf(it.toByte()), received + it, "UTC") }
+        val call = PluginCall(
+            null, "JCVitalV8", "test", "exportSourceJournal",
+            JSObject().put("afterSequence", 100).put("limit", 100),
+        )
+
+        assertNull(call.getLong("afterSequence"))
+        val afterSequence = JCVitalV8JournalArguments.afterSequence(call)
+        val limit = JCVitalV8JournalArguments.limit(call)
+        val result = journal.list(account, device, afterSequence, limit, includePayload = true)
+        val rows = result["envelopes"] as List<Map<String, Any?>>
+
+        assertEquals(100L, afterSequence)
+        assertEquals(100, limit)
+        assertEquals((101L..200L).toList(), rows.map { it["sequence"] as Long })
+        assertEquals(200L, result["nextSequence"])
+        assertEquals(true, result["hasMore"])
+        assertNotNull(rows.first()["envelopeJson"])
+    }
+
+    @Test fun exportCursorParserAcceptsIntegralNumbersAndRejectsInvalidValues() {
+        fun call(value: Any) = PluginCall(
+            null, "JCVitalV8", "test", "exportSourceJournal",
+            JSObject().put("afterSequence", value),
+        )
+
+        assertEquals(100L, JCVitalV8JournalArguments.afterSequence(call(100)))
+        assertEquals(100L, JCVitalV8JournalArguments.afterSequence(call(100L)))
+        assertEquals(100L, JCVitalV8JournalArguments.afterSequence(call(100.0)))
+        assertThrows(IllegalArgumentException::class.java) {
+            JCVitalV8JournalArguments.afterSequence(call(100.5))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            JCVitalV8JournalArguments.afterSequence(call(-1))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            JCVitalV8JournalArguments.afterSequence(call(Long.MAX_VALUE.toString() + "0"))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            JCVitalV8JournalArguments.afterSequence(call("100"))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            JCVitalV8JournalArguments.afterSequence(call(JSONObject.NULL))
+        }
+        fun limitCall(value: Any) = PluginCall(
+            null, "JCVitalV8", "test", "exportSourceJournal",
+            JSObject().put("limit", value),
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            JCVitalV8JournalArguments.limit(limitCall(0))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            JCVitalV8JournalArguments.limit(limitCall(101))
+        }
     }
 
     @Test fun sourceJournalPaginationUsesExclusiveLastSequenceCursorAndRetainsTerminalCursor() {
