@@ -957,6 +957,48 @@ class JCVitalV8SourceJournalTest {
         assertEquals(5, items().size)
     }
 
+    @Test fun sourceJournalPaginationUsesExclusiveLastSequenceCursorAndRetainsTerminalCursor() {
+        configure()
+        val empty = journal.list(account, device, 0, 2, true)
+        assertTrue((empty["envelopes"] as List<*>).isEmpty())
+        assertEquals(0L, empty["nextSequence"])
+        assertEquals(false, empty["hasMore"])
+
+        repeat(5) { journal.appendRaw(byteArrayOf(it.toByte()), received + it, "UTC") }
+        val first = journal.list(account, device, 0, 2, true)
+        val firstRecords = first["envelopes"] as List<*>
+        val firstSequences = firstRecords.map { (it as Map<*, *>)["sequence"] as Long }
+        assertEquals(firstSequences.sorted(), firstSequences)
+        assertTrue(first["hasMore"] as Boolean)
+        assertEquals(firstSequences.last(), first["nextSequence"])
+        assertTrue(firstRecords.all { (it as Map<*, *>)["envelopeJson"] is String })
+
+        val second = journal.list(account, device, first["nextSequence"] as Long, 2, true)
+        val secondRecords = second["envelopes"] as List<*>
+        val secondSequences = secondRecords.map { (it as Map<*, *>)["sequence"] as Long }
+        assertEquals(2, secondRecords.size)
+        assertTrue(second["hasMore"] as Boolean)
+        assertTrue(secondSequences.first() > firstSequences.last())
+        assertEquals(secondSequences.last(), second["nextSequence"])
+
+        val final = journal.list(account, device, second["nextSequence"] as Long, 2, true)
+        val finalRecords = final["envelopes"] as List<*>
+        val finalSequence = (finalRecords.single() as Map<*, *>)["sequence"]
+        assertEquals(1, finalRecords.size)
+        assertEquals(false, final["hasMore"])
+        assertEquals(finalSequence, final["nextSequence"])
+
+        val terminal = journal.list(account, device, final["nextSequence"] as Long, 2, true)
+        assertTrue((terminal["envelopes"] as List<*>).isEmpty())
+        assertEquals(final["nextSequence"], terminal["nextSequence"])
+        assertEquals(false, terminal["hasMore"])
+
+        val exactBoundary = journal.list(account, device, 0, 5, true)
+        assertEquals(5, (exactBoundary["envelopes"] as List<*>).size)
+        assertEquals(false, exactBoundary["hasMore"])
+        assertEquals(final["nextSequence"], exactBoundary["nextSequence"])
+    }
+
     @Test fun fileManifestIsDurableOwnerScopedAndReservationsAreBounded() {
         configure(maxBytes = 10000)
         val store = RawPpgPacketStore.create(context.filesDir, "test-session")

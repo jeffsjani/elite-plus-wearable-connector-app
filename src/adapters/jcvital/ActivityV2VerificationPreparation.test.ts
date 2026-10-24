@@ -1,13 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ActivitySource } from './Activity24_25Certification'
 
-const { listSourceEnvelopes, readActivitySource } = vi.hoisted(() => ({
-  listSourceEnvelopes: vi.fn(),
+const { exportSourceJournal, readActivitySource } = vi.hoisted(() => ({
+  exportSourceJournal: vi.fn(),
   readActivitySource: vi.fn(),
 }))
 
 vi.mock('./jcvitalV8Bridge', () => ({
-  JCVitalV8: { listSourceEnvelopes },
+  JCVitalV8: { exportSourceJournal },
 }))
 
 vi.mock('./Activity24_25Certification', () => ({
@@ -18,7 +18,7 @@ import { prepareActivityV2Verification } from './ActivityV2VerificationPreparati
 
 interface Fixture {
   id: string
-  type: '24' | '25'
+  type: '24' | '25' | 'other'
   date: string
   data: Record<string, unknown>
 }
@@ -32,13 +32,13 @@ const context = {
   sdkVersion: 'v8sdk2.0',
 }
 
-function fixture(id: string, type: '24' | '25', date: string, data: Record<string, unknown>): Fixture {
+function fixture(id: string, type: Fixture['type'], date: string, data: Record<string, unknown> = {}): Fixture {
   return { id, type, date, data }
 }
 
-function envelope(source: Fixture) {
+function envelope(source: Fixture, sequence: number) {
   return {
-    sequence: 1,
+    sequence,
     envelopeId: source.id,
     callbackId: null,
     recordIndex: null,
@@ -92,10 +92,19 @@ function activitySource(source: Fixture): ActivitySource {
 
 function configure(fixtures: Fixture[]) {
   const byId = new Map(fixtures.map((entry) => [entry.id, activitySource(entry)]))
-  listSourceEnvelopes.mockResolvedValue({
-    envelopes: fixtures.map(envelope),
-    hasMore: false,
-    nextSequence: fixtures.length,
+  const records = fixtures.map((entry, index) => envelope(entry, index + 1))
+  exportSourceJournal.mockImplementation(async ({ afterSequence = 0, limit = 100 }: {
+    afterSequence?: number
+    limit?: number
+  }) => {
+    const remaining = records.filter((entry) => entry.sequence > afterSequence)
+    const page = remaining.slice(0, limit)
+    return {
+      modelVersion: 'L0',
+      envelopes: page,
+      hasMore: remaining.length > page.length,
+      nextSequence: page.at(-1)?.sequence ?? afterSequence,
+    }
   })
   readActivitySource.mockImplementation(async (_journal, _scope, id: string) => {
     const source = byId.get(id)
@@ -122,7 +131,7 @@ function validType25(id: string, date: string): Fixture {
 
 describe('prepareActivityV2Verification', () => {
   beforeEach(() => {
-    listSourceEnvelopes.mockReset()
+    exportSourceJournal.mockReset()
     readActivitySource.mockReset()
   })
 
@@ -178,7 +187,112 @@ describe('prepareActivityV2Verification', () => {
     configure([validType24('daily', '2025-01-02'), validType25('detail', '2025-01-02 12:00:00')])
     const prepared = await prepareActivityV2Verification(scope, context)
     expect(prepared.payloads).toHaveLength(14)
-    expect(listSourceEnvelopes).toHaveBeenCalled()
+    expect(exportSourceJournal).toHaveBeenCalled()
     expect(readActivitySource).toHaveBeenCalledTimes(2)
+  })
+
+  it('enumerates a single page and handles an exact page-size boundary', async () => {
+    configure(Array.from({ length: 100 }, (_, index) => fixture(`other-${index}`, 'other', '2025-01-01')))
+    const prepared = await prepareActivityV2Verification(scope, context)
+    expect(prepared.type24).toBeNull()
+    expect(prepared.type25).toBeNull()
+    expect(exportSourceJournal).toHaveBeenCalledTimes(1)
+    expect(exportSourceJournal).toHaveBeenCalledWith({ ...scope, afterSequence: 0, limit: 100 })
+  })
+
+  it('continues across a final partial page without repeating or skipping source records', async () => {
+    configure([
+      ...Array.from({ length: 100 }, (_, index) => fixture(`other-${index}`, 'other', '2025-01-01')),
+      validType24('daily-final-page', '2025-01-02'),
+    ])
+    const prepared = await prepareActivityV2Verification(scope, context)
+    expect(prepared.type24?.source.sourceEnvelopeId).toBe('daily-final-page')
+    expect(exportSourceJournal.mock.calls.map(([request]) => request.afterSequence)).toEqual([0, 100])
+    expect(exportSourceJournal.mock.results.map(({ value }) => value)).toHaveLength(2)
+  })
+
+  it('selects Type24 and Type25 records from different later pages', async () => {
+    configure([
+      ...Array.from({ length: 100 }, (_, index) => fixture(`other-${index}`, 'other', '2025-01-01')),
+      validType24('daily-page-two', '2025-01-02'),
+      ...Array.from({ length: 99 }, (_, index) => fixture(`other-late-${index}`, 'other', '2025-01-01')),
+      validType25('detail-page-three', '2025-01-02 12:00:00'),
+    ])
+    const prepared = await prepareActivityV2Verification(scope, context)
+    expect(prepared.type24?.source.sourceEnvelopeId).toBe('daily-page-two')
+    expect(prepared.type25?.source.sourceEnvelopeId).toBe('detail-page-three')
+    expect(prepared.payloads).toHaveLength(14)
+    expect(exportSourceJournal.mock.calls.map(([request]) => request.afterSequence)).toEqual([0, 100, 200])
+  })
+
+  it('returns cleanly for an empty journal whose terminal cursor is unchanged', async () => {
+    configure([])
+    await expect(prepareActivityV2Verification(scope, context)).resolves.toMatchObject({
+      type24: null, type25: null, payloads: [], selectionValid: false,
+    })
+    expect(exportSourceJournal).toHaveBeenCalledWith({ ...scope, afterSequence: 0, limit: 100 })
+  })
+
+  it('fails closed when hasMore is true but the cursor does not advance', async () => {
+    exportSourceJournal.mockResolvedValue({
+      modelVersion: 'L0', envelopes: [], nextSequence: 0, hasMore: true,
+    })
+    await expect(prepareActivityV2Verification(scope, context)).rejects.toThrow(
+      /pagination did not advance.*"requestedCursor":0,"returnedRecordCount":0,"firstSequence":null,"lastSequence":null,"returnedNextCursor":0,"hasMore":true/,
+    )
+  })
+
+  it('fails closed on a malformed cursor and includes page diagnostics', async () => {
+    const entry = envelope(validType24('daily', '2025-01-02'), 1)
+    exportSourceJournal.mockResolvedValue({
+      modelVersion: 'L0',
+      envelopes: [entry],
+      nextSequence: '1',
+      hasMore: false,
+    })
+    await expect(prepareActivityV2Verification(scope, context)).rejects.toThrow(
+      /invalid cursor.*"requestedCursor":0,"returnedRecordCount":1,"firstSequence":1,"lastSequence":1,"returnedNextCursor":"1","hasMore":false/,
+    )
+  })
+
+  it('fails closed when the native response duplicates a record across pages', async () => {
+    const duplicate = envelope(validType24('daily', '2025-01-02'), 1)
+    exportSourceJournal
+      .mockResolvedValueOnce({ modelVersion: 'L0', envelopes: [duplicate], nextSequence: 1, hasMore: true })
+      .mockResolvedValueOnce({ modelVersion: 'L0', envelopes: [duplicate], nextSequence: 1, hasMore: false })
+    await expect(prepareActivityV2Verification(scope, context)).rejects.toThrow(/duplicate or unordered records/)
+  })
+
+  it('fails closed when records are not in ascending sequence order', async () => {
+    exportSourceJournal.mockResolvedValue({
+      modelVersion: 'L0',
+      envelopes: [
+        envelope(fixture('second', 'other', '2025-01-01'), 2),
+        envelope(fixture('first', 'other', '2025-01-01'), 1),
+      ],
+      nextSequence: 1,
+      hasMore: false,
+    })
+    await expect(prepareActivityV2Verification(scope, context)).rejects.toThrow(/duplicate or unordered records/)
+  })
+
+  it('stops at the 10,000-envelope bound even when each response advances', async () => {
+    exportSourceJournal.mockImplementation(async ({ afterSequence = 0 }: { afterSequence?: number }) => {
+      const sequence = afterSequence + 1
+      return {
+        modelVersion: 'L0',
+        envelopes: [{
+          ...envelope(fixture(`noise-${sequence}`, 'other', '2025-01-01'), sequence),
+          kind: 'BLE_NOTIFICATION',
+          envelopeJson: null,
+        }],
+        nextSequence: sequence,
+        hasMore: true,
+      }
+    })
+    await expect(prepareActivityV2Verification(scope, context)).rejects.toThrow(
+      'Saved Activity source journal exceeded the 10,000-envelope verification read limit.',
+    )
+    expect(exportSourceJournal).toHaveBeenCalledTimes(100)
   })
 })

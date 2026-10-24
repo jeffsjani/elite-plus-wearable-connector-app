@@ -584,6 +584,7 @@ export interface SourceEnvelopeEntry {
 export interface SourceJournalPage {
   modelVersion: string
   envelopes: SourceEnvelopeEntry[]
+  /** Last returned sequence; pass it back as the exclusive afterSequence cursor. */
   nextSequence: number
   hasMore: boolean
 }
@@ -857,7 +858,9 @@ export interface JCVitalV8Plugin {
   getJournalCapacityAnalysis(): Promise<import('./ConnectionDiagnostic').JournalCapacityAnalysis>
   /** Build 32B.8: independent SELECT-only inspection of the retained database; no Bluetooth, scope or normal open. */
   analyzeExistingJournalOffline(): Promise<import('./ConnectionDiagnostic').OfflineJournalInspection>
+  /** Sequence pagination uses sequence > afterSequence; nextSequence is the last returned sequence. */
   listSourceEnvelopes(options: SourceJournalScope & { afterSequence?: number; limit?: number }): Promise<SourceJournalPage>
+  /** Same sequence cursor contract as listSourceEnvelopes, with envelope payloads included. */
   exportSourceJournal(options: SourceJournalScope & { afterSequence?: number; limit?: number }): Promise<SourceJournalPage>
   readSourceEnvelope(options: SourceJournalScope & { envelopeId: string }): Promise<{
     envelopeId: string; sequence: number; envelopeJson: string; rawBytesBase64: string | null

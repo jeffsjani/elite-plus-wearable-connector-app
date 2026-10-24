@@ -856,6 +856,13 @@ can read ten envelopes at a time; each export contains local health-source data
 and must be handled as sensitive account data. No journal endpoint uploads to
 Base44. Disabling or switching scope terminates the old acquisition context.
 
+Journal pages use an exclusive `afterSequence` lower bound (`sequence >
+afterSequence`) and return records in ascending sequence order. `nextSequence`
+is the last sequence in a non-empty page; pass it unchanged for the next page.
+An empty terminal page retains its requested cursor and has `hasMore = false`.
+Catalog pages omit envelope JSON, so source preparation that needs to inspect
+saved records must use the payload-bearing export operation.
+
 Limits are configurable through `maxBytes`, `maxEnvelopes`, and `maxEntryBytes`.
 Defaults are 64 MiB accounted storage, 100,000 envelopes, and 1 MiB per entry;
 limits apply globally across owners while diagnostic record counts are scoped.
