@@ -1,7 +1,7 @@
 import { CapacitorSQLite } from '@capacitor-community/sqlite'
 import type { NativeObservationInput } from '../base44/base44Types'
 import { assertActivityRecoveryIds } from './ActivityCertificationTransport'
-import { MAX_QUEUE_CLAIM } from './ObservationQueueStore'
+import { MAX_QUEUE_CLAIM, SCOPED_ACTIVITY_E2E_CLAIM_COUNT } from './ObservationQueueStore'
 import type {
   EnqueueResult,
   CanonicalRecoveryBatch,
@@ -553,6 +553,51 @@ export class NativeSQLiteQueueStore implements ObservationQueueStore {
     })
     const result = await CapacitorSQLite.query({ database, statement: 'SELECT * FROM observation_queue WHERE owner_user_id = ? AND batch_id = ? ORDER BY created_at ASC, rowid ASC;', values: [ownerUserId, batchId] })
     return (result.values ?? []).map((row) => this.fromRow(row as Record<string, unknown>))
+  }
+
+  async claimPendingByObservationIds(
+    ownerUserId: string,
+    observationIds: readonly string[],
+    batchId: string,
+    now = new Date(),
+  ): Promise<QueueRecord[]> {
+    if (observationIds.length !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT
+      || new Set(observationIds).size !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT) {
+      throw new Error(`SCOPED_ACTIVITY_E2E_IDS_INVALID: exactly ${SCOPED_ACTIVITY_E2E_CLAIM_COUNT} unique IDs are required.`)
+    }
+    await this.initialize()
+    const placeholders = observationIds.map(() => '?').join(',')
+    const timestamp = now.toISOString()
+    const result = await CapacitorSQLite.run({
+      database,
+      statement: `UPDATE observation_queue SET state = 'IN_FLIGHT', batch_id = ?, updated_at = ?, claimed_at = ?, last_attempt_at = ?, attempt_count = attempt_count + 1
+        WHERE owner_user_id = ? AND observation_id IN (${placeholders}) AND state = 'PENDING'
+        AND (SELECT COUNT(*) FROM observation_queue WHERE owner_user_id = ? AND observation_id IN (${placeholders})) = ?
+        AND (SELECT COUNT(*) FROM observation_queue WHERE owner_user_id = ? AND observation_id IN (${placeholders}) AND state = 'PENDING') = ?;`,
+      values: [
+        batchId, timestamp, timestamp, timestamp,
+        ownerUserId, ...observationIds,
+        ownerUserId, ...observationIds, SCOPED_ACTIVITY_E2E_CLAIM_COUNT,
+        ownerUserId, ...observationIds, SCOPED_ACTIVITY_E2E_CLAIM_COUNT,
+      ],
+    })
+    if (Number(result.changes?.changes ?? 0) !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT) {
+      throw new Error('SCOPED_ACTIVITY_E2E_CLAIM_FAILED: every requested row must exist for this owner and be PENDING.')
+    }
+    const claimed = await CapacitorSQLite.query({
+      database,
+      statement: `SELECT * FROM observation_queue WHERE owner_user_id = ? AND batch_id = ? AND observation_id IN (${placeholders}) ORDER BY created_at ASC, rowid ASC;`,
+      values: [ownerUserId, batchId, ...observationIds],
+    })
+    const records = (claimed.values ?? []).map((row) => this.fromRow(row as Record<string, unknown>))
+    const requested = new Set(observationIds)
+    if (records.length !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT
+      || records.some((record) => record.ownerUserId !== ownerUserId || record.state !== 'IN_FLIGHT'
+        || record.batchId !== batchId || !requested.has(record.observationId))
+      || new Set(records.map((record) => record.observationId)).size !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT) {
+      throw new Error('SCOPED_ACTIVITY_E2E_CLAIM_READBACK_FAILED: claim did not match the exact requested set.')
+    }
+    return records
   }
 
   async acknowledgeClaims(claims: QueueClaim[], ownerUserId: string): Promise<number> {

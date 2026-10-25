@@ -2,6 +2,7 @@ import 'fake-indexeddb/auto'
 import { IDBFactory } from 'fake-indexeddb'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { NativeObservationInput } from '../base44/base44Types'
+import { SCOPED_ACTIVITY_E2E_CLAIM_COUNT } from './ObservationQueueStore'
 import { WebQueueStore } from './WebQueueStore'
 
 function observation(observationId: string): NativeObservationInput {
@@ -26,6 +27,41 @@ describe('WebQueueStore', () => {
     expect(second.inserted).toBe(false)
     expect(second.alreadyQueued).toBe(true)
     expect((await store.getPending(`${ownerPrefix}-a`, 100)).length).toBe(1)
+  })
+
+  it('atomically claims exactly 14 owner-scoped pending IDs and fails closed for invalid or incomplete sets', async () => {
+    const owner = `${ownerPrefix}-scoped`
+    const otherOwner = `${ownerPrefix}-other`
+    const ids = Array.from({ length: SCOPED_ACTIVITY_E2E_CLAIM_COUNT }, (_, index) => `scoped-${index}`)
+    await store.enqueueMany(owner, ids.map(observation))
+    const claimed = await store.claimPendingByObservationIds(owner, ids, 'scoped-batch')
+    expect(claimed).toHaveLength(14)
+    expect(claimed.every((record) => record.ownerUserId === owner && record.state === 'IN_FLIGHT'
+      && record.batchId === 'scoped-batch' && ids.includes(record.observationId))).toBe(true)
+
+    await expect(store.claimPendingByObservationIds(owner, ids.slice(0, 13), '13-ids')).rejects.toThrow(/exactly 14/)
+    await expect(store.claimPendingByObservationIds(owner, [...ids, 'extra'], '15-ids')).rejects.toThrow(/exactly 14/)
+    await expect(store.claimPendingByObservationIds(owner, [...ids.slice(0, 13), ids[0]], 'duplicate-ids')).rejects.toThrow(/exactly 14/)
+
+    const missingIds = Array.from({ length: 14 }, (_, index) => `missing-${index}`)
+    await store.enqueueMany(owner, missingIds.slice(0, 13).map(observation))
+    await expect(store.claimPendingByObservationIds(owner, missingIds, 'missing-row')).rejects.toThrow(/must exist/)
+    expect((await store.getPending(owner, 100)).some((record) => missingIds.includes(record.observationId))).toBe(true)
+
+    const wrongOwnerIds = Array.from({ length: 14 }, (_, index) => `wrong-owner-${index}`)
+    await store.enqueueMany(owner, wrongOwnerIds.map(observation))
+    await expect(store.claimPendingByObservationIds(otherOwner, wrongOwnerIds, 'wrong-owner')).rejects.toThrow(/must exist/)
+    expect((await Promise.all(wrongOwnerIds.map((id) => store.getRecord(owner, id))))
+      .every((record) => record?.state === 'PENDING')).toBe(true)
+
+    const nonClaimableIds = Array.from({ length: 14 }, (_, index) => `nonclaimable-${index}`)
+    await store.enqueueMany(owner, nonClaimableIds.map(observation))
+    const [preclaimed] = await store.claimPending(owner, 1, 'prior-claim', new Date(), [nonClaimableIds[0]])
+    await expect(store.claimPendingByObservationIds(owner, nonClaimableIds, 'nonclaimable'))
+      .rejects.toThrow(/must exist/)
+    expect(preclaimed.observationId).toBe(nonClaimableIds[0])
+    expect((await Promise.all(nonClaimableIds.slice(1).map((id) => store.getRecord(owner, id))))
+      .every((record) => record?.state === 'PENDING')).toBe(true)
   })
 
   it('persists local-only first associations across restart and isolates the same ID by owner', async () => {

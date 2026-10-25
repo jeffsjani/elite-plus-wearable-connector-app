@@ -3,7 +3,13 @@ import { connectorObservationService } from '../base44/ConnectorObservationServi
 import { ConnectorServiceError, type ConnectorObservationResult, type ConnectorObservationsResponse } from '../base44/base44Types'
 import { authenticationService } from '../base44/AuthenticationService'
 import { installationIdentityService } from '../storage/InstallationIdentityService'
-import { QueueStoreError, type QueueRecord, type QueueStats, type CanonicalRecoveryBatch } from '../storage/ObservationQueueStore'
+import {
+  QueueStoreError,
+  SCOPED_ACTIVITY_E2E_CLAIM_COUNT,
+  type QueueRecord,
+  type QueueStats,
+  type CanonicalRecoveryBatch,
+} from '../storage/ObservationQueueStore'
 import { observationQueue } from './ObservationQueue'
 import { BrowserNetworkStatus, type NetworkStatus } from './NetworkStatus'
 import { assertActivityRecoveryIds } from '../storage/ActivityCertificationTransport'
@@ -425,7 +431,7 @@ export class ObservationBatchManager {
   }
 
   private async attemptStartupQueueResume(): Promise<void> {
-    if (physicalTestBlocksSender()) return
+    if (physicalTestBlocksSender() || this.certificationClaimBarrier) return
     this.startupOperations++
     try { await this.runStartupQueueResume() }
     finally { this.startupOperations-- }
@@ -489,9 +495,15 @@ export class ObservationBatchManager {
 
   /** Engineering control: releases only stale SENDING rows, then attempts delivery. */
   async retryStaleSending(): Promise<number> {
-    const released = await this.recoverStaleSending('MANUAL')
-    if (released > 0) void this.process()
-    return released
+    if (this.certificationClaimBarrier) throw new Error('Stale-row recovery is blocked during scoped/certification delivery.')
+    this.startupOperations++
+    try {
+      const released = await this.recoverStaleSending('MANUAL')
+      if (released > 0) void this.process()
+      return released
+    } finally {
+      this.startupOperations--
+    }
   }
 
   private scheduleRetry(at: string): void {
@@ -555,6 +567,72 @@ export class ObservationBatchManager {
     return result
   }
 
+  async deliverScopedActivityE2E<T>(
+    observationIds: readonly string[],
+    prepare: () => Promise<void>,
+    finish: (
+      claimedRecords: readonly QueueRecord[],
+      response: ConnectorObservationsResponse | null,
+      event: BatchDeliveryEvent | null,
+    ) => Promise<T>,
+  ): Promise<T> {
+    if (physicalTestBlocksSender()) throw new Error('Physical test isolation defers scoped Activity verification.')
+    if (observationIds.length !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT
+      || new Set(observationIds).size !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT
+      || observationIds.some((id) => !/^[0-9a-f]{64}$/.test(id))) {
+      throw new Error(`Scoped Activity E2E requires exactly ${SCOPED_ACTIVITY_E2E_CLAIM_COUNT} unique SHA-256 observation IDs.`)
+    }
+    if (this.certificationClaimBarrier) throw new Error('Another scoped/certification delivery is already active.')
+    const owner = observationQueue.getOwnerUserId()
+    if (!owner) throw new QueueStoreError('QUEUE_OWNER_MISSING', 'Scoped Activity E2E requires an authenticated queue owner.')
+    this.certificationClaimBarrier = true
+    const selected = new Set(observationIds)
+    const deliveryEvent: { current: BatchDeliveryEvent | null } = { current: null }
+    let response: ConnectorObservationsResponse | null = null
+    let claimedRecords: readonly QueueRecord[] = []
+    let scopedClaimAttempted = false
+    const unsubscribe = this.subscribe((candidate) => {
+      if (candidate.observationIds.some((id) => selected.has(id))) deliveryEvent.current = candidate
+    })
+    try {
+      const deadline = Date.now() + 60_000
+      while (this.activeWorkers > 0 || this.startupOperations > 0) {
+        if (Date.now() >= deadline) throw new Error('Active production batch did not settle; scoped Activity rows were not enqueued.')
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      if (observationQueue.getOwnerUserId() !== owner) throw new Error('Queue account changed before scoped Activity verification.')
+      if (this.paused) throw new Error(this.pauseReason ?? 'Production delivery is paused.')
+      await prepare()
+      if (observationQueue.getOwnerUserId() !== owner) throw new Error('Queue account changed while preparing scoped Activity rows.')
+      this.activeWorkers++
+      this.senderGeneration++
+      try {
+        response = await this.processLoop(
+          () => undefined,
+          undefined,
+          { ids: [...observationIds], owner, onClaimed: (records) => { scopedClaimAttempted = true; claimedRecords = records } },
+        )
+      } finally {
+        this.activeWorkers--
+      }
+      if (scopedClaimAttempted && (claimedRecords.length !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT
+        || claimedRecords.some((record) => record.ownerUserId !== owner || !selected.has(record.observationId))
+        || new Set(claimedRecords.map((record) => record.observationId)).size !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT)) {
+        throw new Error('Scoped Activity claim result was not exactly the requested owner-scoped set.')
+      }
+      if (deliveryEvent.current && (deliveryEvent.current.observationIds.length !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT
+        || deliveryEvent.current.observationIds.some((id) => !selected.has(id)))) {
+        throw new Error('Scoped Activity delivery event included observations outside the requested set.')
+      }
+      if (observationQueue.getOwnerUserId() !== owner) throw new Error('Queue account changed during scoped Activity delivery.')
+      return await finish(claimedRecords, response, deliveryEvent.current)
+    } finally {
+      unsubscribe()
+      this.certificationClaimBarrier = false
+      this.rerunRequested = false
+    }
+  }
+
   async flushCertificationObservationIds(observationIds: readonly string[], options: CertificationFlushOptions = {}): Promise<CertificationFlushReport> {
     if (physicalTestBlocksSender()) throw new Error('Physical test isolation defers certification delivery.')
     const ids = [...new Set(observationIds)]
@@ -578,6 +656,7 @@ export class ObservationBatchManager {
       }))) {
       throw new Error('Activity v2 delivery blocked: current registration does not advertise JCVITAL_ACTIVITY_TRANSPORT_V2.')
     }
+    if (this.certificationClaimBarrier) throw new Error('Another scoped/certification delivery became active during preflight.')
     this.certificationClaimBarrier = true
     const events: BatchDeliveryEvent[] = []
     const selected = new Set(ids)
@@ -621,6 +700,7 @@ export class ObservationBatchManager {
     certification?: { ids: string[]; owner: string; persistEvidence?: (event: BatchDeliveryEvent) => void | Promise<void>;
       retryImmediately?: boolean; activityRecovery?: boolean; validateResults?: (event: BatchDeliveryEvent) => readonly string[];
       blockedReason?: string | null },
+    scopedActivity?: { ids: string[]; owner: string; onClaimed: (records: QueueRecord[]) => void },
   ): Promise<ConnectorObservationsResponse | null> {
     const ownerUserId = observationQueue.getOwnerUserId()
     if (!ownerUserId || this.paused) return null
@@ -635,7 +715,7 @@ export class ObservationBatchManager {
     }
     // Runs before connectivity checks so interrupted batches are released on any trigger.
     if (physicalTestBlocksSender()) return null
-    if (!certification) await this.recoverStaleSending('PROCESS')
+    if (!certification && !scopedActivity) await this.recoverStaleSending('PROCESS')
     if (!this.network.isOnline()) {
       if (certification?.activityRecovery) certification.blockedReason = 'ACTIVITY_NETWORK_OFFLINE'
       return null
@@ -649,13 +729,18 @@ export class ObservationBatchManager {
       if (certification?.activityRecovery) certification.blockedReason = 'ACTIVITY_BACKEND_DEVICE_ID_UNAVAILABLE'
       return null
     }
+    if (scopedActivity && !activityV2CapabilityStore.isEnabled({
+      ownerUserId: scopedActivity.owner, installId: this.installId(), connectorDeviceId,
+    })) throw new Error('Scoped Activity delivery blocked: current registration does not enable the Activity V2 capability.')
     const batchId = createBatchId()
-    if (certification ? observationQueue.getOwnerUserId() !== certification.owner : this.certificationClaimBarrier) return null
+    if (certification || scopedActivity) {
+      if (observationQueue.getOwnerUserId() !== (certification?.owner ?? scopedActivity?.owner)) return null
+    } else if (this.certificationClaimBarrier) return null
     // Recheck after asynchronous preflight; an already-started claim still settles normally.
     if (physicalTestBlocksSender()) return null
     // Atomic: selection + IN_FLIGHT marking happen in one transaction so concurrent workers never claim the same rows.
     let ordinaryClaimLimit = this.config.batchSize
-    if (!certification && !activityV2CapabilityStore.isEnabled({
+    if (!certification && !scopedActivity && !activityV2CapabilityStore.isEnabled({
       ownerUserId: ownerUserId, installId: this.installId(), connectorDeviceId,
     })) {
       const pending = await observationQueue.getPending(this.config.batchSize)
@@ -666,12 +751,15 @@ export class ObservationBatchManager {
       }
       if (firstV2 > 0) ordinaryClaimLimit = firstV2
     }
-    const records = certification
+    const records = scopedActivity
+      ? await observationQueue.claimPendingByObservationIds(scopedActivity.owner, scopedActivity.ids, batchId)
+      : certification
       ? certification.activityRecovery
         ? await observationQueue.claimActivityCertificationObservationIds(certification.ids, batchId)
         : await observationQueue.claimCertificationObservationIds(certification.ids, batchId, certification.retryImmediately)
       : await observationQueue.claimPending(ordinaryClaimLimit, batchId)
-    if (certification && observationQueue.getOwnerUserId() !== ownerUserId) throw new Error('Queue account changed while claiming a certification batch.')
+    if ((certification || scopedActivity) && observationQueue.getOwnerUserId() !== ownerUserId) throw new Error('Queue account changed while claiming a scoped batch.')
+    scopedActivity?.onClaimed(records)
     onClaimed(records.length > 0)
     if (!records.length) {
       if (certification?.activityRecovery) certification.blockedReason = 'ACTIVITY_EXACT_CLAIM_ZERO_ROWS'
@@ -871,7 +959,7 @@ export class ObservationBatchManager {
             }
           }
         }
-        await observationQueue.purgeAcknowledged(certification ? observationIds : undefined)
+        await observationQueue.purgeAcknowledged(certification || scopedActivity ? observationIds : undefined)
       } catch (error) {
         // Base44 accepted the batch; replaying the same observation IDs is idempotent.
         diag.lastErrorCode = 'ACK_PROCESSING_FAILED'

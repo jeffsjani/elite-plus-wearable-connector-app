@@ -1,6 +1,6 @@
 import type { NativeObservationInput } from '../base44/base44Types'
 import { activityTransportClaimable, assertActivityRecoveryIds } from './ActivityCertificationTransport'
-import { MAX_QUEUE_CLAIM } from './ObservationQueueStore'
+import { MAX_QUEUE_CLAIM, SCOPED_ACTIVITY_E2E_CLAIM_COUNT } from './ObservationQueueStore'
 import type {
   CanonicalRecoveryBatch,
   CanonicalRecoveryClaim,
@@ -362,6 +362,63 @@ export class WebQueueStore implements ObservationQueueStore {
       cursor.continue()
     }
     await transactionDone(transaction)
+    return claimed
+  }
+
+  async claimPendingByObservationIds(
+    ownerUserId: string,
+    observationIds: readonly string[],
+    batchId: string,
+    now = new Date(),
+  ): Promise<QueueRecord[]> {
+    if (observationIds.length !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT
+      || new Set(observationIds).size !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT) {
+      throw new Error(`SCOPED_ACTIVITY_E2E_IDS_INVALID: exactly ${SCOPED_ACTIVITY_E2E_CLAIM_COUNT} unique IDs are required.`)
+    }
+    await this.initialize()
+    const transaction = this.database!.transaction(storeName, 'readwrite')
+    const store = transaction.objectStore(storeName)
+    const index = store.index('ownerObservation')
+    const timestamp = now.toISOString()
+    const rows: Array<QueueRecord | undefined> = Array(observationIds.length)
+    let validationError: Error | null = null
+    let completed = 0
+    observationIds.forEach((id, position) => {
+      const request = index.get([ownerUserId, id])
+      request.onsuccess = () => {
+        rows[position] = request.result as QueueRecord | undefined
+        completed++
+        if (completed !== observationIds.length) return
+        if (rows.some((row) => !row || row.ownerUserId !== ownerUserId || row.state !== 'PENDING')) {
+          validationError = new Error('SCOPED_ACTIVITY_E2E_CLAIM_FAILED: every requested row must exist for this owner and be PENDING.')
+          transaction.abort()
+          return
+        }
+        for (const row of rows as QueueRecord[]) {
+          row.state = 'IN_FLIGHT'
+          row.batchId = batchId
+          row.updatedAt = timestamp
+          row.claimedAt = timestamp
+          row.lastAttemptAt = timestamp
+          row.attemptCount++
+          store.put(row)
+        }
+      }
+    })
+    try {
+      await transactionDone(transaction)
+    } catch (error) {
+      if (validationError) throw validationError
+      throw error
+    }
+    const claimed = rows as QueueRecord[]
+    const requested = new Set(observationIds)
+    if (claimed.length !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT
+      || claimed.some((record) => record.ownerUserId !== ownerUserId || record.state !== 'IN_FLIGHT'
+        || record.batchId !== batchId || !requested.has(record.observationId))
+      || new Set(claimed.map((record) => record.observationId)).size !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT) {
+      throw new Error('SCOPED_ACTIVITY_E2E_CLAIM_READBACK_FAILED: claim did not match the exact requested set.')
+    }
     return claimed
   }
 

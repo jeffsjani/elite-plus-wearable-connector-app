@@ -22,6 +22,10 @@ export function activityV2PreviewCanVerify(
       && type24.mappingValid === true && typeof type24.sourceEnvelopeId === 'string' && Boolean(type24.sourceEnvelopeId)
       && type25.qualification === 'PASS' && typeof type25.sourceEnvelopeId === 'string' && Boolean(type25.sourceEnvelopeId)
       && queue.queueConflict === false
+      && queue.TEST_OBSERVATION_COLLISION_COUNT === 0
+      && preview.SCOPED_E2E_SUPPORTED === 'YES' && preview.SCOPED_E2E_SAFE === 'YES'
+      && preview.DIAGNOSTIC_WORKER_RACE_PREVENTED === 'YES'
+      && preview.NORMAL_FIFO_BACKLOG_PROCESSING_BYPASSED_FOR_DIAGNOSTIC === 'YES'
       && observations.length === 14 && ids.every((id) => typeof id === 'string' && id.length > 0)
       && new Set(ids).size === 14
       && scope.ownerUserId === identity.ownerUserId && scope.installId === identity.installId

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   listDiagnosticRecords: vi.fn(),
   getQueueStats: vi.fn(),
+  getDeliveryDiagnostics: vi.fn(),
   getDiagnostics: vi.fn(),
   enqueueMany: vi.fn(),
   process: vi.fn(),
@@ -13,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   loadReport: vi.fn(),
   prepare: vi.fn(),
   enqueueActivity: vi.fn(),
+  deliverScopedActivityE2E: vi.fn(),
   base44ObservationCall: vi.fn(),
   acquireActivity: vi.fn(),
 }))
@@ -46,7 +48,11 @@ vi.mock('../../services/sync/ObservationQueue', () => ({
   },
 }))
 vi.mock('../../services/sync/ObservationBatchManager', () => ({
-  observationBatchManager: { process: mocks.process, getDeliveryDiagnostics: vi.fn() },
+  observationBatchManager: {
+    process: mocks.process,
+    deliverScopedActivityE2E: mocks.deliverScopedActivityE2E,
+    getDeliveryDiagnostics: mocks.getDeliveryDiagnostics,
+  },
 }))
 vi.mock('../../services/base44/base44Environment', () => ({
   BASE44_PRODUCTION_ENVIRONMENT: { observationsFunction: 'nativeConnectorObservations' },
@@ -90,6 +96,10 @@ describe('ActivityV2ProductionVerification preview', () => {
     mocks.loadReport.mockResolvedValue(null)
     mocks.saveReport.mockResolvedValue(undefined)
     mocks.getDiagnostics.mockReturnValue({ queueStoreInitialized: true })
+    mocks.getDeliveryDiagnostics.mockReturnValue({
+      queuePausedForCanonicalFailure: false,
+      pauseReason: null,
+    })
     mocks.getQueueStats.mockResolvedValue({
       pending: 0, retrying: 0, inFlight: 0, failed: 0,
       canonicalRecoveryRequired: false, canonicalRecoveryObservationCount: 0,
@@ -185,6 +195,10 @@ describe('ActivityV2ProductionVerification preview', () => {
     expect(report.TYPE24_SELECTED_SOURCE_ID).toBe('type24-source')
     expect(report.TYPE25_SELECTED_SOURCE_ID).toBe('type25-source')
     expect(report.expectedObservationCount).toBe(14)
+    expect(report.SCOPED_E2E_SUPPORTED).toBe('YES')
+    expect(report.SCOPED_E2E_SAFE).toBe('YES')
+    expect(report.DIAGNOSTIC_WORKER_RACE_PREVENTED).toBe('YES')
+    expect(report.NORMAL_FIFO_BACKLOG_PROCESSING_BYPASSED_FOR_DIAGNOSTIC).toBe('YES')
     expect(report.observations).toHaveLength(14)
     expect(report.observations.map((entry: { observationId: string }) => entry.observationId))
       .toEqual(Array.from({ length: 14 }, (_, index) => `observation-${index}`))
@@ -207,5 +221,40 @@ describe('ActivityV2ProductionVerification preview', () => {
     expect(mocks.acquireActivity).not.toHaveBeenCalled()
     expect(setItem).not.toHaveBeenCalled()
     expect(mocks.saveReport).toHaveBeenCalledTimes(1)
+  })
+
+  it('passes Preview with an unrelated pending backlog when scoped E2E safety is available', async () => {
+    mocks.getQueueStats.mockResolvedValue({
+      pending: 1, retrying: 0, inFlight: 0, failed: 0,
+      canonicalRecoveryRequired: false, canonicalRecoveryObservationCount: 0,
+    })
+    await act(async () => {
+      root.render(createElement(ActivityV2ProductionVerification, {
+        ownerUserId: 'owner-1',
+        scope: { accountId: 'owner-1', deviceScopeId: 'device-1' },
+        device: {
+          deviceId: 'device-1', deviceModel: 'PRO_V8',
+          firmwareVersion: '0.0.8.8', sdkVersion: 'v8sdk2.0',
+        },
+      }))
+    })
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)))
+    const previewButton = [...container.querySelectorAll('button')]
+      .find((button) => button.textContent?.includes('Preview Activity V2 E2E'))
+    await act(async () => {
+      previewButton?.click()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    const report = JSON.parse(
+      (container.querySelector('textarea[aria-label="Activity v2 E2E preview report"]') as HTMLTextAreaElement | null)?.value ?? '',
+    )
+    expect(report.previewStatus).toBe('PASS')
+    expect(report.QUEUE_BACKLOG_PRESENT).toBe('YES')
+    expect(report.queue.TEST_OBSERVATION_COLLISION_COUNT).toBe(0)
+    expect(report.SCOPED_E2E_SUPPORTED).toBe('YES')
+    expect(report.SCOPED_E2E_SAFE).toBe('YES')
+    expect(mocks.process).not.toHaveBeenCalled()
+    expect(mocks.deliverScopedActivityE2E).not.toHaveBeenCalled()
+    expect(mocks.enqueueActivity).not.toHaveBeenCalled()
   })
 })

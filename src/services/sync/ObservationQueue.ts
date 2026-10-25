@@ -6,6 +6,7 @@ import { activityTransportClaimable, assertActivityRecoveryIds, verifyActivityTr
 import {
   QueueStoreError,
   MAX_QUEUE_CLAIM,
+  SCOPED_ACTIVITY_E2E_CLAIM_COUNT,
   type EnqueueResult,
   type ObservationQueueStore,
   type QueueErrorCode,
@@ -235,6 +236,24 @@ export class ObservationQueue {
   async getPending(limit: number): Promise<QueueRecord[]> { const owner = await this.ready(); return this.store.getPending(owner, Math.min(limit, queueLimits.maxBatchClaim)) }
   /** Atomic claim used by the batch manager so concurrent workers never pick up the same PENDING rows. */
   async claimPending(limit: number, batchId: string): Promise<QueueRecord[]> { const owner = await this.ready(); return this.guard('QUEUE_WRITE_FAILED', () => this.store.claimPending(owner, Math.min(limit, queueLimits.maxBatchClaim), batchId)) }
+  async claimPendingByObservationIds(ownerUserId: string, observationIds: readonly string[], batchId: string, now = new Date()): Promise<QueueRecord[]> {
+    const owner = await this.ready()
+    if (owner !== ownerUserId) throw new QueueStoreError('QUEUE_OWNER_MISSING', 'Scoped Activity claim owner does not match the authenticated queue owner.')
+    if (observationIds.length !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT
+      || new Set(observationIds).size !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT) {
+      throw new QueueStoreError('QUEUE_READ_FAILED', `Scoped Activity claim requires exactly ${SCOPED_ACTIVITY_E2E_CLAIM_COUNT} unique observation IDs.`)
+    }
+    const records = await this.guard('QUEUE_WRITE_FAILED', () =>
+      this.store.claimPendingByObservationIds(owner, observationIds, batchId, now))
+    const requested = new Set(observationIds)
+    if (this.getOwnerUserId() !== owner || records.length !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT
+      || records.some((record) => record.ownerUserId !== owner || record.state !== 'IN_FLIGHT'
+        || record.batchId !== batchId || !requested.has(record.observationId))
+      || new Set(records.map((record) => record.observationId)).size !== SCOPED_ACTIVITY_E2E_CLAIM_COUNT) {
+      throw new QueueStoreError('QUEUE_WRITE_FAILED', 'Scoped Activity claim result did not match the exact owner-scoped ID set.')
+    }
+    return records
+  }
   async claimCertificationObservationIds(observationIds: readonly string[], batchId: string, ignoreRetryBackoff = false): Promise<QueueRecord[]> {
     if (observationIds.length > queueLimits.maxBatchClaim) throw new QueueStoreError('QUEUE_READ_FAILED', 'Certification claim exceeds the 100-row limit.')
     const owner = await this.ready()

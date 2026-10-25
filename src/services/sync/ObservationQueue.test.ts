@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { NativeObservationInput } from '../base44/base44Types'
 import { NativeSQLiteQueueStore } from '../storage/NativeSQLiteQueueStore'
-import { QueueStoreError, type QueueRecord } from '../storage/ObservationQueueStore'
+import { QueueStoreError, SCOPED_ACTIVITY_E2E_CLAIM_COUNT, type QueueRecord } from '../storage/ObservationQueueStore'
 import { WebQueueStore } from '../storage/WebQueueStore'
 import { buildWorkoutHrObservation } from '../../adapters/jcvital/WorkoutHrDelivery'
 import { ObservationQueue, observationQueue } from './ObservationQueue'
@@ -16,6 +16,7 @@ import { TemperatureCertification } from '../../adapters/jcvital/TemperatureCert
 import { buildCertificationValidationExport, serializeCertificationValidationExport } from '../../adapters/jcvital/CertificationValidationExport'
 import { ACTIVITY_RESUME_IDS, ACTIVITY_EXCLUDED_ID, ACTIVITY_R5_REVISION, ACTIVITY_RESPONSE_CONTRACT } from '../../adapters/jcvital/ActivityResumeContract'
 import { transportFingerprint, type ActivityTransportEvidence } from '../storage/ActivityCertificationTransport'
+import { createSyntheticObservation } from '../testing/SyntheticObservationFactory'
 
 const sqlite = vi.hoisted(() => ({
   connections: new Set<string>(),
@@ -92,6 +93,70 @@ async function physicalFixture(owner: string): Promise<NativeObservationInput> {
   }, physicalContext, 'America/New_York')
   return observation!
 }
+
+describe('exact scoped Activity E2E claims on both queue stores', () => {
+  it.each(['SQLITE', 'INDEXEDDB'] as const)('%s claims only the 14 supplied PENDING rows and rejects invalid owner/state', async (kind) => {
+    const store = kind === 'SQLITE' ? new NativeSQLiteQueueStore() : new WebQueueStore()
+    const queue = new ObservationQueue(store)
+    const owner = `scoped-e2e-${kind}-${Date.now()}`
+    queue.setOwnerUserId(owner)
+    await queue.initialize()
+    const ids = Array.from({ length: SCOPED_ACTIVITY_E2E_CLAIM_COUNT }, (_, index) => index.toString(16).padStart(64, '0'))
+    const payloads = ids.map((observationId) => ({ ...createSyntheticObservation('activity-v2-e2e'), observationId }))
+    await queue.enqueueMany(payloads)
+
+    await expect(queue.claimPendingByObservationIds(`${owner}-wrong`, ids, 'wrong-owner'))
+      .rejects.toThrow(/does not match/)
+    await expect(queue.claimPendingByObservationIds(owner, ids.slice(0, 13), '13-ids'))
+      .rejects.toThrow(/exactly 14/)
+    await expect(queue.claimPendingByObservationIds(owner, [...ids, 'f'.repeat(64)], '15-ids'))
+      .rejects.toThrow(/exactly 14/)
+    await expect(queue.claimPendingByObservationIds(owner, [...ids.slice(0, 13), ids[0]], 'duplicate-ids'))
+      .rejects.toThrow(/exactly 14/)
+
+    const claimed = await queue.claimPendingByObservationIds(owner, ids, 'scoped-batch')
+    expect(claimed).toHaveLength(14)
+    expect(claimed.map((record) => record.observationId).sort()).toEqual([...ids].sort())
+    expect(claimed.every((record) => record.ownerUserId === owner && record.state === 'IN_FLIGHT'
+      && record.batchId === 'scoped-batch')).toBe(true)
+
+    const missingOwner = `${owner}-missing`
+    queue.setOwnerUserId(missingOwner)
+    await queue.enqueueMany(payloads.slice(0, 13))
+    await expect(queue.claimPendingByObservationIds(missingOwner, ids, 'missing-row'))
+      .rejects.toThrow(/must exist/)
+    expect((await Promise.all(ids.slice(0, 13).map((id) => queue.getRecord(id))))
+      .every((record) => record?.state === 'PENDING')).toBe(true)
+
+    const nonClaimableOwner = `${owner}-nonclaimable`
+    queue.setOwnerUserId(nonClaimableOwner)
+    await queue.enqueueMany(payloads)
+    const preclaimed = await queue.claimPending(1, 'pre-existing-claim')
+    expect(preclaimed).toHaveLength(1)
+    await expect(queue.claimPendingByObservationIds(nonClaimableOwner, ids, 'nonclaimable'))
+      .rejects.toThrow(/must exist/)
+    expect((await Promise.all(ids.slice(1).map((id) => queue.getRecord(id))))
+      .every((record) => record?.state === 'PENDING')).toBe(true)
+  })
+
+  it('rejects a scoped store result that contains an ID outside the requested set', async () => {
+    const store = new WebQueueStore()
+    const queue = new ObservationQueue(store)
+    const owner = `scoped-e2e-bad-result-${Date.now()}`
+    queue.setOwnerUserId(owner)
+    await queue.initialize()
+    const ids = Array.from({ length: 14 }, (_, index) => `bad-result-${index}`)
+    await queue.enqueueMany(ids.map((observationId) => ({ ...createSyntheticObservation(), observationId })))
+    const claim = store.claimPendingByObservationIds.bind(store)
+    vi.spyOn(store, 'claimPendingByObservationIds').mockImplementation(async (...args) => {
+      const records = await claim(...args)
+      return records.map((record, index) => index === 0 ? { ...record, observationId: 'unrelated-id' } : record)
+    })
+
+    await expect(queue.claimPendingByObservationIds(owner, ids, 'bad-readback'))
+      .rejects.toThrow(/exact owner-scoped ID set/)
+  })
+})
 
 beforeEach(() => {
   sqlite.connections.clear()

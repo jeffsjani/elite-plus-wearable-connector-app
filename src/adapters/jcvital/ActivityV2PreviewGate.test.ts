@@ -18,10 +18,14 @@ function preview(overrides: Record<string, unknown> = {}) {
   return {
     previewStatus: 'PASS',
     expectedObservationCount: 14,
+    SCOPED_E2E_SUPPORTED: 'YES',
+    SCOPED_E2E_SAFE: 'YES',
+    DIAGNOSTIC_WORKER_RACE_PREVENTED: 'YES',
+    NORMAL_FIFO_BACKLOG_PROCESSING_BYPASSED_FOR_DIAGNOSTIC: 'YES',
     selectionScope: identity,
     type24: { sourceEnvelopeId: 'type24-id', mappingValid: true },
     type25: { sourceEnvelopeId: 'type25-id', qualification: 'PASS' },
-    queue: { queueConflict: false },
+    queue: { queueConflict: false, TEST_OBSERVATION_COLLISION_COUNT: 0 },
     observations: Array.from({ length: 14 }, (_, index) => ({ observationId: `observation-${index}` })),
     ...overrides,
   }
@@ -48,7 +52,11 @@ describe('activityV2PreviewCanVerify', () => {
     ['missing Type24', { type24: { mappingValid: false } }],
     ['missing qualified Type25', { type25: { qualification: 'FAIL' } }],
     ['queue conflict', { queue: { queueConflict: true } }],
+    ['observation collision', { queue: { queueConflict: false, TEST_OBSERVATION_COLLISION_COUNT: 1 } }],
     ['wrong observation count', { expectedObservationCount: 13 }],
+    ['scoped claim unsupported', { SCOPED_E2E_SUPPORTED: 'NO' }],
+    ['scoped claim unsafe', { SCOPED_E2E_SAFE: 'NO' }],
+    ['worker race not prevented', { DIAGNOSTIC_WORKER_RACE_PREVENTED: 'NO' }],
     ['duplicate observation IDs', {
       observations: [...Array.from({ length: 13 }, (_, index) => ({ observationId: `observation-${index}` })),
         { observationId: 'observation-0' }],

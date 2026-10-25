@@ -1,6 +1,7 @@
 import type { NativeObservationInput } from '../base44/base44Types'
 
 export const MAX_QUEUE_CLAIM = 100
+export const SCOPED_ACTIVITY_E2E_CLAIM_COUNT = 14
 
 export type QueueState = 'PENDING' | 'IN_FLIGHT' | 'RETRY_WAIT' | 'ACKNOWLEDGED' | 'FAILED_PERMANENT' | 'CANONICAL_RECOVERY_REQUIRED'
 
@@ -166,6 +167,7 @@ export interface ObservationQueueStore {
    * so two concurrent workers can never claim the same PENDING/RETRY_WAIT rows.
    */
   claimPending(ownerUserId: string, limit: number, batchId: string, now?: Date, observationIds?: readonly string[], ignoreRetryBackoff?: boolean): Promise<QueueRecord[]>
+  claimPendingByObservationIds(ownerUserId: string, observationIds: readonly string[], batchId: string, now?: Date): Promise<QueueRecord[]>
   claimActivityCertification(ownerUserId: string, observationIds: readonly string[], batchId: string): Promise<QueueRecord[]>
   acknowledgeClaims(claims: QueueClaim[], ownerUserId: string): Promise<number>
   markCanonicalRecoveryRequired(claims: CanonicalRecoveryClaim[], ownerUserId: string, error: QueueErrorMetadata): Promise<number>

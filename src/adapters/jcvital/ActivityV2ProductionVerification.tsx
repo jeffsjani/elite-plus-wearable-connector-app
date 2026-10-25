@@ -4,7 +4,7 @@ import { activityV2CapabilityStore } from '../../services/base44/ActivityV2Capab
 import { connectorIdentityService } from '../../services/base44/ConnectorIdentityService'
 import { observationQueue } from '../../services/sync/ObservationQueue'
 import { observationBatchManager, type BatchDeliveryEvent } from '../../services/sync/ObservationBatchManager'
-import type { QueueRecord, QueueStats } from '../../services/storage/ObservationQueueStore'
+import type { QueueRecord } from '../../services/storage/ObservationQueueStore'
 import { BASE44_PRODUCTION_ENVIRONMENT, resolveConnectorFunctionUrl } from '../../services/base44/base44Environment'
 import { saveValidationJson } from './CertificationJsonExport'
 import {
@@ -55,12 +55,6 @@ function summarizeResults(event: BatchDeliveryEvent | null) {
   }))
 }
 
-function idleQueue(stats: QueueStats): boolean {
-  return stats.pending === 0 && stats.retrying === 0 && stats.inFlight === 0 && stats.failed === 0
-    && stats.canonicalRecoveryRequired !== true
-    && (stats.canonicalRecoveryObservationCount ?? 0) === 0
-}
-
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -71,6 +65,39 @@ function countQueueStates(records: readonly QueueRecord[]) {
     pending: records.filter((record) => record.state === 'PENDING').length,
     failed: records.filter((record) => record.state === 'FAILED_PERMANENT').length,
   }
+}
+
+function physiologyBacklog(records: readonly QueueRecord[]) {
+  const physiologyTypes = new Set(['27', '59', '68'])
+  const pending = records.filter((record) => record.state === 'PENDING'
+    && record.payload.provider === 'JCVITAL' && physiologyTypes.has(record.payload.vendorDataType ?? ''))
+  const counts = new Map<string, number>()
+  for (const record of pending) {
+    const key = `${record.payload.metric || record.payload.metricType || '(missing metric)'} / type ${record.payload.vendorDataType}`
+    counts.set(key, (counts.get(key) ?? 0) + 1)
+  }
+  return {
+    pending: pending.length,
+    byType: [...counts].map(([key, count]) => ({ key, count })).sort((left, right) => left.key.localeCompare(right.key)),
+  }
+}
+
+function backlogFingerprint(records: readonly QueueRecord[]) {
+  const physiology = physiologyBacklog(records)
+  return {
+    QUEUE_TOTAL: records.length,
+    PHYSIOLOGY_PENDING: physiology.pending,
+    PHYSIOLOGY_PENDING_BY_TYPE: physiology.byType,
+  }
+}
+
+function backlogFingerprintMatches(
+  before: ReturnType<typeof backlogFingerprint>,
+  after: ReturnType<typeof backlogFingerprint>,
+): boolean {
+  return before.QUEUE_TOTAL === after.QUEUE_TOTAL
+    && before.PHYSIOLOGY_PENDING === after.PHYSIOLOGY_PENDING
+    && JSON.stringify(before.PHYSIOLOGY_PENDING_BY_TYPE) === JSON.stringify(after.PHYSIOLOGY_PENDING_BY_TYPE)
 }
 
 function queueRowsChanged(before: readonly QueueRecord[], after: readonly QueueRecord[], excludedIds: ReadonlySet<string>): boolean {
@@ -182,6 +209,12 @@ export function ActivityV2ProductionVerification({
       type25: null,
       sourceSelectionWarnings: [],
       expectedObservationCount: 0,
+      QUEUE_BACKLOG_PRESENT: 'NO',
+      SCOPED_E2E_SUPPORTED: typeof observationBatchManager.deliverScopedActivityE2E === 'function' ? 'YES' : 'NO',
+      SCOPED_E2E_SAFE: typeof observationBatchManager.deliverScopedActivityE2E === 'function' ? 'YES' : 'NO',
+      DIAGNOSTIC_WORKER_RACE_PREVENTED: typeof observationBatchManager.deliverScopedActivityE2E === 'function' ? 'YES' : 'NO',
+      NORMAL_FIFO_BACKLOG_PROCESSING_BYPASSED_FOR_DIAGNOSTIC:
+        typeof observationBatchManager.deliverScopedActivityE2E === 'function' ? 'YES' : 'NO',
       observations: [],
       queue: null,
       safetyAssertions: {
@@ -259,9 +292,23 @@ export function ActivityV2ProductionVerification({
       }))
       const ids = prepared.payloads.map((payload) => payload.observationId)
       const queue = await readQueueSnapshot(ids)
-      const queueConflict = queue.records.length > 0 || !idleQueue(queue.stats)
+      const scopedE2ESupported = typeof observationBatchManager.deliverScopedActivityE2E === 'function'
+      const deliveryState = observationBatchManager.getDeliveryDiagnostics()
+      const scopedE2ESafe = scopedE2ESupported && !deliveryState.queuePausedForCanonicalFailure
+        && deliveryState.pauseReason === null && queue.stats.canonicalRecoveryRequired !== true
+        && (queue.stats.canonicalRecoveryObservationCount ?? 0) === 0
+      const queueConflict = queue.matchingRecords.length > 0
+      const backlog = backlogFingerprint(queue.records)
+      const queueBacklogPresent = queue.stats.pending > 0 || queue.stats.retrying > 0
+        || queue.stats.inFlight > 0 || queue.stats.failed > 0
+      report.QUEUE_BACKLOG_PRESENT = queueBacklogPresent ? 'YES' : 'NO'
+      report.SCOPED_E2E_SUPPORTED = scopedE2ESupported ? 'YES' : 'NO'
+      report.SCOPED_E2E_SAFE = scopedE2ESafe ? 'YES' : 'NO'
+      report.DIAGNOSTIC_WORKER_RACE_PREVENTED = scopedE2ESupported ? 'YES' : 'NO'
+      report.NORMAL_FIFO_BACKLOG_PROCESSING_BYPASSED_FOR_DIAGNOSTIC = scopedE2ESupported ? 'YES' : 'NO'
       report.queue = {
         ...summarizeActivityV2QueueBacklog(queue.records),
+        ...backlog,
         queueCountBefore: queue.counts.count,
         pendingCountBefore: queue.stats.pending,
         failedCountBefore: queue.stats.failed,
@@ -272,18 +319,25 @@ export function ActivityV2ProductionVerification({
         })),
         TEST_OBSERVATION_COLLISION_COUNT: queue.matchingRecords.length,
         TEST_OBSERVATION_IDS_ABSENT: Math.max(0, ids.length - queue.matchingRecords.length),
+        QUEUE_BACKLOG_PRESENT: queueBacklogPresent ? 'YES' : 'NO',
+        SCOPED_E2E_SUPPORTED: scopedE2ESupported ? 'YES' : 'NO',
+        SCOPED_E2E_SAFE: scopedE2ESafe ? 'YES' : 'NO',
+        DIAGNOSTIC_WORKER_RACE_PREVENTED: scopedE2ESupported ? 'YES' : 'NO',
+        NORMAL_FIFO_BACKLOG_PROCESSING_BYPASSED_FOR_DIAGNOSTIC: scopedE2ESupported ? 'YES' : 'NO',
         queueConflict,
       }
       const valid = currentCapability.capabilitySupported && currentCapability.productionDeliveryEnabled
         && currentCapability.reason === 'CAPABILITY_SUPPORTED'
         && Boolean(prepared.type24 && prepared.type25 && prepared.selectionValid)
-        && prepared.payloads.length === 14 && !queueConflict
+        && prepared.payloads.length === 14 && queue.matchingRecords.length === 0
+        && scopedE2ESupported && scopedE2ESafe
       report.previewStatus = valid ? 'PASS' : 'FAIL'
       if (!currentCapability.productionDeliveryEnabled) (report.blockers as string[]).push('Production Activity V2 capability is not enabled.')
       if (!prepared.type24) (report.blockers as string[]).push(prepared.type24FailureReason ?? 'Qualified Type24 source unavailable.')
       if (!prepared.type25) (report.blockers as string[]).push(prepared.type25FailureReason ?? 'Qualified Type25 source unavailable.')
       if (prepared.payloads.length !== 14 || !prepared.selectionValid) (report.blockers as string[]).push('Expected observation set is not exactly four daily plus ten minute observations.')
-      if (queueConflict) (report.blockers as string[]).push('Queue is not clear for a first controlled verification or matching observations already exist.')
+      if (queueConflict) (report.blockers as string[]).push('Deterministic Activity observation IDs already exist in the production queue.')
+      if (!scopedE2ESupported || !scopedE2ESafe) (report.blockers as string[]).push('Scoped Activity E2E delivery is not available or safe in this build.')
     } catch (error) {
       ;(report.blockers as string[]).push(describeError(error))
     }
@@ -315,8 +369,15 @@ export function ActivityV2ProductionVerification({
         throw new Error('Preview belongs to a different authenticated owner, installation or device scope.')
       }
       const previewQueue = object(preview.queue)
-      if (previewQueue.queueConflict !== false || preview.expectedObservationCount !== 14) {
-        throw new Error('Preview queue or observation-count gate did not pass.')
+      if (previewQueue.queueConflict !== false || previewQueue.TEST_OBSERVATION_COLLISION_COUNT !== 0
+        || preview.expectedObservationCount !== 14 || preview.SCOPED_E2E_SUPPORTED !== 'YES'
+        || preview.SCOPED_E2E_SAFE !== 'YES'
+        || preview.DIAGNOSTIC_WORKER_RACE_PREVENTED !== 'YES'
+        || preview.NORMAL_FIFO_BACKLOG_PROCESSING_BYPASSED_FOR_DIAGNOSTIC !== 'YES') {
+        throw new Error('Preview scoped-claim, queue-collision or observation-count gate did not pass.')
+      }
+      if (object(preview.type24).mappingValid !== true || object(preview.type25).qualification !== 'PASS') {
+        throw new Error('Preview requires a valid Type24 mapping and passing Type25 qualification.')
       }
     } catch (error) {
       setStatus(`Verification remains disabled until preview passes. ${describeError(error)}`)
@@ -347,16 +408,41 @@ export function ActivityV2ProductionVerification({
     setBusy(true)
     onBusyChange?.(true)
     setStatus('')
+    const attemptTime = new Date().toISOString()
     const report: Record<string, unknown> = {
       schema: 'eliteplus.activity-v2-production-verification.v1',
-      verifiedAt: new Date().toISOString(),
-      e2eAttemptTime: new Date().toISOString(),
+      verifiedAt: attemptTime,
+      e2eAttemptTime: attemptTime,
+      E2E_ATTEMPT_TIME: attemptTime,
+      EXPECTED_OBSERVATION_COUNT: 14,
+      SCOPED_CLAIM_REQUESTED_COUNT: 14,
+      SCOPED_CLAIMED_COUNT: 0,
+      OBSERVATION_COUNT_SENT: 0,
+      TEST_SENT_COUNT: 0,
+      UNRELATED_CLAIMED: 0,
+      UNRELATED_SENT: 0,
+      UNRELATED_ACKED: 0,
+      PHYSIOLOGY_PENDING_BEFORE: null,
+      PHYSIOLOGY_PENDING_AFTER: null,
+      BACKLOG_UNCHANGED: 'NO',
+      HTTP_STATUS: null,
+      REQUEST_ATTEMPT_COUNT: 0,
+      ACK_RECEIVED: 'NO',
+      ACK_ACCEPTED_COUNT: 0,
+      ACK_DUPLICATE_COUNT: 0,
+      ACK_REJECTED_COUNT: 0,
+      TEST_OBSERVATIONS_PENDING_AFTER: 0,
+      TEST_OBSERVATIONS_FAILED_AFTER: 0,
       endpoint: resolveConnectorFunctionUrl(BASE44_PRODUCTION_ENVIRONMENT.observationsFunction),
       requestMethod: 'POST',
       transportE2E: 'FAIL',
+      TRANSPORT_E2E: 'FAIL',
       fullCanonicalE2E: 'UNVERIFIED',
+      FULL_CANONICAL_E2E: 'UNVERIFIED',
       canonicalResponseEvidence: 'FAILED',
-      independentCanonicalRowReadback: 'NOT AVAILABLE',
+      CANONICAL_RESPONSE_EVIDENCE: 'FAIL',
+      independentCanonicalRowReadback: 'UNAVAILABLE',
+      INDEPENDENT_CANONICAL_ROW_READBACK: 'UNAVAILABLE',
       firstSendDuplicateIndication: 'NO',
       serverCapabilityObserved: {
         name: ACTIVITY_V2_CAPABILITY,
@@ -384,12 +470,10 @@ export function ActivityV2ProductionVerification({
       sourceSelectionWarnings: [] as string[],
       errorsBlockers: [] as string[],
     }
-    const eventRef: { current: BatchDeliveryEvent | null } = { current: null }
     let payloads: NativeObservationInput[] = []
+    const transportState: { prepared: Awaited<ReturnType<typeof enqueueActivityNativeTransportV2>> | null } = { prepared: null }
     let response: ConnectorObservationsResponse | null = null
     let attemptStarted = false
-    let queueRecordsBefore: QueueRecord[] = []
-    let queueStatsBefore: QueueStats | null = null
     try {
       const currentInstallId = localStorage.getItem('installId') ?? ''
       const currentConnectorDeviceId = connectorIdentityService.getConnectorDeviceId() ?? ''
@@ -401,8 +485,6 @@ export function ActivityV2ProductionVerification({
       }
       if (scope.accountId !== ownerUserId) throw new Error('Saved Activity journal account does not match the authenticated owner.')
       if (observationQueue.getOwnerUserId() !== ownerUserId) throw new Error('Production queue owner does not match the authenticated owner.')
-      if (observationBatchManager.getDeliveryDiagnostics().senderActive) throw new Error('Production sender is active; verification was not enqueued.')
-
       const context: ActivityDeviceContext = { ownerUserId, ...device }
       if (!context.deviceId || !context.deviceModel || !context.firmwareVersion || !context.sdkVersion) {
         throw new Error('Current authenticated device metadata is incomplete.')
@@ -418,6 +500,8 @@ export function ActivityV2ProductionVerification({
       if (!type24.sourceEnvelopeId || !type25.sourceEnvelopeId) {
         throw new Error('Saved Activity verification sources require exact source-envelope identities.')
       }
+      const type24SourceEnvelopeId = type24.sourceEnvelopeId
+      const type25SourceEnvelopeId = type25.sourceEnvelopeId
       const previewSources = object(preview.type24)
       const previewDetail = object(preview.type25)
       if (previewSources.sourceEnvelopeId !== type24.sourceEnvelopeId
@@ -443,115 +527,132 @@ export function ActivityV2ProductionVerification({
         throw new Error(`Production capability gate changed after preview (${selectedCapability.reason}).`)
       }
 
-      const queueBefore = await readQueueSnapshot(payloads.map((payload) => payload.observationId))
-      queueRecordsBefore = queueBefore.records
-      queueStatsBefore = queueBefore.stats
-      if (queueBefore.records.length || queueBefore.matchingRecords.length || !idleQueue(queueBefore.stats)) {
-        const queueStates = Object.fromEntries(queueBefore.matchingRecords.map((record) => [record.observationId, record.state]))
+      const ids = payloads.map((payload) => payload.observationId)
+      if (ids.length !== 14 || new Set(ids).size !== 14) {
+        throw new Error('Prepared Activity v2 set must contain exactly 14 unique observation IDs.')
+      }
+      let queueBefore: Awaited<ReturnType<typeof readQueueSnapshot>> | null = null
+      let beforeFingerprint: ReturnType<typeof backlogFingerprint> | null = null
+      let insertedCount = 0
+      let duplicateCount = 0
+      let unrelatedClaimedCount = 0
+      let requestAttemptCount = 0
+      let unrelatedChanged = false
+
+      const scopedResult = await observationBatchManager.deliverScopedActivityE2E(ids, async () => {
+        queueBefore = await readQueueSnapshot(ids)
+        beforeFingerprint = backlogFingerprint(queueBefore.records)
+        report.backlogFingerprintBefore = beforeFingerprint
+        const queueConflict = queueBefore.matchingRecords.length !== 0
+        const physiologyBefore = physiologyBacklog(queueBefore.records)
+        report.PHYSIOLOGY_PENDING_BEFORE = physiologyBefore.pending
+        report.physiologyPendingByTypeBefore = physiologyBefore.byType
+        report.QUEUE_BACKLOG_PRESENT = queueBefore.stats.pending > 0 || queueBefore.stats.retrying > 0
+          || queueBefore.stats.inFlight > 0 || queueBefore.stats.failed > 0 ? 'YES' : 'NO'
         report.queue = {
-          preflightClear: false, enqueueCount: 0, insertedCount: 0,
-          duplicateCount: queueBefore.matchingRecords.length, pendingIdsAfterEnqueue: [],
+          ...summarizeActivityV2QueueBacklog(queueBefore.records),
+          ...beforeFingerprint,
+          preflightClear: !queueConflict,
+          enqueueCount: 0,
+          insertedCount: 0,
+          duplicateCount: queueBefore.matchingRecords.length,
+          pendingIdsAfterEnqueue: [],
           queueCountBefore: queueBefore.counts.count,
           pendingCountBefore: queueBefore.stats.pending,
           failedCountBefore: queueBefore.stats.failed,
+          TEST_OBSERVATION_COLLISION_COUNT: queueBefore.matchingRecords.length,
         }
-        report.delivery = { ...(report.delivery as object), queueStates }
-        throw new Error('Production queue conflict detected after preview; no observations were enqueued.')
-      }
-      const before = queueBefore.stats
-      report.queue = {
-        preflightClear: true, enqueueCount: 0, insertedCount: 0, duplicateCount: 0, pendingIdsAfterEnqueue: [],
-        queueCountBefore: queueBefore.counts.count,
-        pendingCountBefore: before.pending,
-        failedCountBefore: before.failed,
-      }
-      if (!beginActivityV2VerificationAttempt(localStorage, attemptKey, {
-        type24: type24.sourceEnvelopeId, type25: type25.sourceEnvelopeId,
-      })) {
-        throw new Error('A saved verification attempt already exists; no duplicate enqueue is allowed.')
-      }
-      attemptStarted = true
-      const prepared = await enqueueActivityNativeTransportV2(
-        [type24, type25], context, observationQueue,
-        activityV2CapabilityStore.isEnabled({ ownerUserId, installId, connectorDeviceId }),
-        ACTIVITY_V2_VERIFICATION_SCOPE,
-      )
-      payloads = prepared.payloads
-      if (payloads.length !== 14 || prepared.payloadCount !== 14) {
-        throw new Error('Prepared Activity v2 set differs from the bounded four-daily-plus-ten-minute verification contract.')
-      }
-      const insertedCount = prepared.insertedCount
-      const duplicateCount = prepared.duplicateCount
-      report.summary = {
-        sourceRecordsProjected: prepared.sourceRecordCount,
-        observationsQueued: insertedCount,
-        delivered: 0,
-        acknowledged: 0,
-        failed: 0,
-      }
-      Object.assign(report.queue as object, {
-        enqueueCount: prepared.payloadCount, insertedCount, duplicateCount,
-      })
-      if (insertedCount !== prepared.payloadCount || duplicateCount !== 0) {
-        const queueStates: Record<string, string> = {}
-        for (const payload of payloads) queueStates[payload.observationId] = (await observationQueue.getRecord(payload.observationId))?.state ?? 'MISSING'
-        report.delivery = { ...(report.delivery as object), queueStates }
-        const acknowledged = Object.values(queueStates).filter((state) => state === 'ACKNOWLEDGED').length
+        if (queueConflict) throw new Error('Deterministic Activity observation ID collision detected; no observations were enqueued.')
+        if (!beginActivityV2VerificationAttempt(localStorage, attemptKey, {
+          type24: type24SourceEnvelopeId, type25: type25SourceEnvelopeId,
+        })) {
+          throw new Error('A saved verification attempt already exists; no duplicate enqueue is allowed.')
+        }
+        attemptStarted = true
+        const prepared = await enqueueActivityNativeTransportV2(
+          [type24, type25], context, observationQueue,
+          activityV2CapabilityStore.isEnabled({ ownerUserId, installId, connectorDeviceId }),
+          ACTIVITY_V2_VERIFICATION_SCOPE,
+        )
+        transportState.prepared = prepared
+        payloads = prepared.payloads
+        insertedCount = prepared.insertedCount
+        duplicateCount = prepared.duplicateCount
         report.summary = {
           sourceRecordsProjected: prepared.sourceRecordCount,
           observationsQueued: insertedCount,
-          delivered: acknowledged,
-          acknowledged,
-          failed: Object.values(queueStates).filter((state) => state === 'FAILED_PERMANENT').length,
+          delivered: 0,
+          acknowledged: 0,
+          failed: 0,
         }
-        ;(report.errorsBlockers as string[]).push('Equivalent deterministic observations were found during enqueue; no sender retry was attempted.')
-        return
-      }
-
-      const pending = await observationQueue.getPending(100)
-      const ids = payloads.map((payload) => payload.observationId)
-      const pendingIds = pending.map((record) => record.observationId)
-      Object.assign(report.queue as object, { pendingIdsAfterEnqueue: pendingIds })
-      if (pendingIds.length !== ids.length || ids.some((id) => !pendingIds.includes(id))) {
-        throw new Error('Production queue changed during verification preflight; normal sender was not invoked by this action.')
-      }
-      if (observationBatchManager.getDeliveryDiagnostics().senderActive) {
-        throw new Error('Production sender became active; normal sender was not invoked by this action.')
-      }
-
-      let notifyResult: (() => void) | undefined
-      const unsubscribe = observationBatchManager.subscribe((candidate) => {
-        if (candidate.observationIds.some((id) => ids.includes(id))) {
-          eventRef.current = candidate
-          notifyResult?.()
+        Object.assign(report.queue as object, {
+          enqueueCount: prepared.payloadCount, insertedCount, duplicateCount,
+        })
+        if (payloads.length !== 14 || prepared.payloadCount !== 14
+          || insertedCount !== 14 || duplicateCount !== 0
+          || JSON.stringify(payloads.map((payload) => payload.observationId)) !== JSON.stringify(ids)) {
+          throw new Error('Exactly 14 new deterministic Activity observations must be enqueued; no duplicate or changed set is allowed.')
+        }
+        const queuedRows = await Promise.all(ids.map((id) => observationQueue.getRecord(id)))
+        if (queuedRows.some((row, index) => !row || row.ownerUserId !== ownerUserId
+          || row.observationId !== ids[index] || row.state !== 'PENDING')) {
+          throw new Error('One or more expected Activity IDs are missing or not PENDING after enqueue.')
+        }
+        Object.assign(report.queue as object, { pendingIdsAfterEnqueue: ids })
+      }, async (claimedRecords, responseValue, eventValue) => {
+        unrelatedClaimedCount = claimedRecords.filter((record) => !ids.includes(record.observationId)).length
+        const beforeSnapshot = queueBefore
+        if (!beforeSnapshot) throw new Error('Scoped queue snapshot before enqueue was not captured.')
+        const afterSnapshot = await readQueueSnapshot(ids)
+        const finalFingerprint = backlogFingerprint(afterSnapshot.records)
+        report.backlogFingerprintAfter = finalFingerprint
+        const physiologyAfter = physiologyBacklog(afterSnapshot.records)
+        report.PHYSIOLOGY_PENDING_AFTER = physiologyAfter.pending
+        report.physiologyPendingByTypeAfter = physiologyAfter.byType
+        unrelatedChanged = queueRowsChanged(beforeSnapshot.records, afterSnapshot.records, new Set(ids))
+        const fingerprintUnchanged = beforeFingerprint !== null
+          && backlogFingerprintMatches(beforeFingerprint, finalFingerprint)
+        report.BACKLOG_UNCHANGED = fingerprintUnchanged && !unrelatedChanged ? 'YES' : 'NO'
+        const diagnostics = observationBatchManager.getDeliveryDiagnostics()
+        const lastBatch = diagnostics.lastBatch
+        requestAttemptCount = lastBatch && eventValue && lastBatch.batchId === eventValue.batchId
+          ? lastBatch.attemptNumber : eventValue ? 1 : 0
+        report.SCOPED_CLAIM_REQUESTED_COUNT = ids.length
+        report.SCOPED_CLAIMED_COUNT = claimedRecords.length
+        report.UNRELATED_CLAIMED = unrelatedClaimedCount
+        report.OBSERVATION_COUNT_SENT = eventValue?.observationIds.length ?? 0
+        report.TEST_SENT_COUNT = eventValue?.observationIds.length ?? 0
+        report.UNRELATED_SENT = eventValue?.observationIds.filter((id) => !ids.includes(id)).length ?? 0
+        report.UNRELATED_ACKED = eventValue?.acknowledgedIds.filter((id) => !ids.includes(id)).length ?? 0
+        report.HTTP_STATUS = eventValue?.httpStatus ?? null
+        report.REQUEST_ATTEMPT_COUNT = requestAttemptCount
+        report.ACK_RECEIVED = responseValue ? 'YES' : 'NO'
+        report.ACK_ACCEPTED_COUNT = responseValue?.accepted ?? eventValue?.accepted ?? 0
+        report.ACK_DUPLICATE_COUNT = responseValue?.duplicate ?? eventValue?.duplicate ?? 0
+        report.ACK_REJECTED_COUNT = responseValue?.rejected ?? eventValue?.rejected ?? 0
+        return {
+          queueAfter: afterSnapshot,
+          queueBefore: beforeSnapshot,
+          diagnostics,
+          response: responseValue,
+          event: eventValue,
+          transportPreparation: transportState.prepared,
         }
       })
-      try {
-        response = await observationBatchManager.process()
-        if (!eventRef.current) {
-          await new Promise<void>((resolve) => {
-            const timer = window.setTimeout(resolve, 35_000)
-            notifyResult = () => { window.clearTimeout(timer); resolve() }
-          })
-        }
-      } finally {
-        unsubscribe()
-      }
-      const deliveryEvent = eventRef.current
+      const { queueAfter: finalQueueSnapshot, queueBefore: initialQueueSnapshot } = scopedResult
+      response = scopedResult.response
+      const deliveryEvent = scopedResult.event
+      if (!scopedResult.transportPreparation) throw new Error('Scoped Activity transport preparation did not complete.')
+      const prepared = scopedResult.transportPreparation
       const results = summarizeResults(deliveryEvent)
       const queueStates: Record<string, string> = {}
-      const queueAfter = await readQueueSnapshot(ids)
       for (const id of ids) {
-        const row = queueAfter.matchingRecords.find((record) => record.observationId === id)
+        const row = finalQueueSnapshot.matchingRecords.find((record) => record.observationId === id)
         queueStates[id] = row?.state ?? (deliveryEvent?.acknowledgedIds.includes(id) ? 'ACKNOWLEDGED_PURGED' : 'MISSING')
       }
-      const deliveryDiagnostics = observationBatchManager.getDeliveryDiagnostics()
-      const lastBatch = deliveryDiagnostics.lastBatch
-      const requestAttemptCount = lastBatch && deliveryEvent && lastBatch.batchId === deliveryEvent.batchId
-        ? lastBatch.attemptNumber : deliveryEvent ? 1 : 0
-      const unrelatedChanged = queueRowsChanged(queueRecordsBefore, queueAfter.records, new Set(ids))
       const perObservation = payloads.map((payload) => {
         const result = results.find((candidate) => candidate.observationId === payload.observationId) ?? null
+        const rowBefore = initialQueueSnapshot.matchingRecords.find((record) => record.observationId === payload.observationId)
         return {
           observationId: payload.observationId,
           metric: payload.metric,
@@ -559,6 +660,9 @@ export function ActivityV2ProductionVerification({
           timeWindow: payload.observedAt,
           slot: payload.sequenceNumber ?? 'record',
           value: payload.valueNumber,
+          queueStateBefore: rowBefore?.state ?? 'MISSING',
+          queueStateAfter: queueStates[payload.observationId],
+          resultClassification: result?.status ?? null,
           resultStatus: result?.status ?? null,
           ackState: queueStates[payload.observationId],
           canonicalStatus: result?.canonicalStatus ?? null,
@@ -606,31 +710,40 @@ export function ActivityV2ProductionVerification({
       const ackComplete = Boolean(deliveryEvent && deliveryEvent.acknowledgedIds.length === 14
         && ids.every((id) => deliveryEvent.acknowledgedIds.includes(id)))
       const noUnexpectedRejection = !deliveryEvent?.rejectedIds.length && results.every((result) => result.status !== 'rejected')
-      const testPendingAfter = queueAfter.matchingRecords.filter((record) =>
+      const testPendingAfter = finalQueueSnapshot.matchingRecords.filter((record) =>
         record.state === 'PENDING' || record.state === 'RETRY_WAIT' || record.state === 'IN_FLIGHT').length
-      const testFailedAfter = queueAfter.matchingRecords.filter((record) =>
+      const testFailedAfter = finalQueueSnapshot.matchingRecords.filter((record) =>
         record.state === 'FAILED_PERMANENT' || record.state === 'CANONICAL_RECOVERY_REQUIRED').length
       const transportPass = insertedCount === 14 && prepared.payloadCount === 14
+        && scopedResult.queueBefore.matchingRecords.length === 0
+        && report.SCOPED_CLAIMED_COUNT === 14 && unrelatedClaimedCount === 0
+        && (report.UNRELATED_SENT === 0) && (report.UNRELATED_ACKED === 0)
         && (deliveryEvent?.httpStatus ?? 0) >= 200 && (deliveryEvent?.httpStatus ?? 0) < 300
         && ackComplete && noUnexpectedRejection && testPendingAfter === 0 && testFailedAfter === 0
-        && requestAttemptCount === 1 && !unrelatedChanged
+        && requestAttemptCount === 1 && !unrelatedChanged && report.BACKLOG_UNCHANGED === 'YES'
       Object.assign(report, classifyActivityV2Verification(transportPass, canonicalResponseConfirmed))
+      report.TRANSPORT_E2E = transportPass ? 'PASS' : 'FAIL'
+      report.CANONICAL_RESPONSE_EVIDENCE = canonicalResponseConfirmed ? 'PASS' : 'FAIL'
+      report.INDEPENDENT_CANONICAL_ROW_READBACK = 'UNAVAILABLE'
+      report.FULL_CANONICAL_E2E = 'UNVERIFIED'
       report.firstSendDuplicateIndication = (deliveryEvent?.duplicate ?? response?.duplicate ?? 0) > 0
         || results.some((result) => result.status === 'duplicate') ? 'YES' : 'NO'
       report.requestAttemptCount = requestAttemptCount
-      report.observationCountSent = insertedCount
+      report.observationCountSent = deliveryEvent?.observationIds.length ?? 0
       report.ackReceived = Boolean(deliveryEvent)
       report.ackAcceptedCount = response?.accepted ?? deliveryEvent?.accepted ?? 0
       report.ackDuplicateCount = response?.duplicate ?? deliveryEvent?.duplicate ?? 0
       report.ackRejectedCount = response?.rejected ?? deliveryEvent?.rejected ?? 0
+      report.TEST_OBSERVATIONS_PENDING_AFTER = testPendingAfter
+      report.TEST_OBSERVATIONS_FAILED_AFTER = testFailedAfter
       report.observationResults = perObservation
       report.queueLifecycle = {
-        queueCountBefore: queueRecordsBefore.length,
-        queueCountAfter: queueAfter.counts.count,
-        pendingCountBefore: queueStatsBefore?.pending ?? null,
-        pendingCountAfter: queueAfter.stats.pending,
-        failedCountBefore: queueStatsBefore?.failed ?? null,
-        failedCountAfter: queueAfter.stats.failed,
+        queueCountBefore: initialQueueSnapshot.records.length,
+        queueCountAfter: finalQueueSnapshot.counts.count,
+        pendingCountBefore: initialQueueSnapshot.stats.pending,
+        pendingCountAfter: finalQueueSnapshot.stats.pending,
+        failedCountBefore: initialQueueSnapshot.stats.failed,
+        failedCountAfter: finalQueueSnapshot.stats.failed,
         testObservationsPendingAfter: testPendingAfter,
         testObservationsFailedAfter: testFailedAfter,
         unrelatedQueueItemsChanged: unrelatedChanged,

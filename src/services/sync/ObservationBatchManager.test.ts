@@ -3,12 +3,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { authenticationService } from '../base44/AuthenticationService'
 import { connectorIdentityService } from '../base44/ConnectorIdentityService'
 import { connectorObservationService } from '../base44/ConnectorObservationService'
+import { activityV2CapabilityStore } from '../base44/ActivityV2Capability'
 import { ConnectorServiceError } from '../base44/base44Types'
 import { ObservationBatchManager } from './ObservationBatchManager'
 import { observationQueue } from './ObservationQueue'
 import type { NetworkStatus } from './NetworkStatus'
 import { createSyntheticObservation } from '../testing/SyntheticObservationFactory'
 import { addAcquisitionProvenance } from './ObservationProvenancePayload'
+import { ACTIVITY_NATIVE_TRANSPORT_V2 } from '../../adapters/jcvital/ActivityNativeTransportV2'
 
 class TestStorage {
   private readonly values = new Map<string, string>()
@@ -299,4 +301,192 @@ describe('ObservationBatchManager', () => {
     expect(stats.retrying).toBe(0)
     expect(stats.failed).toBe(0)
   })
+
+  it('waits for an active normal worker and blocks unscoped claims during scoped preparation', async () => {
+    Object.assign(globalThis, { localStorage: new TestStorage() })
+    localStorage.setItem('installId', 'scoped-barrier-install')
+    const owner = `scoped-barrier-${Date.now()}`
+    observationQueue.setOwnerUserId(owner)
+    await observationQueue.initialize()
+    await observationQueue.enqueue(createSyntheticObservation('normal-before-scope'))
+    connectorIdentityService.setConnectorDeviceId('scoped-barrier-device')
+    vi.spyOn(authenticationService, 'isAuthenticated').mockResolvedValue(true)
+    vi.spyOn(activityV2CapabilityStore, 'isEnabled').mockReturnValue(true)
+
+    let resolveFirst!: (response: Awaited<ReturnType<typeof connectorObservationService.submitObservations>>) => void
+    const firstResponse = new Promise<Awaited<ReturnType<typeof connectorObservationService.submitObservations>>>((resolve) => {
+      resolveFirst = resolve
+    })
+    let firstRequestFinished = false
+    const upload = vi.spyOn(connectorObservationService, 'submitObservations')
+      .mockImplementationOnce(async () => firstResponse.then((response) => {
+        firstRequestFinished = true
+        return response
+      }))
+      .mockImplementation(async (request) => ({
+        success: true,
+        batchId: request.batchId,
+        accepted: 14,
+        duplicate: 0,
+        rejected: 0,
+        errors: [],
+        serverTimestamp: new Date().toISOString(),
+        results: request.observations.map((item) => ({
+          observationId: item.observationId,
+          status: 'accepted' as const,
+          nativeObservationId: `native-${item.observationId}`,
+          canonicalStatus: 'canonicalized' as const,
+          canonicalTarget: `activity.${item.metric}`,
+        })),
+      }))
+    const manager = new ObservationBatchManager({}, new TestNetwork(true))
+    const normalRun = manager.process()
+    await vi.waitFor(() => expect(upload).toHaveBeenCalledTimes(1))
+
+    const ids = Array.from({ length: 14 }, (_, index) => index.toString(16).padStart(64, '0'))
+    const activity = ids.map((observationId) => ({
+      ...createSyntheticObservation('DAILY_STEPS'),
+      observationId,
+      provider: 'JCVITAL',
+      vendorDataType: '24',
+      metricType: 'DAILY_STEPS',
+      rawSourceMetadata: { activityTransportVersion: ACTIVITY_NATIVE_TRANSPORT_V2, canonicalPolicy: 'NATIVE_ONLY' },
+    }))
+    let prepared = false
+    const scopedRun = manager.deliverScopedActivityE2E(ids, async () => {
+      expect(firstRequestFinished).toBe(true)
+      prepared = true
+      await observationQueue.enqueueMany(activity)
+    }, async (claimed, response, event) => ({ claimed, response, event }))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(prepared).toBe(false)
+    await manager.process()
+    expect(upload).toHaveBeenCalledTimes(1)
+
+    resolveFirst({
+      success: true,
+      batchId: 'normal-before-scope',
+      accepted: 1,
+      duplicate: 0,
+      rejected: 0,
+      errors: [],
+      serverTimestamp: new Date().toISOString(),
+      results: [{
+        observationId: (upload.mock.calls[0][0].observations[0]).observationId,
+        status: 'accepted',
+        canonicalStatus: 'not_applicable',
+      }],
+    })
+    const [, scoped] = await Promise.all([normalRun, scopedRun])
+
+    expect(prepared).toBe(true)
+    expect(upload).toHaveBeenCalledTimes(2)
+    expect(upload.mock.calls[1][0].observations.map((item) => item.observationId).sort()).toEqual([...ids].sort())
+    expect(scoped.claimed).toHaveLength(14)
+    expect(scoped.event?.observationIds).toHaveLength(14)
+    expect(scoped.event?.observationIds.every((id) => ids.includes(id))).toBe(true)
+  })
+
+  it('delivers exactly 14 scoped Activity IDs without touching a 10,392-row physiology backlog', async () => {
+    Object.assign(globalThis, { localStorage: new TestStorage() })
+    localStorage.setItem('installId', 'scoped-e2e-install')
+    const owner = `scoped-e2e-backlog-${Date.now()}`
+    observationQueue.setOwnerUserId(owner)
+    await observationQueue.initialize()
+    connectorIdentityService.setConnectorDeviceId('scoped-e2e-device')
+    vi.spyOn(authenticationService, 'isAuthenticated').mockResolvedValue(true)
+    vi.spyOn(activityV2CapabilityStore, 'isEnabled').mockReturnValue(true)
+
+    const backlogSpecs = [
+      { count: 8_164, type: '27', metric: 'heartRate', field: 'heartRate' },
+      { count: 1_532, type: '59', metric: 'wearableTemperature', field: 'temperature' },
+      { count: 696, type: '68', metric: 'oxygenSaturation', field: 'oxygenSaturation' },
+    ] as const
+    const backlog = backlogSpecs.flatMap(({ count, type, metric, field }) =>
+      Array.from({ length: count }, (_, index) => ({
+        ...createSyntheticObservation(metric),
+        observationId: `history-${type}-${index}`,
+        provider: 'JCVITAL',
+        vendorDataType: type,
+        vendorField: field,
+        metricType: metric,
+        acquisitionMode: 'HISTORICAL_SYNC',
+      })))
+    await observationQueue.enqueueMany(backlog)
+
+    const ids = Array.from({ length: 14 }, (_, index) => index.toString(16).padStart(64, '0'))
+    const activity = ids.map((observationId, index) => ({
+      ...createSyntheticObservation(index < 4 ? 'DAILY_STEPS' : 'DETAILED_ACTIVITY_EPOCH'),
+      observationId,
+      provider: 'JCVITAL',
+      sourceConnector: 'JCVITAL_NATIVE',
+      vendorDataType: index < 4 ? '24' : '25',
+      vendorField: index < 4 ? 'step' : 'arraySteps',
+      metricType: index < 4 ? 'DAILY_STEPS' : 'DETAILED_ACTIVITY_EPOCH',
+      rawSourceMetadata: {
+        activityTransportVersion: ACTIVITY_NATIVE_TRANSPORT_V2,
+        canonicalPolicy: 'NATIVE_ONLY',
+        canonicalTarget: null,
+      },
+    }))
+    const upload = vi.spyOn(connectorObservationService, 'submitObservations').mockImplementation(async (request) => ({
+      success: true,
+      batchId: request.batchId,
+      accepted: 14,
+      duplicate: 0,
+      rejected: 0,
+      errors: [],
+      serverTimestamp: new Date().toISOString(),
+      results: request.observations.map((item) => ({
+        observationId: item.observationId,
+        status: 'accepted' as const,
+        nativeObservationId: `native-${item.observationId}`,
+        canonicalStatus: 'canonicalized' as const,
+        canonicalTarget: `activity.${item.metric}`,
+      })),
+    }))
+    const manager = new ObservationBatchManager({}, new TestNetwork(true))
+    let beforeRecords: Awaited<ReturnType<typeof observationQueue.listDiagnosticRecords>> = []
+    const result = await manager.deliverScopedActivityE2E(ids, async () => {
+      beforeRecords = await observationQueue.listDiagnosticRecords()
+      expect(beforeRecords).toHaveLength(10_392)
+      await observationQueue.enqueueMany(activity)
+    }, async (claimed, response, event) => ({
+      claimed,
+      response,
+      event,
+      before: beforeRecords,
+      after: await observationQueue.listDiagnosticRecords(),
+    }))
+
+    const countsByType = (records: typeof beforeRecords) => backlogSpecs.map(({ type }) => ({
+      type,
+      count: records.filter((record) => record.state === 'PENDING' && record.payload.vendorDataType === type).length,
+    }))
+    const unrelatedSent = result.event?.observationIds.filter((id) => !ids.includes(id)) ?? []
+    const unrelatedAcked = result.event?.acknowledgedIds.filter((id) => !ids.includes(id)) ?? []
+    const pendingTests = result.after.filter((record) => ids.includes(record.observationId)
+      && ['PENDING', 'RETRY_WAIT', 'IN_FLIGHT'].includes(record.state))
+    const failedTests = result.after.filter((record) => ids.includes(record.observationId)
+      && ['FAILED_PERMANENT', 'CANONICAL_RECOVERY_REQUIRED'].includes(record.state))
+
+    expect(upload).toHaveBeenCalledOnce()
+    expect(upload.mock.calls[0][0].observations.map((item) => item.observationId).sort()).toEqual([...ids].sort())
+    expect(result.claimed).toHaveLength(14)
+    expect(result.claimed.every((record) => ids.includes(record.observationId))).toBe(true)
+    expect(result.response?.accepted).toBe(14)
+    expect(result.event?.observationIds).toHaveLength(14)
+    expect(result.event?.acknowledgedIds).toHaveLength(14)
+    expect(unrelatedSent).toEqual([])
+    expect(unrelatedAcked).toEqual([])
+    expect(countsByType(result.before)).toEqual([
+      { type: '27', count: 8_164 },
+      { type: '59', count: 1_532 },
+      { type: '68', count: 696 },
+    ])
+    expect(countsByType(result.after)).toEqual(countsByType(result.before))
+    expect(result.after).toHaveLength(10_392)
+    expect(pendingTests).toHaveLength(0)
+    expect(failedTests).toHaveLength(0)
+  }, 30_000)
 })
