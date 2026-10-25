@@ -7,6 +7,7 @@ import { observationBatchManager, type BatchDeliveryEvent } from '../../services
 import type { QueueRecord } from '../../services/storage/ObservationQueueStore'
 import { BASE44_PRODUCTION_ENVIRONMENT, resolveConnectorFunctionUrl } from '../../services/base44/base44Environment'
 import { saveValidationJson } from './CertificationJsonExport'
+import { evaluateActivityV2ScopedE2ESafety } from './ActivityV2ScopedE2ESafety'
 import {
   ACTIVITY_NATIVE_TRANSPORT_V2,
   ACTIVITY_V2_CAPABILITY,
@@ -211,7 +212,9 @@ export function ActivityV2ProductionVerification({
       expectedObservationCount: 0,
       QUEUE_BACKLOG_PRESENT: 'NO',
       SCOPED_E2E_SUPPORTED: typeof observationBatchManager.deliverScopedActivityE2E === 'function' ? 'YES' : 'NO',
-      SCOPED_E2E_SAFE: typeof observationBatchManager.deliverScopedActivityE2E === 'function' ? 'YES' : 'NO',
+      SCOPED_E2E_SAFE: 'NO',
+      SCOPED_E2E_SAFETY_PREDICATES: null,
+      SCOPED_E2E_UNSAFE_REASONS: [],
       DIAGNOSTIC_WORKER_RACE_PREVENTED: typeof observationBatchManager.deliverScopedActivityE2E === 'function' ? 'YES' : 'NO',
       NORMAL_FIFO_BACKLOG_PROCESSING_BYPASSED_FOR_DIAGNOSTIC:
         typeof observationBatchManager.deliverScopedActivityE2E === 'function' ? 'YES' : 'NO',
@@ -293,14 +296,32 @@ export function ActivityV2ProductionVerification({
       const ids = prepared.payloads.map((payload) => payload.observationId)
       const queue = await readQueueSnapshot(ids)
       const scopedE2ESupported = typeof observationBatchManager.deliverScopedActivityE2E === 'function'
-      const deliveryState = observationBatchManager.getDeliveryDiagnostics()
-      const scopedE2ESafe = scopedE2ESupported && !deliveryState.queuePausedForCanonicalFailure
-        && deliveryState.pauseReason === null && queue.stats.canonicalRecoveryRequired !== true
-        && (queue.stats.canonicalRecoveryObservationCount ?? 0) === 0
       const queueConflict = queue.matchingRecords.length > 0
       const backlog = backlogFingerprint(queue.records)
       const queueBacklogPresent = queue.stats.pending > 0 || queue.stats.retrying > 0
         || queue.stats.inFlight > 0 || queue.stats.failed > 0
+      const scopedClaimAvailable = scopedE2ESupported
+        && typeof observationQueue.claimPendingByObservationIds === 'function'
+      const safety = evaluateActivityV2ScopedE2ESafety({
+        expectedObservationCount: prepared.payloads.length,
+        testIdCollisionCount: queue.matchingRecords.length,
+        testIdsAbsentCount: Math.max(0, ids.length - queue.matchingRecords.length),
+        scopedClaimAvailable,
+        scopedOwnerFilterAvailable: scopedClaimAvailable,
+        scopedIdFilterAvailable: scopedClaimAvailable,
+        scopedAtomicClaimAvailable: scopedClaimAvailable,
+        workerRacePrevented: scopedE2ESupported,
+        diagnosticBypassesNormalFifo: scopedE2ESupported,
+        capabilityPresent: currentCapability.capabilitySupported,
+        productionDeliveryEnabled: currentCapability.productionDeliveryEnabled,
+        type24Valid: Boolean(prepared.type24),
+        type25Qualified: prepared.type25?.details.qualification?.status === 'PASS',
+        previewReadOnly: Object.values(report.safetyAssertions as Record<string, unknown>)
+          .every((value) => value === 'NO' || value === 0),
+      })
+      const scopedE2ESafe = safety.safe
+      report.SCOPED_E2E_SAFETY_PREDICATES = safety.predicates
+      report.SCOPED_E2E_UNSAFE_REASONS = safety.unsafeReasons
       report.QUEUE_BACKLOG_PRESENT = queueBacklogPresent ? 'YES' : 'NO'
       report.SCOPED_E2E_SUPPORTED = scopedE2ESupported ? 'YES' : 'NO'
       report.SCOPED_E2E_SAFE = scopedE2ESafe ? 'YES' : 'NO'
@@ -337,7 +358,9 @@ export function ActivityV2ProductionVerification({
       if (!prepared.type25) (report.blockers as string[]).push(prepared.type25FailureReason ?? 'Qualified Type25 source unavailable.')
       if (prepared.payloads.length !== 14 || !prepared.selectionValid) (report.blockers as string[]).push('Expected observation set is not exactly four daily plus ten minute observations.')
       if (queueConflict) (report.blockers as string[]).push('Deterministic Activity observation IDs already exist in the production queue.')
-      if (!scopedE2ESupported || !scopedE2ESafe) (report.blockers as string[]).push('Scoped Activity E2E delivery is not available or safe in this build.')
+      if (!scopedE2ESupported || !scopedE2ESafe) {
+        (report.blockers as string[]).push(`Scoped Activity E2E delivery is not available or safe in this build: ${safety.unsafeReasons.join(', ') || 'scoped delivery unsupported'}.`)
+      }
     } catch (error) {
       ;(report.blockers as string[]).push(describeError(error))
     }

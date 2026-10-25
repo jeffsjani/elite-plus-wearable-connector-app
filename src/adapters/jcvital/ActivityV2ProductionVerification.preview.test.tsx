@@ -45,6 +45,7 @@ vi.mock('../../services/sync/ObservationQueue', () => ({
     listDiagnosticRecords: mocks.listDiagnosticRecords,
     getQueueStats: mocks.getQueueStats,
     enqueueMany: mocks.enqueueMany,
+    claimPendingByObservationIds: vi.fn(),
   },
 }))
 vi.mock('../../services/sync/ObservationBatchManager', () => ({
@@ -256,5 +257,62 @@ describe('ActivityV2ProductionVerification preview', () => {
     expect(mocks.process).not.toHaveBeenCalled()
     expect(mocks.deliverScopedActivityE2E).not.toHaveBeenCalled()
     expect(mocks.enqueueActivity).not.toHaveBeenCalled()
+  })
+
+  it('passes Preview in the exact v75 phone state: 10404 rows, 10392 physiology pending, scoped safe', async () => {
+    const physiology = (type: string, metric: string, count: number, offset: number) =>
+      Array.from({ length: count }, (_, index) => ({
+        observationId: `${metric}-${offset + index}`, state: 'PENDING',
+        payload: { provider: 'JCVITAL', vendorDataType: type, metric },
+      }))
+    mocks.listDiagnosticRecords.mockResolvedValue([
+      ...physiology('27', 'HEART_RATE', 8164, 0),
+      ...physiology('59', 'WEARABLE_TEMPERATURE', 1532, 0),
+      ...physiology('68', 'OXYGEN_SATURATION', 696, 0),
+      ...Array.from({ length: 12 }, (_, index) => ({
+        observationId: `acked-${index}`, state: 'ACKNOWLEDGED',
+        payload: { provider: 'JCVITAL', vendorDataType: '27', metric: 'HEART_RATE' },
+      })),
+    ])
+    mocks.getQueueStats.mockResolvedValue({
+      pending: 10392, retrying: 0, inFlight: 0, failed: 0,
+      canonicalRecoveryRequired: false, canonicalRecoveryObservationCount: 0,
+    })
+    await act(async () => {
+      root.render(createElement(ActivityV2ProductionVerification, {
+        ownerUserId: 'owner-1',
+        scope: { accountId: 'owner-1', deviceScopeId: 'device-1' },
+        device: { deviceId: 'device-1', deviceModel: 'PRO_V8', firmwareVersion: '0.0.8.8', sdkVersion: 'v8sdk2.0' },
+      }))
+    })
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)))
+    const previewButton = [...container.querySelectorAll('button')]
+      .find((button) => button.textContent?.includes('Preview Activity V2 E2E'))
+    await act(async () => {
+      previewButton?.click()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    const report = JSON.parse(
+      (container.querySelector('textarea[aria-label="Activity v2 E2E preview report"]') as HTMLTextAreaElement | null)?.value ?? '',
+    )
+    expect(report.previewStatus).toBe('PASS')
+    expect(report.blockers).toEqual([])
+    expect(report.expectedObservationCount).toBe(14)
+    expect(report.QUEUE_BACKLOG_PRESENT).toBe('YES')
+    expect(report.queue.QUEUE_TOTAL).toBe(10404)
+    expect(report.queue.QUEUE_PENDING).toBe(10392)
+    expect(report.queue.PHYSIOLOGY_PENDING).toBe(10392)
+    expect(report.queue.TEST_OBSERVATION_COLLISION_COUNT).toBe(0)
+    expect(report.queue.TEST_OBSERVATION_IDS_ABSENT).toBe(14)
+    expect(report.queue.queueConflict).toBe(false)
+    expect(report.SCOPED_E2E_SUPPORTED).toBe('YES')
+    expect(report.SCOPED_E2E_SAFE).toBe('YES')
+    expect(report.DIAGNOSTIC_WORKER_RACE_PREVENTED).toBe('YES')
+    expect(report.NORMAL_FIFO_BACKLOG_PROCESSING_BYPASSED_FOR_DIAGNOSTIC).toBe('YES')
+    expect(report.SCOPED_E2E_UNSAFE_REASONS).toEqual([])
+    expect(Object.values(report.SCOPED_E2E_SAFETY_PREDICATES).every((value) => value === true)).toBe(true)
+    expect(Object.keys(report.SCOPED_E2E_SAFETY_PREDICATES)).toHaveLength(14)
+    expect(mocks.process).not.toHaveBeenCalled()
+    expect(mocks.enqueueMany).not.toHaveBeenCalled()
   })
 })
